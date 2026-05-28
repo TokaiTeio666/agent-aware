@@ -1,0 +1,34 @@
+{
+  "version": "V0",
+  "run_name": "v0-smoke-2026-05-28",
+  "run_type": "smoke",
+  "command": "powershell -ExecutionPolicy Bypass -File .\\scripts\\run_v0_smoke.ps1",
+  "engine": "exact",
+  "dataset": {
+    "type": "synthetic",
+    "base_count": 1000,
+    "query_count": 100,
+    "dim": 32,
+    "clusters": 16,
+    "seed": 42
+  },
+  "search": {
+    "k": 10
+  },
+  "ground_truth": {
+    "source": "exact_self",
+    "official_ivecs": false
+  },
+  "pass_criteria": {
+    "recall_at_10": "== 1.0",
+    "one_minus_recall_at_10": "== 0.0",
+    "metrics_complete": true,
+    "build_run_archive_flow": true
+  },
+  "archives": {
+    "log": "archive/logs/v0-smoke-2026-05-28.log",
+    "result": "archive/results/v0-smoke-2026-05-28.txt",
+    "build_info": "archive/build_info/v0-smoke-2026-05-28.txt"
+  }
+}
+

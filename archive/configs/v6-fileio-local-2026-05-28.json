@@ -1,0 +1,55 @@
+{
+  "version": "v6",
+  "date": "2026-05-28",
+  "purpose": "Local smoke validation for V6 file-backed compaction I/O before AutoDL deployment",
+  "dataset": {
+    "type": "synthetic",
+    "workload": "agent",
+    "base_count": 2000,
+    "query_count": 300,
+    "dim": 64,
+    "clusters": 32,
+    "session_length": 10,
+    "seed": 42,
+    "ground_truth": "dynamic exact brute force over main base plus current delta"
+  },
+  "index": {
+    "engine": "graph",
+    "layout": "packed",
+    "packing": "coaccess",
+    "graph_degree": 16,
+    "search_width": 128,
+    "entry_count": 48,
+    "routing_sample_count": 512,
+    "cache_policy": "agent",
+    "cache_pages": 24,
+    "path_cache_policy": "reuse",
+    "path_cache_capacity": 128
+  },
+  "mixed_workload": {
+    "operation_count": 360,
+    "write_ratio_percent": 20,
+    "expected_query_count": 288,
+    "expected_insert_count": 72
+  },
+  "compaction": {
+    "io_mode": "file",
+    "io_bytes_per_vector": 4096,
+    "policies": ["none", "aggressive", "sla"],
+    "sla_p99_ms": 0.8
+  },
+  "autodl_deployment": {
+    "docs": "docs/AUTODL_DEPLOYMENT.md",
+    "synthetic_script": "scripts/autodl/run_v6_synthetic.sh",
+    "sift_template": "scripts/autodl/run_v6_sift_template.sh"
+  },
+  "pass_criteria": {
+    "build_success": true,
+    "recall_at_10_min": 0.95,
+    "wal_records_equal_insert_count": true,
+    "compaction_io_bytes_observable": true,
+    "sla_query_p99_lower_than_aggressive": true,
+    "sla_query_compaction_interference_lower_than_aggressive": true
+  },
+  "run_command": "powershell -ExecutionPolicy Bypass -File .\\scripts\\run_v6_fileio_compare.ps1"
+}

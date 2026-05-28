@@ -1,0 +1,49 @@
+{
+  "version": "V4",
+  "run_name": "v4-path-2026-05-28",
+  "run_type": "warm",
+  "script": "powershell -ExecutionPolicy Bypass -File .\\scripts\\run_v4_path_compare.ps1",
+  "engine": "graph",
+  "dataset": {
+    "type": "synthetic",
+    "workload": "agent",
+    "session_length": 10,
+    "base_count": 2000,
+    "query_count": 300,
+    "dim": 64,
+    "clusters": 32,
+    "seed": 42
+  },
+  "search": {
+    "k": 10,
+    "layout": "packed",
+    "packing": "coaccess",
+    "graph_degree": 16,
+    "page_size": 4096,
+    "search_width": 128,
+    "entry_count": 48,
+    "routing_sample_count": 512,
+    "warmup_runs": 1
+  },
+  "cache": {
+    "policy": "agent",
+    "cache_pages": 24
+  },
+  "path_cache_variants": [
+    {"policy": "none", "capacity": 0},
+    {"policy": "reuse", "capacity": 128, "hit_search_width": 96}
+  ],
+  "ground_truth": {
+    "source": "exact_bruteforce",
+    "official_ivecs": false
+  },
+  "pass_criteria": {
+    "path_cache_hit_rate_observable": true,
+    "recall_not_degraded": true,
+    "expanded_query_lower": true,
+    "visited_query_lower": true,
+    "ssd_reads_query_lower": true,
+    "p99_not_higher": true
+  }
+}
+

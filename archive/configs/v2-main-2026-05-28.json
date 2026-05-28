@@ -1,0 +1,45 @@
+{
+  "version": "V2",
+  "run_name": "v2-main-2026-05-28",
+  "run_type": "cold-like-and-warm",
+  "script": "powershell -ExecutionPolicy Bypass -File .\\scripts\\run_v2_compare.ps1",
+  "engine": "graph",
+  "dataset": {
+    "type": "synthetic",
+    "base_count": 2000,
+    "query_count": 200,
+    "dim": 64,
+    "clusters": 32,
+    "seed": 42
+  },
+  "search": {
+    "k": 10,
+    "graph_degree": 16,
+    "page_size": 4096,
+    "search_width": 128,
+    "entry_count": 48,
+    "routing_sample_count": 512,
+    "coaccess_sessions": 96,
+    "coaccess_trace_length": 48
+  },
+  "variants": [
+    {"layout": "one-node", "packing": "none", "run_type": "cold", "warmup_runs": 0, "index": "build/v2_onenode_cold.idx"},
+    {"layout": "packed", "packing": "random", "run_type": "cold", "warmup_runs": 0, "index": "build/v2_packed_random_cold.idx"},
+    {"layout": "packed", "packing": "bfs", "run_type": "cold", "warmup_runs": 0, "index": "build/v2_packed_bfs_cold.idx"},
+    {"layout": "packed", "packing": "coaccess", "run_type": "cold", "warmup_runs": 0, "index": "build/v2_packed_coaccess_cold.idx"},
+    {"layout": "one-node", "packing": "none", "run_type": "warm", "warmup_runs": 1, "index": "build/v2_onenode_cold.idx"},
+    {"layout": "packed", "packing": "coaccess", "run_type": "warm", "warmup_runs": 1, "index": "build/v2_packed_coaccess_cold.idx"}
+  ],
+  "ground_truth": {
+    "source": "exact_bruteforce",
+    "official_ivecs": false,
+    "note": "Allowed for synthetic workload. SIFT1M must use official .ivecs."
+  },
+  "pass_criteria": {
+    "packed_reads_less_than_one_node": true,
+    "coaccess_better_than_random": true,
+    "recall_drop": "not significant",
+    "cold_warm_recorded": true
+  }
+}
+
