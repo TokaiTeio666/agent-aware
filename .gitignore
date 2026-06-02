@@ -1,8 +1,15 @@
 build/
+.vs/
 *.exe
 *.o
 *.obj
 *.log
 data/
+sift/
+sift.tar.gz
 results/
 
+!archive/results/
+!archive/results/**
+!archive/logs/
+!archive/logs/**

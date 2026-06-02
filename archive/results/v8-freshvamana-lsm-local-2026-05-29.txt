@@ -1,0 +1,51 @@
+AgentMem-Flow V8 local summary
+date=2026-05-29
+version=V8 FreshVamana + LSM-style StreamMerge
+
+build=pass
+build_command=powershell -ExecutionPolicy Bypass -File .\scripts\build.ps1
+git_commit_hash=ff382de
+git_status=dirty worktree; V7/V8 changes not committed yet
+
+synthetic_smoke_result=archive/results/v8-freshvamana-lsm-smoke-2026-05-29.txt
+synthetic_mode=synthetic
+synthetic_run_type=smoke
+synthetic_graph_build_policy=approx-rp
+synthetic_robust_prune_alpha=1.2
+synthetic_workload_mode=mixed
+synthetic_operation_count=300
+synthetic_write_ratio_percent=30
+synthetic_delete_ratio_percent=50
+synthetic_recall_at_10=0.9862
+synthetic_one_minus_recall_at_10=0.0138
+synthetic_p99_latency_ms=0.5381
+synthetic_insert_count=45
+synthetic_delete_count=45
+synthetic_tombstone_count=45
+synthetic_wal_records=90
+synthetic_stream_merge_ops=1
+synthetic_stream_merge_vectors=1045
+synthetic_stream_merge_inserted=45
+synthetic_stream_merge_deleted=45
+synthetic_stream_merge_seconds=0.0489
+
+sift10k_result=archive/results/v8-freshvamana-sift10k-2026-05-29.txt
+sift10k_mode=fvecs
+sift10k_base_limit=10000
+sift10k_query_limit=100
+sift10k_graph_build_policy=approx-rp
+sift10k_robust_prune_alpha=1.2
+sift10k_graph_build_seconds=8.9465
+sift10k_truth=file_out_of_range_exact_bruteforce
+sift10k_recall_at_10=1.0000
+sift10k_one_minus_recall_at_10=0.0000
+sift10k_p99_latency_ms=8.3964
+sift10k_ssd_reads_per_query_avg=855.2200
+
+pass_dynamic_recall_at_10_min_0_95=true
+pass_delete_count_equals_tombstone_count=true
+pass_wal_records_equal_insert_plus_delete=true
+pass_stream_merge_ops_positive=true
+pass_sift10k_recall_at_10_min_0_95=true
+
+notes=StreamMerge writes a new LTI index for the next process run; it does not hot-swap the active graph in the same run.

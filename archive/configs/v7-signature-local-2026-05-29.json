@@ -1,0 +1,54 @@
+{
+  "version": "v7",
+  "date": "2026-05-29",
+  "purpose": "Local warm/smoke comparison of Query Path Cache signature policies",
+  "dataset": {
+    "type": "synthetic",
+    "workload": "agent",
+    "base_count": 2000,
+    "query_count": 300,
+    "dim": 64,
+    "clusters": 32,
+    "session_length": 10,
+    "seed": 42,
+    "ground_truth": "exact brute force"
+  },
+  "index": {
+    "engine": "graph",
+    "layout": "packed",
+    "packing": "coaccess",
+    "graph_degree": 16,
+    "graph_build_policy": "exact",
+    "search_width": 128,
+    "entry_count": 48,
+    "routing_sample_count": 512,
+    "cache_policy": "agent",
+    "cache_pages": 24,
+    "path_cache_capacity": 128,
+    "path_cache_hit_search_width": 96
+  },
+  "query_signature_policies": [
+    "routed",
+    "simhash",
+    "pq-prefix",
+    "simhash-pq"
+  ],
+  "signature_params": {
+    "simhash_bits": 16,
+    "pq_prefix_subspaces": 4,
+    "pq_prefix_centroids": 16,
+    "pq_prefix_train_iterations": 4
+  },
+  "run": {
+    "run_type": "warm",
+    "warmup_runs": 1,
+    "command": "powershell -ExecutionPolicy Bypass -File .\\scripts\\run_v7_signature_compare.ps1"
+  },
+  "pass_criteria": {
+    "build_success": true,
+    "recall_drop_not_observed": true,
+    "path_cache_hit_rate_observable": true,
+    "ssd_reads_per_query_lower_than_no_path_cache": true,
+    "archive_complete": true
+  }
+}

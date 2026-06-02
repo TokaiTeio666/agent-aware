@@ -3,6 +3,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <fstream>
+#include <memory>
 #include <string>
 #include <unordered_map>
 #include <vector>
@@ -11,13 +12,69 @@
 
 namespace agentmem {
 
+struct DiskGraphBuildStats {
+  std::size_t hotpath_train_queries = 0;
+  std::size_t hotpath_unique_visited_nodes = 0;
+  std::size_t hotpath_top_node_visit_count = 0;
+};
+
+class PqAdcModel {
+ public:
+  void train(const VectorSet& base, std::size_t subspaces,
+             std::size_t centroids, std::size_t train_limit,
+             std::size_t iterations, std::uint32_t seed);
+
+  bool enabled() const {
+    return !codes_.empty();
+  }
+
+  std::size_t subspaces() const {
+    return subspaces_;
+  }
+
+  std::size_t centroids() const {
+    return centroids_;
+  }
+
+  std::size_t code_bytes() const {
+    return codes_.size();
+  }
+
+  std::vector<float> build_adc_table(const float* query) const;
+  float adc_distance(std::uint32_t id, const std::vector<float>& table) const;
+
+ private:
+  std::size_t subspaces_ = 0;
+  std::size_t centroids_ = 0;
+  std::size_t dim_ = 0;
+  std::vector<std::size_t> offsets_;
+  std::vector<float> codebooks_;
+  std::vector<std::uint8_t> codes_;
+};
+
 struct DiskGraphBuildConfig {
   std::size_t degree = 16;
   std::size_t page_size = 4096;
+  std::string build_policy = "exact";
   std::string packing_strategy = "one-node";
   std::uint32_t random_seed = 42;
+  std::size_t approx_projections = 8;
+  std::size_t approx_window = 24;
+  std::size_t approx_random_samples = 32;
+  std::size_t approx_candidate_limit = 512;
+  std::size_t lsh_tables = 8;
+  std::size_t lsh_bits = 14;
+  std::size_t lsh_probe_radius = 0;
+  std::size_t lsh_bucket_limit = 64;
+  double robust_prune_alpha = 1.2;
+  std::vector<std::uint32_t> deleted_ids;
   std::size_t coaccess_sessions = 64;
   std::size_t coaccess_trace_length = 32;
+  const VectorSet* hotpath_queries = nullptr;
+  std::size_t hotpath_train_queries = 200;
+  std::size_t hotpath_search_width = 128;
+  std::size_t hotpath_entry_count = 32;
+  DiskGraphBuildStats* stats = nullptr;
 };
 
 struct DiskGraphSearchConfig {
@@ -25,6 +82,15 @@ struct DiskGraphSearchConfig {
   std::size_t search_width = 64;
   std::size_t entry_count = 32;
   std::vector<std::uint32_t> seed_ids;
+  bool early_stop = false;
+  std::size_t early_stop_min_expansions = 0;
+  bool adaptive_early_stop = false;
+  std::size_t early_stop_patience = 16;
+  double early_stop_eps = 0.001;
+  std::size_t min_expansions = 64;
+  const PqAdcModel* pq_model = nullptr;
+  bool adc_enable = false;
+  std::size_t rerank_topk = 0;
 };
 
 struct DiskGraphSearchStats {
@@ -34,11 +100,23 @@ struct DiskGraphSearchStats {
   std::size_t page_requests = 0;
   std::size_t page_cache_hits = 0;
   std::size_t page_cache_misses = 0;
+  std::size_t io_submits = 0;
+  std::size_t io_completions = 0;
+  double adc_table_build_us = 0.0;
 };
 
 struct DiskGraphSearchResult {
   std::vector<SearchResult> topk;
   DiskGraphSearchStats stats;
+};
+
+struct DiskGraphIoStatus {
+  std::string requested_mode = "pread";
+  std::string effective_mode = "pread";
+  std::string fallback_reason;
+  bool direct_enabled = false;
+  bool io_uring_enabled = false;
+  std::size_t batch_size = 1;
 };
 
 struct DiskGraphMetadata {
@@ -52,6 +130,8 @@ struct DiskGraphMetadata {
   std::uint32_t nodes_per_page = 1;
 };
 
+class DiskPageReader;
+
 class NaiveDiskGraphBuilder {
  public:
   static void build(const VectorSet& base, const std::string& path,
@@ -61,10 +141,15 @@ class NaiveDiskGraphBuilder {
 class NaiveDiskGraphIndex {
  public:
   explicit NaiveDiskGraphIndex(const std::string& path);
+  ~NaiveDiskGraphIndex();
 
   const DiskGraphMetadata& metadata() const {
     return metadata_;
   }
+
+  void configure_io(const std::string& mode, std::size_t batch_size);
+
+  const DiskGraphIoStatus& io_status() const;
 
   DiskGraphSearchResult search_one(const float* query,
                                    const DiskGraphSearchConfig& config);
@@ -76,10 +161,11 @@ class NaiveDiskGraphIndex {
     std::vector<std::uint32_t> neighbors;
   };
 
-  DiskNode read_node(std::uint32_t id);
+  DiskNode read_node(std::uint32_t id, DiskGraphSearchStats& stats);
 
   std::string path_;
   std::ifstream input_;
+  std::unique_ptr<DiskPageReader> page_reader_;
   DiskGraphMetadata metadata_;
 };
 
@@ -92,12 +178,16 @@ class PackedDiskGraphBuilder {
 class PackedDiskGraphIndex {
  public:
   explicit PackedDiskGraphIndex(const std::string& path);
+  ~PackedDiskGraphIndex();
 
   const DiskGraphMetadata& metadata() const {
     return metadata_;
   }
 
   void configure_cache(const std::string& policy, std::size_t capacity_pages);
+  void configure_io(const std::string& mode, std::size_t batch_size);
+
+  const DiskGraphIoStatus& io_status() const;
 
   DiskGraphSearchResult search_one(const float* query,
                                    const DiskGraphSearchConfig& config);
@@ -120,7 +210,7 @@ class PackedDiskGraphIndex {
     std::uint64_t frequency = 0;
   };
 
-  DecodedPage read_page(std::uint32_t page_id);
+  DecodedPage read_page(std::uint32_t page_id, DiskGraphSearchStats& stats);
   const DecodedPage& load_page(std::uint32_t page_id,
                                DiskGraphSearchStats& stats);
   void evict_one_page();
@@ -128,6 +218,7 @@ class PackedDiskGraphIndex {
 
   std::string path_;
   std::ifstream input_;
+  std::unique_ptr<DiskPageReader> page_reader_;
   DiskGraphMetadata metadata_;
   std::vector<std::uint32_t> node_to_page_;
   std::string cache_policy_ = "none";

@@ -1,0 +1,82 @@
+{
+  "version": "v9",
+  "date": "2026-05-29",
+  "purpose": "FreshLSH-Vamana construction and early-stop search validation for SIFT1M-oriented scaling",
+  "datasets": [
+    {
+      "name": "sift10k-subset",
+      "base": "data/sift/sift_base.fvecs",
+      "query": "data/sift/sift_query.fvecs",
+      "truth": "data/sift/sift_groundtruth.ivecs",
+      "base_limit": 10000,
+      "query_limit": 100,
+      "ground_truth": "official SIFT1M ivecs checked, then exact brute force fallback for loaded subset"
+    },
+    {
+      "name": "sift100k-subset",
+      "base": "data/sift/sift_base.fvecs",
+      "query": "data/sift/sift_query.fvecs",
+      "truth": "data/sift/sift_groundtruth.ivecs",
+      "base_limit": 100000,
+      "query_limit": 100,
+      "ground_truth": "official SIFT1M ivecs checked, then exact brute force fallback for loaded subset"
+    },
+    {
+      "name": "freshlsh-streammerge-smoke",
+      "type": "synthetic",
+      "base_count": 1000,
+      "query_count": 100,
+      "dim": 32,
+      "clusters": 16,
+      "ground_truth": "dynamic exact brute force over Main + Delta - tombstones"
+    }
+  ],
+  "graph_builder": {
+    "policy": "lsh-rp",
+    "description": "FreshLSH-Vamana: multi-table SimHash LSH candidates, fast top-k construction prune, batch reciprocal edge pruning, batch FreshVamana delete patch",
+    "graph_degree": 32,
+    "lsh_tables": 8,
+    "lsh_bits_sift10k": 10,
+    "lsh_bits_sift100k_or_sift1m": 14,
+    "lsh_probe_radius": 0,
+    "lsh_bucket_limit": 64,
+    "approx_window": 32,
+    "approx_random_samples": 32,
+    "approx_candidate_limit": 192,
+    "robust_prune_alpha": 1.2,
+    "layout": "packed",
+    "packing": "bfs"
+  },
+  "search_profiles": {
+    "high_recall": {
+      "search_width": 1536,
+      "search_early_stop": false,
+      "entry_count": 512,
+      "routing_sample_count": 8192
+    },
+    "balanced_low_latency": {
+      "search_width": 384,
+      "search_early_stop": true,
+      "search_early_stop_min": 192,
+      "entry_count": 512,
+      "routing_sample_count": 8192
+    },
+    "competition_low_latency": {
+      "search_width": 384,
+      "search_early_stop": true,
+      "search_early_stop_min": 128,
+      "entry_count": 512,
+      "routing_sample_count": 8192
+    }
+  },
+  "pass_criteria": {
+    "build_success": true,
+    "sift10k_build_faster_than_v8": true,
+    "sift10k_recall_at_10_min": 0.95,
+    "sift100k_build_success": true,
+    "sift100k_recall_at_10_min": 0.95,
+    "early_stop_lowers_p99_and_reads_at_recall_min": 0.95,
+    "streammerge_dynamic_recall_at_10_min": 0.95,
+    "wal_records_equal_insert_plus_delete": true
+  }
+}

@@ -1,0 +1,61 @@
+V2 main result summary.
+
+Dataset:
+synthetic, base_count=2000, query_count=200, dim=64, clusters=32, seed=42
+
+Common parameters:
+k=10, graph_degree=16, page_size=4096, search_width=128, entry_count=48, routing_sample_count=512
+
+Cold-like results:
+
+one-node:
+recall_at_10=0.9985
+one_minus_recall_at_10=0.0015
+avg_latency_ms=0.9236
+p95_latency_ms=1.1803
+p99_latency_ms=1.3063
+ssd_reads_per_query_avg=176.6750
+
+packed random:
+recall_at_10=0.9985
+one_minus_recall_at_10=0.0015
+avg_latency_ms=1.3132
+p95_latency_ms=1.5153
+p99_latency_ms=1.8603
+ssd_reads_per_query_avg=111.2350
+
+packed bfs:
+recall_at_10=0.9985
+one_minus_recall_at_10=0.0015
+avg_latency_ms=0.2845
+p95_latency_ms=0.3712
+p99_latency_ms=0.4743
+ssd_reads_per_query_avg=21.0200
+
+packed coaccess:
+recall_at_10=0.9985
+one_minus_recall_at_10=0.0015
+avg_latency_ms=0.2729
+p95_latency_ms=0.3334
+p99_latency_ms=0.4180
+ssd_reads_per_query_avg=21.4100
+
+Warm results:
+
+one-node warm:
+recall_at_10=0.9985
+avg_latency_ms=0.9519
+p95_latency_ms=1.1759
+p99_latency_ms=1.3683
+ssd_reads_per_query_avg=176.6750
+
+packed coaccess warm:
+recall_at_10=0.9985
+avg_latency_ms=0.2884
+p95_latency_ms=0.3530
+p99_latency_ms=0.3763
+ssd_reads_per_query_avg=21.4100
+
+Read reduction:
+coaccess_vs_one_node = 87.88%
+coaccess_vs_random = 80.75%

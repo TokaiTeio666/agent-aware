@@ -22,7 +22,12 @@ $Common = @(
   "--coaccess-sessions", "96",
   "--coaccess-trace-length", "48",
   "--cache-policy", "agent",
-  "--cache-pages", "24"
+  "--cache-pages", "24",
+  "--query-signature-policy", "routed",
+  "--simhash-bits", "16",
+  "--pq-prefix-subspaces", "4",
+  "--pq-prefix-centroids", "16",
+  "--pq-prefix-train-iterations", "4"
 )
 
 $Index = Join-Path $Root "build/v4_packed_coaccess.idx"

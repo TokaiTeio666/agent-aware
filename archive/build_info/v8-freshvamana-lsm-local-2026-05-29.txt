@@ -1,0 +1,18 @@
+version: v8
+date: 2026-05-29
+git_commit_hash: ff382de
+git_status: dirty worktree; V7/V8 docs, scripts, code, and archive artifacts not committed yet
+compiler: g++.exe (x86_64-posix-seh-rev0, Built by MinGW-W64 project) 8.1.0
+os: Microsoft Windows NT 10.0.26200.0
+timezone: Asia/Shanghai
+processor_count: 28
+hardware_note: local Windows smoke/regression only; SIFT100K/SIFT1M final validation should run under WSL2/Ubuntu ext4 or AutoDL Linux SSD.
+build_command: powershell -ExecutionPolicy Bypass -File .\scripts\build.ps1
+synthetic_run_command: .\build\agentmem_flow.exe --engine graph --synthetic --base-count 1000 --query-count 100 --dim 32 --clusters 16 --k 10 --layout packed --packing bfs --index build\fresh_lti_archive.idx --build-index --graph-build-policy approx-rp --graph-degree 16 --approx-projections 6 --approx-window 16 --approx-random-samples 16 --approx-candidate-limit 256 --search-width 128 --entry-count 48 --routing-sample-count 256 --cache-policy none --path-cache-policy none --workload-mode mixed --operation-count 300 --write-ratio 30 --delete-ratio 50 --wal build\fresh_lsm_archive.wal --compaction-policy stream-merge --stream-merge-index build\fresh_lti_archive_merged.idx --run-type smoke
+sift10k_run_command: .\build\agentmem_flow.exe --engine graph --base data\sift\sift_base.fvecs --query data\sift\sift_query.fvecs --truth data\sift\sift_groundtruth.ivecs --base-limit 10000 --query-limit 100 --k 10 --layout packed --packing bfs --index build\sift10k_freshvamana_20260529-155420.idx --build-index --graph-build-policy approx-rp --graph-degree 32 --approx-projections 10 --approx-window 32 --approx-random-samples 32 --approx-candidate-limit 768 --search-width 1024 --entry-count 256 --routing-sample-count 4096 --cache-policy none --path-cache-policy none --run-type smoke
+random_seed: 42
+synthetic_dataset: base=1000, query=100, dim=32, clusters=16, dynamic truth over Main + Delta - tombstones
+sift_dataset: data\sift official files, base_limit=10000, query_limit=100
+sift_truth_note: official SIFT1M ivecs contained out-of-range ids for the loaded subset; binary recomputed exact truth for current base subset
+index: packed/bfs, approx-rp, RobustPrune alpha=1.2
+fresh_lsm: insert/delete WAL records, tombstone filtering, StreamMerge output index

@@ -1,0 +1,19 @@
+Command:
+.\build\agentmem_flow.exe --engine exact --synthetic --base-count 2000 --query-count 200 --dim 64 --clusters 32 --k 10
+
+Output:
+mode=synthetic
+engine=exact
+base_count=2000
+query_count=200
+dim=64
+k=10
+truth=exact_self
+recall_at_10=1.0000
+qps=14637.2166
+avg_latency_ms=0.0683
+p50_latency_ms=0.0680
+p95_latency_ms=0.0704
+p99_latency_ms=0.0734
+elapsed_seconds=0.0137
+

@@ -1,32 +1,84 @@
 #include "agentmem/graph_index.h"
 
 #include <algorithm>
+#include <atomic>
+#include <cerrno>
+#include <chrono>
+#include <cmath>
+#include <cstdlib>
 #include <cstring>
 #include <deque>
 #include <limits>
+#include <numeric>
 #include <queue>
 #include <random>
 #include <stdexcept>
 #include <unordered_map>
 #include <unordered_set>
 
+#ifdef __linux__
+#include <fcntl.h>
+#include <sys/mman.h>
+#include <sys/syscall.h>
+#include <unistd.h>
+#if __has_include(<linux/io_uring.h>)
+#include <linux/io_uring.h>
+#define AGENTMEM_HAS_IO_URING 1
+#else
+#define AGENTMEM_HAS_IO_URING 0
+#endif
+#else
+#define AGENTMEM_HAS_IO_URING 0
+#endif
+
 #include "agentmem/brute_force.h"
 
 namespace agentmem {
 namespace {
 
-constexpr char kMagic[8] = {'A', 'M', 'F', 'G', 'V', '1', '\0', '\0'};
-constexpr char kPackedMagic[8] = {'A', 'M', 'F', 'P', 'V', '2', '\0', '\0'};
+constexpr char kMagic[8] = {'A', 'M', 'F', 'G', 'V', '1', '\0', '\0'};  // 单节点页格式。
+constexpr char kPackedMagic[8] = {'A', 'M', 'F', 'P', 'V', '2', '\0', '\0'};  // 紧凑页格式。
 constexpr std::uint32_t kVersion = 1;
 constexpr std::uint32_t kPackedVersion = 2;
-constexpr std::uint64_t kRecordsOffset = 4096;
+constexpr std::uint64_t kRecordsOffset = 4096;  // 预留首个 4 KB 页存放 header。
 
 struct NeighborCandidate {
   std::uint32_t id = 0;
   float distance = 0.0f;
 };
 
+struct ProjectionItem {
+  float score = 0.0f;
+  std::uint32_t id = 0;
+};
+
+struct ProjectionIndex {
+  std::vector<std::vector<std::uint32_t>> orders;     // 每个投影上的排序结果。
+  std::vector<std::vector<std::uint32_t>> positions;  // node id 到排序位置的反查表。
+};
+
+struct LshTable {
+  std::vector<std::uint32_t> signatures;    // 每个向量的 SimHash。
+  std::vector<std::uint32_t> ids_by_bucket; // CSR 风格的桶内 id 连续区。
+  std::vector<std::uint32_t> offsets;       // offsets[b]..offsets[b+1] 为桶 b。
+};
+
+struct LshIndex {
+  std::size_t bits = 0;
+  std::vector<LshTable> tables;
+};
+
 struct WorseNeighborFirst {
+  bool operator()(const NeighborCandidate& lhs,
+                  const NeighborCandidate& rhs) const {
+    if (lhs.distance == rhs.distance) {
+      return lhs.id < rhs.id;
+    }
+    return lhs.distance < rhs.distance;
+  }
+};
+
+struct BetterNeighborFirst {
   bool operator()(const NeighborCandidate& lhs,
                   const NeighborCandidate& rhs) const {
     if (lhs.distance == rhs.distance) {
@@ -93,7 +145,7 @@ T get_bytes(const std::vector<char>& page, std::size_t& offset) {
 }
 
 std::size_t record_bytes(std::size_t dim, std::size_t degree) {
-  return sizeof(std::uint32_t) * 2 + dim * sizeof(float) +
+  return sizeof(std::uint32_t) * 2 + dim * sizeof(float) +  // id、degree、向量、邻居。
          degree * sizeof(std::uint32_t);
 }
 
@@ -115,18 +167,85 @@ bool contains_id(const std::vector<std::uint32_t>& ids, std::uint32_t target) {
   return std::find(ids.begin(), ids.end(), target) != ids.end();
 }
 
+std::uint32_t mix_u32(std::uint32_t value) {
+  value ^= value >> 16;
+  value *= 0x7feb352du;
+  value ^= value >> 15;
+  value *= 0x846ca68bu;
+  value ^= value >> 16;
+  return value;
+}
+
+bool is_candidate_build_policy(const DiskGraphBuildConfig& config) {
+  return config.build_policy == "approx-rp" ||
+         config.build_policy == "lsh-rp";
+}
+
+void validate_build_policy(const DiskGraphBuildConfig& config) {
+  if (config.build_policy != "exact" && !is_candidate_build_policy(config)) {
+    throw std::runtime_error(
+        "--graph-build-policy must be exact, approx-rp, or lsh-rp");
+  }
+  if (is_candidate_build_policy(config)) {
+    if (config.approx_projections == 0) {
+      throw std::runtime_error("--approx-projections must be positive");
+    }
+    if (config.approx_window == 0) {
+      throw std::runtime_error("--approx-window must be positive");
+    }
+    if (config.approx_candidate_limit != 0 &&
+        config.approx_candidate_limit < config.degree) {
+      throw std::runtime_error(
+          "--approx-candidate-limit must be 0 or at least --graph-degree");
+    }
+  }
+  if (config.build_policy == "lsh-rp") {
+    if (config.lsh_tables == 0) {
+      throw std::runtime_error("--lsh-tables must be positive");
+    }
+    if (config.lsh_bits == 0 || config.lsh_bits > 24) {
+      throw std::runtime_error("--lsh-bits must be between 1 and 24");
+    }
+    if (config.lsh_probe_radius > 1) {
+      throw std::runtime_error(
+          "--lsh-probe-radius currently supports only 0 or 1");
+    }
+    if (config.lsh_bucket_limit == 0) {
+      throw std::runtime_error("--lsh-bucket-limit must be positive");
+    }
+  }
+  if (config.robust_prune_alpha < 1.0) {
+    throw std::runtime_error("--robust-prune-alpha must be at least 1.0");
+  }
+}
+
+std::vector<char> deleted_mask(std::size_t count,
+                               const std::vector<std::uint32_t>& deleted_ids) {
+  std::vector<char> deleted(count, 0);
+  for (const auto id : deleted_ids) {
+    if (id < count) {
+      deleted[id] = 1;
+    }
+  }
+  return deleted;
+}
+
 std::vector<std::uint32_t> exact_neighbors(const VectorSet& base,
                                            std::size_t node_id,
-                                           std::size_t degree) {
+                                           std::size_t degree,
+                                           const std::vector<char>& deleted) {
   const std::size_t effective_degree =
       base.size() == 0 ? 0 : std::min(degree, base.size() - 1);
+  if (node_id >= deleted.size() || deleted[node_id]) {
+    return {};
+  }
   std::priority_queue<NeighborCandidate, std::vector<NeighborCandidate>,
                       WorseNeighborFirst>
       heap;
   const float* source = base.row(node_id);
 
   for (std::size_t other = 0; other < base.size(); ++other) {
-    if (other == node_id) {
+    if (other == node_id || (other < deleted.size() && deleted[other])) {
       continue;
     }
     const float distance = squared_l2(source, base.row(other), base.dim);
@@ -166,11 +285,528 @@ std::vector<std::uint32_t> exact_neighbors(const VectorSet& base,
 }
 
 std::vector<std::vector<std::uint32_t>> build_exact_graph(
-    const VectorSet& base, std::size_t degree) {
+    const VectorSet& base, std::size_t degree,
+    const std::vector<char>& deleted) {
+  // 仅用于小规模正确性基线：每个节点都会与全量 base 比较，复杂度接近 O(N^2)。
   std::vector<std::vector<std::uint32_t>> graph;
   graph.reserve(base.size());
   for (std::size_t i = 0; i < base.size(); ++i) {
-    graph.push_back(exact_neighbors(base, i, degree));
+    graph.push_back(exact_neighbors(base, i, degree, deleted));
+  }
+  return graph;
+}
+
+float projection_score(const float* row, const std::vector<float>& plane,
+                       std::size_t dim) {
+  float score = 0.0f;
+  for (std::size_t d = 0; d < dim; ++d) {
+    score += row[d] * plane[d];
+  }
+  return score;
+}
+
+ProjectionIndex build_projection_index(const VectorSet& base,
+                                       const DiskGraphBuildConfig& config) {
+  // approx-rp 用多个随机超平面排序，排名相近的向量会进入候选集。
+  ProjectionIndex index;
+  index.orders.resize(config.approx_projections);
+  index.positions.resize(config.approx_projections);
+
+  std::mt19937 rng(config.random_seed);
+  std::uniform_int_distribution<int> sign_pick(0, 1);
+  std::vector<float> plane(base.dim, 0.0f);
+  std::vector<ProjectionItem> items(base.size());
+
+  for (std::size_t p = 0; p < config.approx_projections; ++p) {
+    for (float& value : plane) {
+      value = sign_pick(rng) == 0 ? -1.0f : 1.0f;
+    }
+
+    for (std::size_t i = 0; i < base.size(); ++i) {
+      items[i] = ProjectionItem{
+          projection_score(base.row(i), plane, base.dim),
+          static_cast<std::uint32_t>(i)};
+    }
+
+    std::sort(items.begin(), items.end(),
+              [](const ProjectionItem& lhs, const ProjectionItem& rhs) {
+                if (lhs.score == rhs.score) {
+                  return lhs.id < rhs.id;
+                }
+                return lhs.score < rhs.score;
+              });
+
+    index.orders[p].resize(base.size());
+    index.positions[p].resize(base.size());
+    for (std::size_t rank = 0; rank < items.size(); ++rank) {
+      const auto id = items[rank].id;
+      index.orders[p][rank] = id;
+      index.positions[p][id] = static_cast<std::uint32_t>(rank);
+    }
+  }
+
+  return index;
+}
+
+void add_candidate(std::vector<std::uint32_t>& candidates, std::uint32_t self,
+                   std::uint32_t candidate, std::size_t count) {
+  if (candidate != self && candidate < count) {
+    candidates.push_back(candidate);
+  }
+}
+
+void add_projection_candidates(std::vector<std::uint32_t>& candidates,
+                               std::uint32_t self,
+                               const ProjectionIndex& projection_index,
+                               const DiskGraphBuildConfig& config,
+                               std::size_t count) {
+  for (std::size_t p = 0; p < projection_index.orders.size(); ++p) {
+    const std::size_t rank = projection_index.positions[p][self];
+    const std::size_t begin =
+        rank > config.approx_window ? rank - config.approx_window : 0;
+    const std::size_t end =
+        std::min(count, rank + config.approx_window + 1);
+    for (std::size_t i = begin; i < end; ++i) {
+      add_candidate(candidates, self, projection_index.orders[p][i], count);
+    }
+  }
+}
+
+void add_deterministic_samples(std::vector<std::uint32_t>& candidates,
+                               std::uint32_t self,
+                               const DiskGraphBuildConfig& config,
+                               std::size_t count) {
+  if (count <= 1) {
+    return;
+  }
+  const std::uint32_t seed = mix_u32(config.random_seed ^ self);  // 可复现实验的伪随机采样。
+  for (std::size_t i = 0; i < config.approx_random_samples; ++i) {
+    const std::uint32_t mixed =
+        mix_u32(seed + static_cast<std::uint32_t>(i * 0x9e3779b9u));
+    add_candidate(candidates, self,
+                  static_cast<std::uint32_t>(mixed % count), count);
+  }
+
+  const std::size_t ring = std::min<std::size_t>(config.approx_window, count - 1);
+  for (std::size_t offset = 1; offset <= ring; ++offset) {
+    add_candidate(candidates, self,
+                  static_cast<std::uint32_t>((self + offset) % count), count);
+    add_candidate(candidates, self,
+                  static_cast<std::uint32_t>((self + count - offset) % count),
+                  count);
+  }
+}
+
+void deduplicate_and_limit(std::vector<std::uint32_t>& candidates,
+                           std::uint32_t self,
+                           const DiskGraphBuildConfig& config,
+                           std::size_t count,
+                           const std::vector<char>& deleted) {
+  candidates.erase(
+      std::remove_if(candidates.begin(), candidates.end(),
+                     [&](std::uint32_t id) {
+                       return id == self || id >= count ||
+                              (id < deleted.size() && deleted[id]);
+                     }),
+      candidates.end());
+  std::sort(candidates.begin(), candidates.end());
+  candidates.erase(std::unique(candidates.begin(), candidates.end()),
+                   candidates.end());
+  if (config.approx_candidate_limit != 0 &&
+      candidates.size() > config.approx_candidate_limit) {
+    // 候选上限限制建图成本；固定 seed 保证同参数下结果稳定。
+    std::mt19937 rng(mix_u32(config.random_seed ^ self ^ 0xa77c0deu));
+    std::shuffle(candidates.begin(), candidates.end(), rng);
+    candidates.resize(config.approx_candidate_limit);
+  }
+}
+
+std::vector<std::uint32_t> nearest_neighbors_from_candidates(
+    const VectorSet& base, std::uint32_t self,
+    const std::vector<std::uint32_t>& candidates, std::size_t degree,
+    const std::vector<char>& deleted) {
+  const std::size_t effective_degree =
+      std::min<std::size_t>(degree, base.size() - 1);
+  if (effective_degree == 0 || self >= deleted.size() || deleted[self]) {
+    return {};
+  }
+
+  std::vector<NeighborCandidate> pool;
+  pool.reserve(candidates.size());
+  const float* source = base.row(self);
+  for (const auto candidate : candidates) {
+    if (candidate == self || candidate >= base.size() ||
+        candidate >= deleted.size() || deleted[candidate]) {
+      continue;
+    }
+    pool.push_back(NeighborCandidate{
+        candidate, squared_l2(source, base.row(candidate), base.dim)});
+  }
+
+  if (pool.size() > effective_degree) {
+    std::nth_element(pool.begin(), pool.begin() + effective_degree,
+                     pool.end(), BetterNeighborFirst{});
+    pool.resize(effective_degree);
+  }
+  std::sort(pool.begin(), pool.end(), BetterNeighborFirst{});
+
+  std::vector<std::uint32_t> output;
+  output.reserve(pool.size());
+  for (const auto& candidate : pool) {
+    output.push_back(candidate.id);
+  }
+  return output;
+}
+
+std::vector<std::uint32_t> robust_prune_neighbors(
+    const VectorSet& base, std::uint32_t self,
+    const std::vector<std::uint32_t>& candidates, std::size_t degree,
+    double alpha, const std::vector<char>& deleted) {
+  // FreshVamana 风格裁剪：优先保留近邻，并移除可被已选邻居替代的冗余边。
+  const std::size_t effective_degree =
+      std::min<std::size_t>(degree, base.size() - 1);
+  if (effective_degree == 0 || self >= deleted.size() || deleted[self]) {
+    return {};
+  }
+
+  std::vector<NeighborCandidate> pool;
+  pool.reserve(candidates.size());
+  const float* source = base.row(self);
+  for (const auto candidate : candidates) {
+    if (candidate == self || candidate >= base.size() ||
+        candidate >= deleted.size() || deleted[candidate]) {
+      continue;
+    }
+    pool.push_back(NeighborCandidate{
+        candidate, squared_l2(source, base.row(candidate), base.dim)});
+  }
+  std::sort(pool.begin(), pool.end(), BetterNeighborFirst{});
+
+  std::vector<std::uint32_t> output;
+  output.reserve(effective_degree);
+  const double alpha_sq = alpha * alpha;
+  while (!pool.empty() && output.size() < effective_degree) {
+    const auto picked = pool.front();
+    output.push_back(picked.id);
+
+    std::vector<NeighborCandidate> remaining;
+    remaining.reserve(pool.size());
+    for (std::size_t i = 1; i < pool.size(); ++i) {
+      const auto& candidate = pool[i];
+      const float between =
+          squared_l2(base.row(picked.id), base.row(candidate.id), base.dim);
+      if (alpha_sq * static_cast<double>(between) >
+          static_cast<double>(candidate.distance)) {
+        remaining.push_back(candidate);
+      }
+    }
+    pool = std::move(remaining);
+  }
+
+  return output;
+}
+
+void add_reverse_edges_batch(const VectorSet& base,
+                             std::vector<std::vector<std::uint32_t>>& graph,
+                             std::size_t degree,
+                             const std::vector<char>& deleted) {
+  // 批量补反向边后再统一裁剪，避免逐边插入导致反复重算距离。
+  const std::size_t count = graph.size();
+  std::vector<std::vector<std::uint32_t>> reverse(count);
+  for (std::size_t i = 0; i < count; ++i) {
+    if (i < deleted.size() && deleted[i]) {
+      graph[i].clear();
+      continue;
+    }
+    for (const auto neighbor : graph[i]) {
+      if (neighbor < count && neighbor < deleted.size() && !deleted[neighbor]) {
+        reverse[neighbor].push_back(static_cast<std::uint32_t>(i));
+      }
+    }
+  }
+
+  for (std::size_t i = 0; i < count; ++i) {
+    if (i < deleted.size() && deleted[i]) {
+      graph[i].clear();
+      continue;
+    }
+    if (reverse[i].empty()) {
+      continue;
+    }
+    std::vector<std::uint32_t> candidates;
+    candidates.reserve(graph[i].size() + reverse[i].size());
+    candidates.insert(candidates.end(), graph[i].begin(), graph[i].end());
+    candidates.insert(candidates.end(), reverse[i].begin(), reverse[i].end());
+    std::sort(candidates.begin(), candidates.end());
+    candidates.erase(std::unique(candidates.begin(), candidates.end()),
+                     candidates.end());
+    graph[i] = nearest_neighbors_from_candidates(
+        base, static_cast<std::uint32_t>(i), candidates, degree, deleted);
+  }
+}
+
+void apply_freshvamana_delete_patch(
+    const VectorSet& base, std::vector<std::vector<std::uint32_t>>& graph,
+    std::size_t degree, double alpha, const std::vector<char>& deleted) {
+  // 删除节点后，把其入邻居与出邻居重新连接，尽量保持图的可达性。
+  if (deleted.empty()) {
+    return;
+  }
+
+  std::vector<std::vector<std::uint32_t>> incoming(graph.size());
+  for (std::size_t source = 0; source < graph.size(); ++source) {
+    if (source < deleted.size() && deleted[source]) {
+      continue;
+    }
+    for (const auto target : graph[source]) {
+      if (target < deleted.size() && deleted[target]) {
+        incoming[target].push_back(static_cast<std::uint32_t>(source));
+      }
+    }
+  }
+
+  std::vector<std::vector<std::uint32_t>> patch_candidates(graph.size());
+  std::vector<std::uint32_t> affected;
+  std::vector<char> affected_mask(graph.size(), 0);
+  std::vector<std::uint32_t> deleted_nodes;
+
+  for (std::size_t deleted_id = 0; deleted_id < deleted.size(); ++deleted_id) {
+    if (!deleted[deleted_id]) {
+      continue;
+    }
+    deleted_nodes.push_back(static_cast<std::uint32_t>(deleted_id));
+
+    std::vector<std::uint32_t> out_neighbors;
+    for (const auto neighbor : graph[deleted_id]) {
+      if (neighbor < deleted.size() && !deleted[neighbor]) {
+        out_neighbors.push_back(neighbor);
+      }
+    }
+    auto& in_neighbors = incoming[deleted_id];
+    in_neighbors.erase(
+        std::remove_if(in_neighbors.begin(), in_neighbors.end(),
+                       [&](std::uint32_t id) {
+                         return id >= deleted.size() || deleted[id];
+                       }),
+        in_neighbors.end());
+
+    for (const auto source : in_neighbors) {
+      if (source >= patch_candidates.size()) {
+        continue;
+      }
+      if (!affected_mask[source]) {
+        affected_mask[source] = 1;
+        affected.push_back(source);
+      }
+      patch_candidates[source].insert(patch_candidates[source].end(),
+                                      out_neighbors.begin(),
+                                      out_neighbors.end());
+      patch_candidates[source].insert(patch_candidates[source].end(),
+                                      in_neighbors.begin(),
+                                      in_neighbors.end());
+    }
+  }
+
+  for (const auto source : affected) {
+    std::vector<std::uint32_t> candidates;
+    candidates.reserve(graph[source].size() + patch_candidates[source].size());
+    for (const auto neighbor : graph[source]) {
+      if (neighbor < deleted.size() && !deleted[neighbor]) {
+        candidates.push_back(neighbor);
+      }
+    }
+    candidates.insert(candidates.end(), patch_candidates[source].begin(),
+                      patch_candidates[source].end());
+    std::sort(candidates.begin(), candidates.end());
+    candidates.erase(std::unique(candidates.begin(), candidates.end()),
+                     candidates.end());
+    graph[source] =
+        robust_prune_neighbors(base, source, candidates, degree, alpha, deleted);
+  }
+
+  for (const auto deleted_id : deleted_nodes) {
+    if (deleted_id < graph.size()) {
+      graph[deleted_id].clear();
+    }
+  }
+}
+
+std::uint32_t compute_lsh_signature(const float* row,
+                                    const std::vector<float>& planes,
+                                    std::size_t table, std::size_t bits,
+                                    std::size_t dim) {
+  std::uint32_t signature = 0;
+  const std::size_t table_offset = table * bits * dim;
+  for (std::size_t bit = 0; bit < bits; ++bit) {
+    const float* plane = planes.data() + table_offset + bit * dim;
+    float score = 0.0f;
+    for (std::size_t d = 0; d < dim; ++d) {
+      score += row[d] * plane[d];
+    }
+    if (score >= 0.0f) {
+      signature |= (1u << bit);
+    }
+  }
+  return signature;
+}
+
+LshIndex build_lsh_index(const VectorSet& base,
+                         const DiskGraphBuildConfig& config) {
+  // 多表 SimHash 只负责生成候选；最终边仍按原始向量距离筛选。
+  LshIndex index;
+  index.bits = config.lsh_bits;
+  index.tables.resize(config.lsh_tables);
+
+  const std::size_t bucket_count = std::size_t{1} << config.lsh_bits;
+  std::vector<float> planes(config.lsh_tables * config.lsh_bits * base.dim);
+  std::mt19937 rng(config.random_seed ^ 0x51f15eedu);
+  std::uniform_int_distribution<int> sign_pick(0, 1);
+  for (float& value : planes) {
+    value = sign_pick(rng) == 0 ? -1.0f : 1.0f;
+  }
+
+  for (std::size_t t = 0; t < config.lsh_tables; ++t) {
+    auto& table = index.tables[t];
+    table.signatures.resize(base.size());
+    table.offsets.assign(bucket_count + 1, 0);
+    for (std::size_t i = 0; i < base.size(); ++i) {
+      const auto signature =
+          compute_lsh_signature(base.row(i), planes, t, config.lsh_bits,
+                                base.dim);
+      table.signatures[i] = signature;
+      ++table.offsets[signature + 1];  // 先计数，再转为 CSR 前缀和。
+    }
+
+    for (std::size_t bucket = 1; bucket < table.offsets.size(); ++bucket) {
+      table.offsets[bucket] += table.offsets[bucket - 1];
+    }
+
+    table.ids_by_bucket.resize(base.size());
+    std::vector<std::uint32_t> cursor = table.offsets;
+    for (std::size_t i = 0; i < base.size(); ++i) {
+      const auto signature = table.signatures[i];
+      table.ids_by_bucket[cursor[signature]++] =
+          static_cast<std::uint32_t>(i);
+    }
+  }
+  return index;
+}
+
+void add_lsh_bucket_candidates(std::vector<std::uint32_t>& candidates,
+                               std::uint32_t self, const LshTable& table,
+                               std::uint32_t signature,
+                               const DiskGraphBuildConfig& config) {
+  if (signature + 1 >= table.offsets.size()) {
+    return;
+  }
+  const std::uint32_t begin = table.offsets[signature];
+  const std::uint32_t end = table.offsets[signature + 1];
+  const std::uint32_t size = end - begin;
+  if (size <= config.lsh_bucket_limit) {
+    for (std::uint32_t i = begin; i < end; ++i) {
+      candidates.push_back(table.ids_by_bucket[i]);
+    }
+    return;
+  }
+
+  const std::uint32_t seed = mix_u32(self ^ signature ^ 0x15a4e35u);
+  for (std::size_t i = 0; i < config.lsh_bucket_limit; ++i) {
+    const auto offset = mix_u32(seed + static_cast<std::uint32_t>(i)) % size;
+    candidates.push_back(table.ids_by_bucket[begin + offset]);
+  }
+}
+
+void add_lsh_candidates(std::vector<std::uint32_t>& candidates,
+                        std::uint32_t self, const LshIndex& index,
+                        const DiskGraphBuildConfig& config) {
+  const std::uint32_t mask =
+      config.lsh_bits == 32 ? std::numeric_limits<std::uint32_t>::max()
+                            : ((1u << config.lsh_bits) - 1u);
+  for (const auto& table : index.tables) {
+    const auto signature = table.signatures[self] & mask;
+    add_lsh_bucket_candidates(candidates, self, table, signature, config);
+    if (config.lsh_probe_radius == 1) {
+      for (std::size_t bit = 0; bit < config.lsh_bits; ++bit) {
+        add_lsh_bucket_candidates(candidates, self, table,
+                                  signature ^ (1u << bit), config);
+      }
+    }
+  }
+}
+
+std::vector<std::vector<std::uint32_t>> build_approx_projection_graph(
+    const VectorSet& base, const DiskGraphBuildConfig& config,
+    const std::vector<char>& deleted) {
+  const ProjectionIndex projection_index = build_projection_index(base, config);
+  std::vector<std::vector<std::uint32_t>> graph(base.size());
+
+  for (std::size_t i = 0; i < base.size(); ++i) {
+    if (i < deleted.size() && deleted[i]) {
+      continue;
+    }
+    std::vector<std::uint32_t> candidates;
+    candidates.reserve(config.approx_projections *
+                           (config.approx_window * 2 + 1) +
+                       config.approx_random_samples + config.approx_window * 2);
+    const auto self = static_cast<std::uint32_t>(i);
+    add_projection_candidates(candidates, self, projection_index, config,
+                              base.size());
+    add_deterministic_samples(candidates, self, config, base.size());
+    deduplicate_and_limit(candidates, self, config, base.size(), deleted);
+    graph[i] = robust_prune_neighbors(base, self, candidates, config.degree,
+                                      config.robust_prune_alpha, deleted);
+  }
+
+  add_reverse_edges_batch(base, graph, config.degree, deleted);
+  return graph;
+}
+
+std::vector<std::vector<std::uint32_t>> build_lsh_projection_graph(
+    const VectorSet& base, const DiskGraphBuildConfig& config,
+    const std::vector<char>& deleted) {
+  // lsh-rp 是 SIFT100K/SIFT1M 的快速建图路径，避免 exact 的二次复杂度。
+  const LshIndex lsh_index = build_lsh_index(base, config);
+  std::vector<std::vector<std::uint32_t>> graph(base.size());
+
+  for (std::size_t i = 0; i < base.size(); ++i) {
+    if (i < deleted.size() && deleted[i]) {
+      continue;
+    }
+    std::vector<std::uint32_t> candidates;
+    const auto probe_multiplier =
+        config.lsh_probe_radius == 0 ? 1 : (config.lsh_bits + 1);
+    candidates.reserve(config.lsh_tables * probe_multiplier *
+                           config.lsh_bucket_limit +
+                       config.approx_random_samples + config.approx_window * 2);
+    const auto self = static_cast<std::uint32_t>(i);
+    add_lsh_candidates(candidates, self, lsh_index, config);
+    add_deterministic_samples(candidates, self, config, base.size());
+    deduplicate_and_limit(candidates, self, config, base.size(), deleted);
+    graph[i] = nearest_neighbors_from_candidates(
+        base, self, candidates, config.degree, deleted);
+  }
+
+  add_reverse_edges_batch(base, graph, config.degree, deleted);
+  return graph;
+}
+
+std::vector<std::vector<std::uint32_t>> build_graph(
+    const VectorSet& base, const DiskGraphBuildConfig& config) {
+  // 三种 builder 共用同一输出结构，删除修补作为统一的后处理阶段。
+  validate_build_policy(config);
+  const auto deleted = deleted_mask(base.size(), config.deleted_ids);
+  const std::vector<char> no_deleted(base.size(), 0);
+  std::vector<std::vector<std::uint32_t>> graph;
+  if (config.build_policy == "exact") {
+    graph = build_exact_graph(base, config.degree, no_deleted);
+  } else if (config.build_policy == "approx-rp") {
+    graph = build_approx_projection_graph(base, config, no_deleted);
+  } else {
+    graph = build_lsh_projection_graph(base, config, no_deleted);
+  }
+  if (!config.deleted_ids.empty()) {
+    apply_freshvamana_delete_patch(base, graph, config.degree,
+                                   config.robust_prune_alpha, deleted);
   }
   return graph;
 }
@@ -279,22 +915,10 @@ std::vector<std::uint32_t> bfs_order(
   return order;
 }
 
-std::uint32_t pick_best_unplaced(const std::vector<char>& placed,
-                                 const std::vector<double>& hotness) {
-  std::uint32_t best = 0;
-  double best_score = -1.0;
-  for (std::size_t i = 0; i < placed.size(); ++i) {
-    if (!placed[i] && hotness[i] > best_score) {
-      best_score = hotness[i];
-      best = static_cast<std::uint32_t>(i);
-    }
-  }
-  return best;
-}
-
 std::vector<std::uint32_t> coaccess_order(
     const std::vector<std::vector<std::uint32_t>>& graph,
     std::size_t nodes_per_page, std::size_t sessions, std::size_t trace_length) {
+  // 模拟 Agent 会话访问轨迹，将经常共同访问的节点尽量压入同一磁盘页。
   std::vector<std::uint32_t> order;
   order.reserve(graph.size());
   if (graph.empty()) {
@@ -334,42 +958,73 @@ std::vector<std::uint32_t> coaccess_order(
 
   std::vector<char> placed(graph.size(), 0);
   std::size_t remaining = graph.size();
+  std::size_t next_unplaced = 0;
+
+  auto take_next_unplaced = [&]() -> std::uint32_t {
+    while (next_unplaced < placed.size() && placed[next_unplaced]) {
+      ++next_unplaced;
+    }
+    if (next_unplaced >= placed.size()) {
+      return std::numeric_limits<std::uint32_t>::max();
+    }
+    return static_cast<std::uint32_t>(next_unplaced);
+  };
+
+  auto score_for_page = [&](std::uint32_t candidate,
+                            const std::vector<std::uint32_t>& page_nodes) {
+    double score = hotness[candidate] * 0.001;
+    for (const auto page_node : page_nodes) {
+      const auto found = coaccess.find(pair_key(candidate, page_node));
+      if (found != coaccess.end()) {
+        score += found->second * 20.0;
+      }
+      if (contains_id(graph[candidate], page_node) ||
+          contains_id(graph[page_node], candidate)) {
+        score += 10.0;
+      }
+    }
+    return score;
+  };
 
   while (remaining > 0) {
     std::vector<std::uint32_t> page_nodes;
     page_nodes.reserve(nodes_per_page);
-    const std::uint32_t anchor = pick_best_unplaced(placed, hotness);
+    const std::uint32_t anchor = take_next_unplaced();
+    if (anchor == std::numeric_limits<std::uint32_t>::max()) {
+      break;
+    }
     placed[anchor] = 1;
     --remaining;
     page_nodes.push_back(anchor);
     order.push_back(anchor);
 
     while (remaining > 0 && page_nodes.size() < nodes_per_page) {
-      std::uint32_t best = 0;
+      std::vector<std::uint32_t> candidates;
+      for (const auto page_node : page_nodes) {
+        for (const auto neighbor : graph[page_node]) {
+          if (neighbor < placed.size() && !placed[neighbor]) {
+            candidates.push_back(neighbor);
+          }
+        }
+      }
+      std::sort(candidates.begin(), candidates.end());
+      candidates.erase(std::unique(candidates.begin(), candidates.end()),
+                       candidates.end());
+
+      std::uint32_t best = std::numeric_limits<std::uint32_t>::max();
       double best_score = -1.0;
-
-      for (std::size_t candidate = 0; candidate < graph.size(); ++candidate) {
-        if (placed[candidate]) {
-          continue;
-        }
-
-        double score = hotness[candidate] * 0.001;
-        const auto candidate_id = static_cast<std::uint32_t>(candidate);
-        for (const auto page_node : page_nodes) {
-          const auto found = coaccess.find(pair_key(candidate_id, page_node));
-          if (found != coaccess.end()) {
-            score += found->second * 20.0;
-          }
-          if (contains_id(graph[candidate], page_node) ||
-              contains_id(graph[page_node], candidate_id)) {
-            score += 10.0;
-          }
-        }
-
+      for (const auto candidate : candidates) {
+        const double score = score_for_page(candidate, page_nodes);
         if (score > best_score) {
           best_score = score;
-          best = candidate_id;
+          best = candidate;
         }
+      }
+      if (best == std::numeric_limits<std::uint32_t>::max()) {
+        best = take_next_unplaced();
+      }
+      if (best == std::numeric_limits<std::uint32_t>::max()) {
+        break;
       }
 
       placed[best] = 1;
@@ -382,8 +1037,81 @@ std::vector<std::uint32_t> coaccess_order(
   return order;
 }
 
+std::vector<std::uint32_t> hotpath_order(
+    const VectorSet& base, const std::vector<std::vector<std::uint32_t>>& graph,
+    const DiskGraphBuildConfig& config) {
+  // 用真实查询样本统计访问热度，再按访问次数重排节点。
+  if (config.hotpath_queries == nullptr || config.hotpath_queries->empty()) {
+    throw std::runtime_error(
+        "hotpath packing requires sampled queries during index build");
+  }
+  if (config.hotpath_queries->dim != base.dim) {
+    throw std::runtime_error("hotpath query dimension does not match base");
+  }
+
+  const std::size_t train_queries =
+      std::min(config.hotpath_train_queries, config.hotpath_queries->size());
+  std::vector<std::size_t> visit_count(graph.size(), 0);
+  const auto entries = entry_points(graph.size(), config.hotpath_entry_count);
+
+  for (std::size_t query_id = 0; query_id < train_queries; ++query_id) {
+    const float* query = config.hotpath_queries->row(query_id);
+    std::vector<char> visited(graph.size(), 0);
+    std::priority_queue<SearchResult, std::vector<SearchResult>, CloserFirst>
+        candidates;
+
+    for (const auto entry : entries) {
+      if (entry >= graph.size() || visited[entry]) {
+        continue;
+      }
+      visited[entry] = 1;
+      ++visit_count[entry];
+      candidates.push(SearchResult{
+          entry, squared_l2(query, base.row(entry), base.dim)});
+    }
+
+    std::size_t expanded = 0;
+    while (!candidates.empty() && expanded < config.hotpath_search_width) {
+      const auto current = candidates.top();
+      candidates.pop();
+      ++expanded;
+      for (const auto neighbor : graph[current.id]) {
+        if (neighbor >= graph.size() || visited[neighbor]) {
+          continue;
+        }
+        visited[neighbor] = 1;
+        ++visit_count[neighbor];
+        candidates.push(SearchResult{
+            neighbor, squared_l2(query, base.row(neighbor), base.dim)});
+      }
+    }
+  }
+
+  std::vector<std::uint32_t> order = natural_order(graph.size());
+  std::stable_sort(order.begin(), order.end(),
+                   [&](std::uint32_t lhs, std::uint32_t rhs) {
+                     if (visit_count[lhs] == visit_count[rhs]) {
+                       return lhs < rhs;
+                     }
+                     return visit_count[lhs] > visit_count[rhs];
+                   });
+
+  if (config.stats != nullptr) {
+    config.stats->hotpath_train_queries = train_queries;
+    config.stats->hotpath_unique_visited_nodes =
+        static_cast<std::size_t>(std::count_if(
+            visit_count.begin(), visit_count.end(),
+            [](std::size_t count) { return count != 0; }));
+    config.stats->hotpath_top_node_visit_count =
+        visit_count.empty()
+            ? 0
+            : *std::max_element(visit_count.begin(), visit_count.end());
+  }
+  return order;
+}
+
 std::vector<std::uint32_t> packed_order(
-    const std::vector<std::vector<std::uint32_t>>& graph,
+    const VectorSet& base, const std::vector<std::vector<std::uint32_t>>& graph,
     const DiskGraphBuildConfig& config, std::size_t nodes_per_page) {
   if (config.packing_strategy == "random") {
     return random_order(graph.size(), config.random_seed);
@@ -395,15 +1123,605 @@ std::vector<std::uint32_t> packed_order(
     return coaccess_order(graph, nodes_per_page, config.coaccess_sessions,
                           config.coaccess_trace_length);
   }
+  if (config.packing_strategy == "hotpath") {
+    return hotpath_order(base, graph, config);
+  }
   throw std::runtime_error("Unknown packing strategy: " +
                            config.packing_strategy);
 }
 
 }  // namespace
 
+namespace {
+
+#ifdef __linux__
+constexpr std::size_t kDirectIoAlignment = 4096;
+
+std::string errno_reason(const std::string& prefix) {
+  return prefix + "_" + std::to_string(errno);
+}
+#endif
+
+#if AGENTMEM_HAS_IO_URING && defined(__NR_io_uring_setup) && \
+    defined(__NR_io_uring_enter)
+// 直接调用 Linux syscall 的最小 io_uring 包装，避免引入 liburing 依赖。
+class RawIoUring {
+ public:
+  RawIoUring() = default;
+
+  ~RawIoUring() {
+    close();
+  }
+
+  RawIoUring(const RawIoUring&) = delete;
+  RawIoUring& operator=(const RawIoUring&) = delete;
+
+  bool open(std::size_t entries, std::string& reason) {
+    close();
+    io_uring_params params{};
+    const auto depth = static_cast<unsigned>(
+        std::max<std::size_t>(1, std::min<std::size_t>(entries, 4096)));
+    ring_fd_ = static_cast<int>(
+        syscall(__NR_io_uring_setup, depth, &params));
+    if (ring_fd_ < 0) {
+      reason = errno_reason("io_uring_setup_failed_errno");
+      return false;
+    }
+
+    sq_ring_size_ =
+        params.sq_off.array + params.sq_entries * sizeof(unsigned);
+    cq_ring_size_ =
+        params.cq_off.cqes + params.cq_entries * sizeof(io_uring_cqe);
+    if ((params.features & IORING_FEAT_SINGLE_MMAP) != 0) {
+      sq_ring_size_ = std::max(sq_ring_size_, cq_ring_size_);
+      cq_ring_size_ = sq_ring_size_;
+      single_mmap_ = true;
+    }
+
+    sq_ring_ = mmap(nullptr, sq_ring_size_, PROT_READ | PROT_WRITE,
+                    MAP_SHARED | MAP_POPULATE, ring_fd_,
+                    IORING_OFF_SQ_RING);
+    if (sq_ring_ == MAP_FAILED) {
+      sq_ring_ = nullptr;
+      reason = errno_reason("io_uring_sq_mmap_failed_errno");
+      close();
+      return false;
+    }
+
+    if (single_mmap_) {
+      cq_ring_ = sq_ring_;
+    } else {
+      cq_ring_ = mmap(nullptr, cq_ring_size_, PROT_READ | PROT_WRITE,
+                      MAP_SHARED | MAP_POPULATE, ring_fd_,
+                      IORING_OFF_CQ_RING);
+      if (cq_ring_ == MAP_FAILED) {
+        cq_ring_ = nullptr;
+        reason = errno_reason("io_uring_cq_mmap_failed_errno");
+        close();
+        return false;
+      }
+    }
+
+    sqes_size_ = params.sq_entries * sizeof(io_uring_sqe);
+    sqes_ = static_cast<io_uring_sqe*>(
+        mmap(nullptr, sqes_size_, PROT_READ | PROT_WRITE,
+             MAP_SHARED | MAP_POPULATE, ring_fd_, IORING_OFF_SQES));
+    if (sqes_ == MAP_FAILED) {
+      sqes_ = nullptr;
+      reason = errno_reason("io_uring_sqe_mmap_failed_errno");
+      close();
+      return false;
+    }
+
+    const auto* sq = static_cast<char*>(sq_ring_);
+    const auto* cq = static_cast<char*>(cq_ring_);
+    sq_head_ = reinterpret_cast<unsigned*>(
+        const_cast<char*>(sq) + params.sq_off.head);
+    sq_tail_ = reinterpret_cast<unsigned*>(
+        const_cast<char*>(sq) + params.sq_off.tail);
+    sq_ring_mask_ = reinterpret_cast<unsigned*>(
+        const_cast<char*>(sq) + params.sq_off.ring_mask);
+    sq_ring_entries_ = reinterpret_cast<unsigned*>(
+        const_cast<char*>(sq) + params.sq_off.ring_entries);
+    sq_array_ = reinterpret_cast<unsigned*>(
+        const_cast<char*>(sq) + params.sq_off.array);
+    cq_head_ = reinterpret_cast<unsigned*>(
+        const_cast<char*>(cq) + params.cq_off.head);
+    cq_tail_ = reinterpret_cast<unsigned*>(
+        const_cast<char*>(cq) + params.cq_off.tail);
+    cq_ring_mask_ = reinterpret_cast<unsigned*>(
+        const_cast<char*>(cq) + params.cq_off.ring_mask);
+    cqes_ = reinterpret_cast<io_uring_cqe*>(
+        const_cast<char*>(cq) + params.cq_off.cqes);
+    return true;
+  }
+
+  void close() {
+    if (sqes_ != nullptr) {
+      munmap(sqes_, sqes_size_);
+      sqes_ = nullptr;
+    }
+    if (cq_ring_ != nullptr && !single_mmap_) {
+      munmap(cq_ring_, cq_ring_size_);
+    }
+    cq_ring_ = nullptr;
+    if (sq_ring_ != nullptr) {
+      munmap(sq_ring_, sq_ring_size_);
+      sq_ring_ = nullptr;
+    }
+    if (ring_fd_ >= 0) {
+      ::close(ring_fd_);
+      ring_fd_ = -1;
+    }
+    single_mmap_ = false;
+  }
+
+  bool read(int fd, std::uint64_t offset, void* buffer, std::size_t bytes,
+            DiskGraphSearchStats& stats, std::string& reason) {
+    const unsigned head = *sq_head_;
+    const unsigned tail = *sq_tail_;
+    if (tail - head >= *sq_ring_entries_) {
+      reason = "io_uring_submission_queue_full";
+      return false;
+    }
+
+    const unsigned index = tail & *sq_ring_mask_;
+    io_uring_sqe& sqe = sqes_[index];
+    std::memset(&sqe, 0, sizeof(sqe));
+    sqe.opcode = IORING_OP_READ;
+    sqe.fd = fd;
+    sqe.off = offset;
+    sqe.addr = reinterpret_cast<std::uint64_t>(buffer);
+    sqe.len = static_cast<std::uint32_t>(bytes);
+    sqe.user_data = next_user_data_++;
+    sq_array_[index] = index;
+    std::atomic_thread_fence(std::memory_order_release);
+    *sq_tail_ = tail + 1;
+
+    const int submitted = static_cast<int>(
+        syscall(__NR_io_uring_enter, ring_fd_, 1, 1,
+                IORING_ENTER_GETEVENTS, nullptr, 0));
+    if (submitted < 0) {
+      reason = errno_reason("io_uring_enter_failed_errno");
+      return false;
+    }
+    ++stats.io_submits;
+
+    while (*cq_head_ == *cq_tail_) {
+      const int waited = static_cast<int>(
+          syscall(__NR_io_uring_enter, ring_fd_, 0, 1,
+                  IORING_ENTER_GETEVENTS, nullptr, 0));
+      if (waited < 0) {
+        reason = errno_reason("io_uring_wait_failed_errno");
+        return false;
+      }
+    }
+
+    std::atomic_thread_fence(std::memory_order_acquire);
+    const unsigned cq_head = *cq_head_;
+    const io_uring_cqe& cqe = cqes_[cq_head & *cq_ring_mask_];
+    const int result = cqe.res;
+    *cq_head_ = cq_head + 1;
+    ++stats.io_completions;
+    if (result != static_cast<int>(bytes)) {
+      reason = result < 0
+                   ? "io_uring_read_failed_errno_" + std::to_string(-result)
+                   : "io_uring_short_read_" + std::to_string(result);
+      return false;
+    }
+    return true;
+  }
+
+ private:
+  int ring_fd_ = -1;
+  void* sq_ring_ = nullptr;
+  void* cq_ring_ = nullptr;
+  io_uring_sqe* sqes_ = nullptr;
+  std::size_t sq_ring_size_ = 0;
+  std::size_t cq_ring_size_ = 0;
+  std::size_t sqes_size_ = 0;
+  bool single_mmap_ = false;
+  unsigned* sq_head_ = nullptr;
+  unsigned* sq_tail_ = nullptr;
+  unsigned* sq_ring_mask_ = nullptr;
+  unsigned* sq_ring_entries_ = nullptr;
+  unsigned* sq_array_ = nullptr;
+  unsigned* cq_head_ = nullptr;
+  unsigned* cq_tail_ = nullptr;
+  unsigned* cq_ring_mask_ = nullptr;
+  io_uring_cqe* cqes_ = nullptr;
+  std::uint64_t next_user_data_ = 1;
+};
+#endif
+
+}  // namespace
+
+// 屏蔽平台差异：Linux 可选 pread/O_DIRECT/io_uring，其他平台回退到 ifstream。
+class DiskPageReader {
+ public:
+  DiskPageReader(std::string path, std::size_t page_size)
+      : path_(std::move(path)), page_size_(page_size) {
+    configure("pread", 1);
+  }
+
+  ~DiskPageReader() {
+    close_native();
+  }
+
+  DiskPageReader(const DiskPageReader&) = delete;
+  DiskPageReader& operator=(const DiskPageReader&) = delete;
+
+  void configure(const std::string& mode, std::size_t batch_size) {
+    if (mode != "pread" && mode != "odirect" && mode != "io_uring") {
+      throw std::runtime_error("Unsupported disk I/O mode: " + mode);
+    }
+    if (batch_size == 0) {
+      throw std::runtime_error("Disk I/O batch size must be positive");
+    }
+
+    close_native();
+    status_ = DiskGraphIoStatus{};
+    status_.requested_mode = mode;  // requested 与 effective 分开，便于实验识别回退。
+    status_.batch_size = batch_size;
+
+#ifdef __linux__
+    if (mode == "pread") {
+      open_linux_fd(O_RDONLY | O_CLOEXEC, "pread_open_failed_errno");
+      return;
+    }
+
+    if (mode == "odirect") {
+      if (!direct_io_layout_supported()) {  // O_DIRECT 要求页偏移和长度按 4 KB 对齐。
+        fallback_to_pread("odirect_requires_4096_aligned_pages");
+        return;
+      }
+      if (!try_open_linux_fd(O_RDONLY | O_CLOEXEC | O_DIRECT)) {
+        fallback_to_pread(errno_reason("odirect_open_failed_errno"));
+        return;
+      }
+      status_.effective_mode = "odirect";
+      status_.direct_enabled = true;
+      return;
+    }
+
+#if AGENTMEM_HAS_IO_URING && defined(__NR_io_uring_setup) && \
+    defined(__NR_io_uring_enter)
+    bool direct_opened = false;
+    if (direct_io_layout_supported()) {
+      direct_opened = try_open_linux_fd(O_RDONLY | O_CLOEXEC | O_DIRECT);
+    }
+    if (!direct_opened && !try_open_linux_fd(O_RDONLY | O_CLOEXEC)) {
+      throw std::runtime_error(
+          "Cannot open graph index for io_uring: " + path_);
+    }
+
+    std::string reason;
+    if (!ring_.open(batch_size, reason)) {
+      fallback_to_pread(reason);
+      return;
+    }
+    status_.effective_mode = "io_uring";
+    status_.direct_enabled = direct_opened;
+    status_.io_uring_enabled = true;
+    if (!direct_opened) {
+      status_.fallback_reason =
+          "io_uring_active_with_buffered_fd_odirect_unavailable";
+    }
+#else
+    fallback_to_pread("io_uring_headers_or_syscalls_unavailable");
+#endif
+#else
+    if (mode == "pread") {
+      open_buffered_stream();
+      return;
+    }
+    fallback_to_pread(mode + "_requires_linux");
+#endif
+  }
+
+  const DiskGraphIoStatus& status() const {
+    return status_;
+  }
+
+  std::vector<char> read(std::uint64_t offset, std::size_t bytes,
+                         DiskGraphSearchStats& stats) {
+    std::vector<char> output(bytes, 0);
+#ifdef __linux__
+    if (status_.effective_mode == "odirect" ||
+        status_.effective_mode == "io_uring") {
+      if (status_.direct_enabled &&
+          (offset % kDirectIoAlignment != 0 ||
+           bytes % kDirectIoAlignment != 0)) {
+        throw std::runtime_error(
+            "Direct graph I/O requires aligned page offsets and lengths");
+      }
+
+      void* aligned = nullptr;  // O_DIRECT 不能直接读入普通 vector 缓冲区。
+      if (posix_memalign(&aligned, kDirectIoAlignment, bytes) != 0) {
+        throw std::runtime_error("Failed to allocate aligned graph I/O buffer");
+      }
+      bool ok = false;
+      std::string reason;
+      if (status_.effective_mode == "io_uring") {
+#if AGENTMEM_HAS_IO_URING && defined(__NR_io_uring_setup) && \
+    defined(__NR_io_uring_enter)
+        ok = ring_.read(fd_, offset, aligned, bytes, stats, reason);
+#endif
+      } else {
+        ok = read_with_pread(aligned, bytes, offset, stats, reason);
+      }
+      if (ok) {
+        std::memcpy(output.data(), aligned, bytes);
+      }
+      std::free(aligned);
+      if (!ok) {
+        throw std::runtime_error("Graph page read failed: " + reason);
+      }
+      return output;
+    }
+
+    std::string reason;
+    if (!read_with_pread(output.data(), bytes, offset, stats, reason)) {
+      throw std::runtime_error("Graph page read failed: " + reason);
+    }
+#else
+    buffered_input_.clear();
+    buffered_input_.seekg(static_cast<std::streamoff>(offset), std::ios::beg);
+    if (!buffered_input_) {
+      throw std::runtime_error("Failed to seek graph index: " + path_);
+    }
+    buffered_input_.read(output.data(), static_cast<std::streamsize>(bytes));
+    if (!buffered_input_) {
+      throw std::runtime_error("Failed to read graph page");
+    }
+    ++stats.io_submits;
+    ++stats.io_completions;
+#endif
+    return output;
+  }
+
+ private:
+#ifdef __linux__
+  bool direct_io_layout_supported() const {
+    return page_size_ % kDirectIoAlignment == 0;
+  }
+
+  bool try_open_linux_fd(int flags) {
+    if (fd_ >= 0) {
+      ::close(fd_);
+      fd_ = -1;
+    }
+    fd_ = ::open(path_.c_str(), flags);
+    return fd_ >= 0;
+  }
+
+  void open_linux_fd(int flags, const std::string& error_prefix) {
+    if (!try_open_linux_fd(flags)) {
+      throw std::runtime_error(errno_reason(error_prefix) + ": " + path_);
+    }
+  }
+
+  void fallback_to_pread(const std::string& reason) {
+    close_native();
+    open_linux_fd(O_RDONLY | O_CLOEXEC, "pread_fallback_open_failed_errno");
+    status_.effective_mode = "pread";
+    status_.direct_enabled = false;
+    status_.io_uring_enabled = false;
+    status_.fallback_reason = reason;
+  }
+
+  bool read_with_pread(void* buffer, std::size_t bytes, std::uint64_t offset,
+                       DiskGraphSearchStats& stats, std::string& reason) {
+    const ssize_t result =
+        ::pread(fd_, buffer, bytes, static_cast<off_t>(offset));
+    ++stats.io_submits;
+    if (result < 0) {
+      reason = errno_reason("pread_failed_errno");
+      return false;
+    }
+    ++stats.io_completions;
+    if (result != static_cast<ssize_t>(bytes)) {
+      reason = "pread_short_read_" + std::to_string(result);
+      return false;
+    }
+    return true;
+  }
+#else
+  void open_buffered_stream() {
+    buffered_input_.open(path_, std::ios::binary);
+    if (!buffered_input_) {
+      throw std::runtime_error("Cannot open graph index: " + path_);
+    }
+  }
+
+  void fallback_to_pread(const std::string& reason) {
+    open_buffered_stream();
+    status_.effective_mode = "pread";
+    status_.fallback_reason = reason;
+  }
+#endif
+
+  void close_native() {
+#ifdef __linux__
+#if AGENTMEM_HAS_IO_URING && defined(__NR_io_uring_setup) && \
+    defined(__NR_io_uring_enter)
+    ring_.close();
+#endif
+    if (fd_ >= 0) {
+      ::close(fd_);
+      fd_ = -1;
+    }
+#else
+    if (buffered_input_.is_open()) {
+      buffered_input_.close();
+    }
+#endif
+  }
+
+  std::string path_;
+  std::size_t page_size_ = 0;
+  DiskGraphIoStatus status_;
+#ifdef __linux__
+  int fd_ = -1;
+#if AGENTMEM_HAS_IO_URING && defined(__NR_io_uring_setup) && \
+    defined(__NR_io_uring_enter)
+  RawIoUring ring_;
+#endif
+#else
+  std::ifstream buffered_input_;
+#endif
+};
+
+void PqAdcModel::train(const VectorSet& base, std::size_t subspaces,
+                       std::size_t centroids, std::size_t train_limit,
+                       std::size_t iterations, std::uint32_t seed) {
+  // 将原始向量切为多个子空间，各自训练码本并为每个 base 向量生成短码。
+  if (base.empty() || subspaces == 0 || centroids < 2 || centroids > 256 ||
+      iterations == 0) {
+    throw std::runtime_error("Invalid PQ training configuration");
+  }
+  subspaces_ = std::min(subspaces, base.dim);
+  centroids_ = centroids;
+  dim_ = base.dim;
+  offsets_.resize(subspaces_ + 1);
+  for (std::size_t m = 0; m <= subspaces_; ++m) {
+    offsets_[m] = (m * dim_) / subspaces_;
+  }
+
+  const std::size_t sample_count =
+      std::min(base.size(), std::max(centroids_, train_limit));
+  std::vector<std::uint32_t> sample_ids(sample_count);
+  for (std::size_t i = 0; i < sample_count; ++i) {
+    sample_ids[i] = static_cast<std::uint32_t>(
+        (static_cast<std::uint64_t>(i) * base.size()) / sample_count);
+  }
+
+  codebooks_.assign(subspaces_ * centroids_ * dim_, 0.0f);
+  std::mt19937 rng(seed ^ 0x0adc0deu);
+  for (std::size_t m = 0; m < subspaces_; ++m) {
+    const std::size_t begin = offsets_[m];
+    const std::size_t end = offsets_[m + 1];
+    for (std::size_t c = 0; c < centroids_; ++c) {
+      const std::size_t sample =
+          sample_ids[(c * sample_count) / centroids_];
+      float* centroid = codebooks_.data() + (m * centroids_ + c) * dim_;
+      std::copy(base.row(sample) + begin, base.row(sample) + end,
+                centroid + begin);
+    }
+
+    std::vector<float> sums(centroids_ * (end - begin), 0.0f);
+    std::vector<std::size_t> counts(centroids_, 0);
+    for (std::size_t iteration = 0; iteration < iterations; ++iteration) {
+      std::fill(sums.begin(), sums.end(), 0.0f);
+      std::fill(counts.begin(), counts.end(), 0);
+      for (std::size_t i = 0; i < sample_count; ++i) {
+        const float* row = base.row(sample_ids[i]);
+        std::size_t best = 0;
+        float best_distance = std::numeric_limits<float>::max();
+        for (std::size_t c = 0; c < centroids_; ++c) {
+          const float* centroid =
+              codebooks_.data() + (m * centroids_ + c) * dim_;
+          float distance = 0.0f;
+          for (std::size_t d = begin; d < end; ++d) {
+            const float diff = row[d] - centroid[d];
+            distance += diff * diff;
+          }
+          if (distance < best_distance) {
+            best_distance = distance;
+            best = c;
+          }
+        }
+        ++counts[best];
+        for (std::size_t d = begin; d < end; ++d) {
+          sums[best * (end - begin) + (d - begin)] += row[d];
+        }
+      }
+
+      for (std::size_t c = 0; c < centroids_; ++c) {
+        float* centroid = codebooks_.data() + (m * centroids_ + c) * dim_;
+        if (counts[c] == 0) {
+          const std::size_t replacement =
+              sample_ids[std::uniform_int_distribution<std::size_t>(
+                  0, sample_count - 1)(rng)];
+          std::copy(base.row(replacement) + begin, base.row(replacement) + end,
+                    centroid + begin);
+          continue;
+        }
+        for (std::size_t d = begin; d < end; ++d) {
+          centroid[d] =
+              sums[c * (end - begin) + (d - begin)] /
+              static_cast<float>(counts[c]);
+        }
+      }
+    }
+  }
+
+  codes_.resize(base.size() * subspaces_);
+  for (std::size_t i = 0; i < base.size(); ++i) {
+    const float* row = base.row(i);
+    for (std::size_t m = 0; m < subspaces_; ++m) {
+      const std::size_t begin = offsets_[m];
+      const std::size_t end = offsets_[m + 1];
+      std::size_t best = 0;
+      float best_distance = std::numeric_limits<float>::max();
+      for (std::size_t c = 0; c < centroids_; ++c) {
+        const float* centroid =
+            codebooks_.data() + (m * centroids_ + c) * dim_;
+        float distance = 0.0f;
+        for (std::size_t d = begin; d < end; ++d) {
+          const float diff = row[d] - centroid[d];
+          distance += diff * diff;
+        }
+        if (distance < best_distance) {
+          best_distance = distance;
+          best = c;
+        }
+      }
+      codes_[i * subspaces_ + m] = static_cast<std::uint8_t>(best);
+    }
+  }
+}
+
+std::vector<float> PqAdcModel::build_adc_table(const float* query) const {
+  // 每个 query 只构造一次查表距离，图遍历时按 PQ code 快速累加。
+  if (!enabled()) {
+    return {};
+  }
+  std::vector<float> table(subspaces_ * centroids_, 0.0f);
+  for (std::size_t m = 0; m < subspaces_; ++m) {
+    const std::size_t begin = offsets_[m];
+    const std::size_t end = offsets_[m + 1];
+    for (std::size_t c = 0; c < centroids_; ++c) {
+      const float* centroid =
+          codebooks_.data() + (m * centroids_ + c) * dim_;
+      float distance = 0.0f;
+      for (std::size_t d = begin; d < end; ++d) {
+        const float diff = query[d] - centroid[d];
+        distance += diff * diff;
+      }
+      table[m * centroids_ + c] = distance;
+    }
+  }
+  return table;
+}
+
+float PqAdcModel::adc_distance(std::uint32_t id,
+                              const std::vector<float>& table) const {
+  if (!enabled() || id * subspaces_ + subspaces_ > codes_.size() ||
+      table.size() != subspaces_ * centroids_) {
+    throw std::runtime_error("Invalid PQ ADC lookup");
+  }
+  float distance = 0.0f;
+  for (std::size_t m = 0; m < subspaces_; ++m) {
+    distance += table[m * centroids_ + codes_[id * subspaces_ + m]];
+  }
+  return distance;
+}
+
 void NaiveDiskGraphBuilder::build(const VectorSet& base,
                                   const std::string& path,
                                   const DiskGraphBuildConfig& config) {
+  // V1 基线：一个向量固定占用一个磁盘页，便于观察随机读放大。
   if (base.empty()) {
     throw std::runtime_error("Cannot build graph index for empty base vectors");
   }
@@ -419,6 +1737,7 @@ void NaiveDiskGraphBuilder::build(const VectorSet& base,
   if (record_bytes(base.dim, config.degree) > config.page_size) {
     throw std::runtime_error("Node record does not fit in configured page size");
   }
+  const auto graph = build_graph(base, config);
 
   std::ofstream output(path, std::ios::binary | std::ios::trunc);
   if (!output) {
@@ -443,7 +1762,7 @@ void NaiveDiskGraphBuilder::build(const VectorSet& base,
                static_cast<std::streamsize>(header_padding.size()));
 
   for (std::size_t i = 0; i < base.size(); ++i) {
-    const auto neighbors = exact_neighbors(base, i, config.degree);
+    const auto& neighbors = graph[i];
     std::vector<char> page(config.page_size, 0);
     std::size_t offset = 0;
     const auto id = static_cast<std::uint32_t>(i);
@@ -499,9 +1818,22 @@ NaiveDiskGraphIndex::NaiveDiskGraphIndex(const std::string& path)
   if (record_bytes(metadata_.dim, metadata_.degree) > metadata_.page_size) {
     throw std::runtime_error("Graph index record is larger than page size");
   }
+  page_reader_ = std::make_unique<DiskPageReader>(path_, metadata_.page_size);
 }
 
-NaiveDiskGraphIndex::DiskNode NaiveDiskGraphIndex::read_node(std::uint32_t id) {
+NaiveDiskGraphIndex::~NaiveDiskGraphIndex() = default;
+
+void NaiveDiskGraphIndex::configure_io(const std::string& mode,
+                                       std::size_t batch_size) {
+  page_reader_->configure(mode, batch_size);
+}
+
+const DiskGraphIoStatus& NaiveDiskGraphIndex::io_status() const {
+  return page_reader_->status();
+}
+
+NaiveDiskGraphIndex::DiskNode NaiveDiskGraphIndex::read_node(
+    std::uint32_t id, DiskGraphSearchStats& stats) {
   if (id >= metadata_.vector_count) {
     throw std::runtime_error("Graph node id out of range");
   }
@@ -509,17 +1841,8 @@ NaiveDiskGraphIndex::DiskNode NaiveDiskGraphIndex::read_node(std::uint32_t id) {
   const std::uint64_t offset =
       metadata_.records_offset +
       static_cast<std::uint64_t>(id) * metadata_.page_size;
-  input_.clear();
-  input_.seekg(static_cast<std::streamoff>(offset), std::ios::beg);
-  if (!input_) {
-    throw std::runtime_error("Failed to seek graph index: " + path_);
-  }
-
-  std::vector<char> page(metadata_.page_size, 0);
-  input_.read(page.data(), static_cast<std::streamsize>(page.size()));
-  if (!input_) {
-    throw std::runtime_error("Failed to read graph node page");
-  }
+  std::vector<char> page = page_reader_->read(offset, metadata_.page_size,
+                                               stats);
 
   std::size_t cursor = 0;
   DiskNode node;
@@ -564,17 +1887,37 @@ DiskGraphSearchResult NaiveDiskGraphIndex::search_one(
     if (found != local_nodes.end()) {
       return found->second;
     }
-    DiskNode node = read_node(id);
+    DiskNode node = read_node(id, output.stats);
     ++output.stats.node_reads;
     auto inserted = local_nodes.emplace(id, std::move(node));
     return inserted.first->second;
   };
 
+  std::vector<float> adc_table;
+  if (config.adc_enable && config.pq_model != nullptr) {
+    const auto adc_start = std::chrono::steady_clock::now();
+    adc_table = config.pq_model->build_adc_table(query);
+    const auto adc_end = std::chrono::steady_clock::now();
+    output.stats.adc_table_build_us =
+        std::chrono::duration<double, std::micro>(adc_end - adc_start).count();
+  }
+  auto query_distance = [&](std::uint32_t id, const DiskNode& node) {
+    if (!adc_table.empty()) {
+      return config.pq_model->adc_distance(id, adc_table);
+    }
+    return squared_l2(query, node.vector.data(), metadata_.dim);
+  };
+
+  const std::size_t effective_k =
+      std::min<std::size_t>(config.top_k,
+                            static_cast<std::size_t>(metadata_.vector_count));
+  const std::size_t result_capacity =
+      std::min<std::size_t>(
+          std::max(effective_k, config.rerank_topk),
+          static_cast<std::size_t>(metadata_.vector_count));
+
   auto add_best = [&](const SearchResult& result) {
-    const std::size_t effective_k =
-        std::min<std::size_t>(config.top_k,
-                              static_cast<std::size_t>(metadata_.vector_count));
-    if (best.size() < effective_k) {
+    if (best.size() < result_capacity) {
       best.push(result);
     } else {
       const auto& worst = best.top();
@@ -584,6 +1927,34 @@ DiskGraphSearchResult NaiveDiskGraphIndex::search_one(
         best.push(result);
       }
     }
+  };
+
+  auto should_stop = [&](const SearchResult& next) {
+    if (!config.early_stop || best.size() < result_capacity ||
+        output.stats.expanded < config.early_stop_min_expansions) {
+      return false;
+    }
+    const auto& worst = best.top();
+    return next.distance > worst.distance;
+  };
+  std::size_t stagnant_expansions = 0;
+  double previous_worst_distance = std::numeric_limits<double>::infinity();
+  auto update_adaptive_stop = [&]() {
+    if (!config.adaptive_early_stop || best.size() < result_capacity) {
+      return;
+    }
+    const double current = best.top().distance;
+    const double improvement =
+        std::isfinite(previous_worst_distance)
+            ? (previous_worst_distance - current) /
+                  std::max(1.0, std::abs(previous_worst_distance))
+            : std::numeric_limits<double>::infinity();
+    if (improvement > config.early_stop_eps) {
+      stagnant_expansions = 0;
+    } else {
+      ++stagnant_expansions;
+    }
+    previous_worst_distance = current;
   };
 
   const std::vector<std::uint32_t> entries =
@@ -599,14 +1970,22 @@ DiskGraphSearchResult NaiveDiskGraphIndex::search_one(
       continue;
     }
     const DiskNode& node = load_node(entry);
-    const float distance = squared_l2(query, node.vector.data(), metadata_.dim);
+    const float distance = query_distance(entry, node);
     const SearchResult result{entry, distance};
     candidates.push(result);
     add_best(result);
   }
 
   while (!candidates.empty() && output.stats.expanded < config.search_width) {
+    if (config.adaptive_early_stop &&
+        output.stats.expanded >= config.min_expansions &&
+        stagnant_expansions >= config.early_stop_patience) {
+      break;
+    }
     const SearchResult current = candidates.top();
+    if (should_stop(current)) {
+      break;
+    }
     candidates.pop();
     const DiskNode& node = load_node(current.id);
     ++output.stats.expanded;
@@ -617,22 +1996,40 @@ DiskGraphSearchResult NaiveDiskGraphIndex::search_one(
         continue;
       }
       const DiskNode& neighbor = load_node(neighbor_id);
-      const float distance =
-          squared_l2(query, neighbor.vector.data(), metadata_.dim);
+      const float distance = query_distance(neighbor_id, neighbor);
       const SearchResult candidate{neighbor_id, distance};
       candidates.push(candidate);
       add_best(candidate);
     }
+    update_adaptive_stop();
   }
 
   output.stats.visited = visited.size();
   output.topk = sorted_results(best);
+  if (!adc_table.empty() && config.rerank_topk > 0) {
+    for (auto& result : output.topk) {
+      const auto found = local_nodes.find(result.id);
+      if (found != local_nodes.end()) {
+        result.distance =
+            squared_l2(query, found->second.vector.data(), metadata_.dim);
+      }
+    }
+    std::sort(output.topk.begin(), output.topk.end(),
+              [](const SearchResult& lhs, const SearchResult& rhs) {
+                return lhs.distance == rhs.distance ? lhs.id < rhs.id
+                                                    : lhs.distance < rhs.distance;
+              });
+  }
+  if (output.topk.size() > effective_k) {
+    output.topk.resize(effective_k);
+  }
   return output;
 }
 
 void PackedDiskGraphBuilder::build(const VectorSet& base,
                                    const std::string& path,
                                    const DiskGraphBuildConfig& config) {
+  // V2 布局：多个节点共用一个页，降低图遍历过程中触发的页读取次数。
   if (base.empty()) {
     throw std::runtime_error("Cannot build packed graph index for empty base vectors");
   }
@@ -652,8 +2049,8 @@ void PackedDiskGraphBuilder::build(const VectorSet& base,
     throw std::runtime_error("Packed page cannot hold even one node");
   }
 
-  const auto graph = build_exact_graph(base, config.degree);
-  const auto order = packed_order(graph, config, nodes_per_page);
+  const auto graph = build_graph(base, config);
+  const auto order = packed_order(base, graph, config, nodes_per_page);
   if (order.size() != base.size()) {
     throw std::runtime_error("Packed order does not cover all nodes");
   }
@@ -671,7 +2068,7 @@ void PackedDiskGraphBuilder::build(const VectorSet& base,
   const std::uint64_t records_offset =
       align_up(directory_offset + directory_bytes, config.page_size);
 
-  std::vector<std::uint32_t> node_to_page(base.size(), 0);
+  std::vector<std::uint32_t> node_to_page(base.size(), 0);  // 查询时 O(1) 定位所在页。
   for (std::size_t position = 0; position < order.size(); ++position) {
     const std::uint32_t page_id =
         static_cast<std::uint32_t>(position / nodes_per_page);
@@ -725,14 +2122,14 @@ void PackedDiskGraphBuilder::build(const VectorSet& base,
     put_bytes(page, offset, static_cast<std::uint32_t>(page_id));
     put_bytes(page, offset, node_count);
 
-    for (std::size_t slot = 0; slot < nodes_per_page; ++slot) {
+    for (std::size_t slot = 0; slot < nodes_per_page; ++slot) {  // SoA: id 区。
       const std::uint32_t id =
           slot < node_count ? order[begin + slot]
                             : std::numeric_limits<std::uint32_t>::max();
       put_bytes(page, offset, id);
     }
 
-    for (std::size_t slot = 0; slot < nodes_per_page; ++slot) {
+    for (std::size_t slot = 0; slot < nodes_per_page; ++slot) {  // SoA: degree 区。
       const std::uint32_t degree =
           slot < node_count
               ? static_cast<std::uint32_t>(graph[order[begin + slot]].size())
@@ -740,7 +2137,7 @@ void PackedDiskGraphBuilder::build(const VectorSet& base,
       put_bytes(page, offset, degree);
     }
 
-    for (std::size_t slot = 0; slot < nodes_per_page; ++slot) {
+    for (std::size_t slot = 0; slot < nodes_per_page; ++slot) {  // SoA: vector 区。
       if (offset + base.dim * sizeof(float) > page.size()) {
         throw std::runtime_error("Packed vector block exceeds page size");
       }
@@ -751,7 +2148,7 @@ void PackedDiskGraphBuilder::build(const VectorSet& base,
       offset += base.dim * sizeof(float);
     }
 
-    for (std::size_t slot = 0; slot < nodes_per_page; ++slot) {
+    for (std::size_t slot = 0; slot < nodes_per_page; ++slot) {  // SoA: neighbor 区。
       const std::uint32_t node_id =
           slot < node_count ? order[begin + slot]
                             : std::numeric_limits<std::uint32_t>::max();
@@ -813,7 +2210,10 @@ PackedDiskGraphIndex::PackedDiskGraphIndex(const std::string& path)
   if (!input_) {
     throw std::runtime_error("Failed to read packed graph directory");
   }
+  page_reader_ = std::make_unique<DiskPageReader>(path_, metadata_.page_size);
 }
+
+PackedDiskGraphIndex::~PackedDiskGraphIndex() = default;
 
 void PackedDiskGraphIndex::configure_cache(const std::string& policy,
                                            std::size_t capacity_pages) {
@@ -828,8 +2228,18 @@ void PackedDiskGraphIndex::configure_cache(const std::string& policy,
   cache_capacity_pages_ = capacity_pages;
 }
 
+void PackedDiskGraphIndex::configure_io(const std::string& mode,
+                                        std::size_t batch_size) {
+  page_reader_->configure(mode, batch_size);
+}
+
+const DiskGraphIoStatus& PackedDiskGraphIndex::io_status() const {
+  return page_reader_->status();
+}
+
 PackedDiskGraphIndex::DecodedPage PackedDiskGraphIndex::read_page(
-    std::uint32_t page_id) {
+    std::uint32_t page_id, DiskGraphSearchStats& stats) {
+  // 解码顺序必须与 PackedDiskGraphBuilder 写入的四个 SoA 区域严格一致。
   if (page_id >= metadata_.page_count) {
     throw std::runtime_error("Packed page id out of range");
   }
@@ -837,17 +2247,8 @@ PackedDiskGraphIndex::DecodedPage PackedDiskGraphIndex::read_page(
   const std::uint64_t offset =
       metadata_.records_offset +
       static_cast<std::uint64_t>(page_id) * metadata_.page_size;
-  input_.clear();
-  input_.seekg(static_cast<std::streamoff>(offset), std::ios::beg);
-  if (!input_) {
-    throw std::runtime_error("Failed to seek packed graph index: " + path_);
-  }
-
-  std::vector<char> page(metadata_.page_size, 0);
-  input_.read(page.data(), static_cast<std::streamsize>(page.size()));
-  if (!input_) {
-    throw std::runtime_error("Failed to read packed graph page");
-  }
+  std::vector<char> page = page_reader_->read(offset, metadata_.page_size,
+                                               stats);
 
   std::size_t cursor = 0;
   DecodedPage decoded;
@@ -910,7 +2311,7 @@ double PackedDiskGraphIndex::cache_score(const CacheEntry& entry) const {
   const double frequency = static_cast<double>(entry.frequency);
   const double recency = static_cast<double>(entry.last_access);
   const double density = static_cast<double>(entry.page.nodes.size());
-  return frequency * 1000.0 + recency + density * 0.01;
+  return frequency * 1000.0 + recency + density * 0.01;  // Agent 策略优先长期热点。
 }
 
 void PackedDiskGraphIndex::evict_one_page() {
@@ -938,7 +2339,7 @@ const PackedDiskGraphIndex::DecodedPage& PackedDiskGraphIndex::load_page(
   if (cache_policy_ != "none" && cache_capacity_pages_ > 0) {
     auto found = page_cache_.find(page_id);
     if (found != page_cache_.end()) {
-      ++stats.page_cache_hits;
+      ++stats.page_cache_hits;  // 跨 query 复用已解码页。
       found->second.last_access = ++cache_clock_;
       ++found->second.frequency;
       return found->second.page;
@@ -947,7 +2348,7 @@ const PackedDiskGraphIndex::DecodedPage& PackedDiskGraphIndex::load_page(
 
   ++stats.page_cache_misses;
   ++stats.node_reads;
-  DecodedPage page = read_page(page_id);
+  DecodedPage page = read_page(page_id, stats);
 
   if (cache_policy_ == "none" || cache_capacity_pages_ == 0) {
     scratch_page_ = std::move(page);
@@ -975,7 +2376,7 @@ DiskGraphSearchResult PackedDiskGraphIndex::search_one(
 
   DiskGraphSearchResult output;
   std::unordered_set<std::uint32_t> visited;
-  std::unordered_map<std::uint32_t, DiskNode> local_nodes;
+  std::unordered_map<std::uint32_t, DiskNode> local_nodes;  // 单次查询内避免重复解码节点。
   std::priority_queue<SearchResult, std::vector<SearchResult>, CloserFirst>
       candidates;
   std::priority_queue<SearchResult, std::vector<SearchResult>, WorseResultFirst>
@@ -987,7 +2388,7 @@ DiskGraphSearchResult PackedDiskGraphIndex::search_one(
       return node_found->second;
     }
 
-    const std::uint32_t page_id = node_to_page_[id];
+    const std::uint32_t page_id = node_to_page_[id];  // 一次读页会顺带缓存页内其他节点。
     const DecodedPage& page = load_page(page_id, output.stats);
     for (const auto& node : page.nodes) {
       local_nodes.emplace(node.id, node);
@@ -1000,11 +2401,31 @@ DiskGraphSearchResult PackedDiskGraphIndex::search_one(
     return node_found->second;
   };
 
+  std::vector<float> adc_table;  // 留空时使用原始向量距离。
+  if (config.adc_enable && config.pq_model != nullptr) {
+    const auto adc_start = std::chrono::steady_clock::now();
+    adc_table = config.pq_model->build_adc_table(query);
+    const auto adc_end = std::chrono::steady_clock::now();
+    output.stats.adc_table_build_us =
+        std::chrono::duration<double, std::micro>(adc_end - adc_start).count();
+  }
+  auto query_distance = [&](std::uint32_t id, const DiskNode& node) {
+    if (!adc_table.empty()) {
+      return config.pq_model->adc_distance(id, adc_table);
+    }
+    return squared_l2(query, node.vector.data(), metadata_.dim);
+  };
+
+  const std::size_t effective_k =
+      std::min<std::size_t>(config.top_k,
+                            static_cast<std::size_t>(metadata_.vector_count));
+  const std::size_t result_capacity =
+      std::min<std::size_t>(
+          std::max(effective_k, config.rerank_topk),
+          static_cast<std::size_t>(metadata_.vector_count));
+
   auto add_best = [&](const SearchResult& result) {
-    const std::size_t effective_k =
-        std::min<std::size_t>(config.top_k,
-                              static_cast<std::size_t>(metadata_.vector_count));
-    if (best.size() < effective_k) {
+    if (best.size() < result_capacity) {
       best.push(result);
     } else {
       const auto& worst = best.top();
@@ -1014,6 +2435,34 @@ DiskGraphSearchResult PackedDiskGraphIndex::search_one(
         best.push(result);
       }
     }
+  };
+
+  auto should_stop = [&](const SearchResult& next) {  // frontier 已不可能改善 Top-K。
+    if (!config.early_stop || best.size() < result_capacity ||
+        output.stats.expanded < config.early_stop_min_expansions) {
+      return false;
+    }
+    const auto& worst = best.top();
+    return next.distance > worst.distance;
+  };
+  std::size_t stagnant_expansions = 0;
+  double previous_worst_distance = std::numeric_limits<double>::infinity();
+  auto update_adaptive_stop = [&]() {
+    if (!config.adaptive_early_stop || best.size() < result_capacity) {
+      return;
+    }
+    const double current = best.top().distance;
+    const double improvement =
+        std::isfinite(previous_worst_distance)
+            ? (previous_worst_distance - current) /
+                  std::max(1.0, std::abs(previous_worst_distance))
+            : std::numeric_limits<double>::infinity();
+    if (improvement > config.early_stop_eps) {
+      stagnant_expansions = 0;
+    } else {
+      ++stagnant_expansions;
+    }
+    previous_worst_distance = current;
   };
 
   const std::vector<std::uint32_t> entries =
@@ -1029,14 +2478,22 @@ DiskGraphSearchResult PackedDiskGraphIndex::search_one(
       continue;
     }
     const DiskNode& node = load_node(entry);
-    const float distance = squared_l2(query, node.vector.data(), metadata_.dim);
+    const float distance = query_distance(entry, node);
     const SearchResult result{entry, distance};
     candidates.push(result);
     add_best(result);
   }
 
   while (!candidates.empty() && output.stats.expanded < config.search_width) {
+    if (config.adaptive_early_stop &&
+        output.stats.expanded >= config.min_expansions &&
+        stagnant_expansions >= config.early_stop_patience) {
+      break;
+    }
     const SearchResult current = candidates.top();
+    if (should_stop(current)) {
+      break;
+    }
     candidates.pop();
     const DiskNode& node = load_node(current.id);
     ++output.stats.expanded;
@@ -1047,16 +2504,33 @@ DiskGraphSearchResult PackedDiskGraphIndex::search_one(
         continue;
       }
       const DiskNode& neighbor = load_node(neighbor_id);
-      const float distance =
-          squared_l2(query, neighbor.vector.data(), metadata_.dim);
+      const float distance = query_distance(neighbor_id, neighbor);
       const SearchResult candidate{neighbor_id, distance};
       candidates.push(candidate);
       add_best(candidate);
     }
+    update_adaptive_stop();
   }
 
   output.stats.visited = visited.size();
   output.topk = sorted_results(best);
+  if (!adc_table.empty() && config.rerank_topk > 0) {  // 用原始向量恢复候选排序精度。
+    for (auto& result : output.topk) {
+      const auto found = local_nodes.find(result.id);
+      if (found != local_nodes.end()) {
+        result.distance =
+            squared_l2(query, found->second.vector.data(), metadata_.dim);
+      }
+    }
+    std::sort(output.topk.begin(), output.topk.end(),
+              [](const SearchResult& lhs, const SearchResult& rhs) {
+                return lhs.distance == rhs.distance ? lhs.id < rhs.id
+                                                    : lhs.distance < rhs.distance;
+              });
+  }
+  if (output.topk.size() > effective_k) {
+    output.topk.resize(effective_k);
+  }
   return output;
 }
 

@@ -17,7 +17,7 @@ struct WorseFirst {
     if (lhs.distance == rhs.distance) {
       return lhs.id < rhs.id;
     }
-    return lhs.distance < rhs.distance;
+    return lhs.distance < rhs.distance;  // priority_queue 顶部保留当前最差结果。
   }
 };
 
@@ -44,7 +44,7 @@ std::vector<SearchResult> BruteForceIndex::search_one(const float* query,
     return {};
   }
 
-  const std::size_t effective_k = std::min(k, base_.size());
+  const std::size_t effective_k = std::min(k, base_.size());  // 防止 k 超过数据量。
   std::priority_queue<HeapItem, std::vector<HeapItem>, WorseFirst> heap;
 
   for (std::size_t i = 0; i < base_.size(); ++i) {
@@ -53,7 +53,7 @@ std::vector<SearchResult> BruteForceIndex::search_one(const float* query,
     if (heap.size() < effective_k) {
       heap.push(item);
     } else {
-      const HeapItem& worst = heap.top();
+      const HeapItem& worst = heap.top();  // 新结果更优时替换堆顶。
       if (distance < worst.distance ||
           (distance == worst.distance && item.id < worst.id)) {
         heap.pop();
@@ -69,7 +69,7 @@ std::vector<SearchResult> BruteForceIndex::search_one(const float* query,
     heap.pop();
   }
 
-  std::sort(results.begin(), results.end(),
+  std::sort(results.begin(), results.end(),  // 对外统一返回从近到远的顺序。
             [](const SearchResult& lhs, const SearchResult& rhs) {
               if (lhs.distance == rhs.distance) {
                 return lhs.id < rhs.id;
@@ -94,4 +94,3 @@ std::vector<std::vector<SearchResult>> BruteForceIndex::search_batch(
 }
 
 }  // namespace agentmem
-

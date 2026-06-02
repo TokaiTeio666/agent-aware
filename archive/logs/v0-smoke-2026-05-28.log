@@ -1,0 +1,20 @@
+Command:
+powershell -ExecutionPolicy Bypass -File .\scripts\run_v0_smoke.ps1
+
+Log:
+Built C:\Users\admin\文档\agent-aware\build\agentmem_flow.exe
+mode=synthetic
+engine=exact
+base_count=1000
+query_count=100
+dim=32
+k=10
+truth=exact_self
+recall_at_10=1.0000
+one_minus_recall_at_10=0.0000
+qps=26634.7050
+avg_latency_ms=0.0375
+p50_latency_ms=0.0360
+p95_latency_ms=0.0495
+p99_latency_ms=0.0583
+elapsed_seconds=0.0038

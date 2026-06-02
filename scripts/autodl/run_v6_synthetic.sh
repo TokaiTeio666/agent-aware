@@ -35,9 +35,19 @@ COMMON=(
   --path-cache-policy reuse
   --path-cache-capacity "${PATH_CACHE_CAPACITY:-128}"
   --path-cache-hit-search-width "${PATH_CACHE_HIT_SEARCH_WIDTH:-96}"
+  --query-signature-policy "${QUERY_SIGNATURE_POLICY:-routed}"
+  --simhash-bits "${SIMHASH_BITS:-16}"
+  --pq-prefix-subspaces "${PQ_PREFIX_SUBSPACES:-4}"
+  --pq-prefix-centroids "${PQ_PREFIX_CENTROIDS:-16}"
+  --pq-prefix-train-iterations "${PQ_PREFIX_TRAIN_ITERATIONS:-4}"
   --workload-mode mixed
   --operation-count "${OPERATION_COUNT:-360}"
   --write-ratio "${WRITE_RATIO:-20}"
+  --delta-index-policy "${DELTA_INDEX_POLICY:-flat}"
+  --delta-ivf-centroids "${DELTA_IVF_CENTROIDS:-32}"
+  --delta-ivf-probes "${DELTA_IVF_PROBES:-16}"
+  --delta-ivf-train-iterations "${DELTA_IVF_TRAIN_ITERATIONS:-6}"
+  --delta-ivf-rebuild-interval "${DELTA_IVF_REBUILD_INTERVAL:-32}"
   --delta-compaction-threshold "${DELTA_COMPACTION_THRESHOLD:-24}"
   --compaction-batch-size "${COMPACTION_BATCH_SIZE:-8}"
   --compaction-work-us 0
@@ -46,6 +56,10 @@ COMMON=(
   --run-type "${RUN_TYPE:-warm}"
   --warmup-runs "${WARMUP_RUNS:-1}"
 )
+
+if [[ "${WAL_REPLAY:-0}" == "1" ]]; then
+  COMMON+=(--wal-replay)
+fi
 
 INDEX="$RUN_DIR/v6_packed_coaccess.idx"
 RESULT="$ROOT/archive/results/v6-autodl-synthetic-$DATE_TAG.txt"
@@ -94,8 +108,19 @@ cat > "$CONFIG" <<JSON
   "workload": {
     "operation_count": ${OPERATION_COUNT:-360},
     "write_ratio_percent": ${WRITE_RATIO:-20},
+    "delta_index_policy": "${DELTA_INDEX_POLICY:-flat}",
+    "delta_ivf_centroids": ${DELTA_IVF_CENTROIDS:-32},
+    "delta_ivf_probes": ${DELTA_IVF_PROBES:-16},
+    "delta_ivf_train_iterations": ${DELTA_IVF_TRAIN_ITERATIONS:-6},
+    "delta_ivf_rebuild_interval": ${DELTA_IVF_REBUILD_INTERVAL:-32},
+    "wal_replay": ${WAL_REPLAY:-0},
     "run_type": "${RUN_TYPE:-warm}",
-    "warmup_runs": ${WARMUP_RUNS:-1}
+    "warmup_runs": ${WARMUP_RUNS:-1},
+    "query_signature_policy": "${QUERY_SIGNATURE_POLICY:-routed}",
+    "simhash_bits": ${SIMHASH_BITS:-16},
+    "pq_prefix_subspaces": ${PQ_PREFIX_SUBSPACES:-4},
+    "pq_prefix_centroids": ${PQ_PREFIX_CENTROIDS:-16},
+    "pq_prefix_train_iterations": ${PQ_PREFIX_TRAIN_ITERATIONS:-4}
   },
   "compaction": {
     "io_mode": "file",

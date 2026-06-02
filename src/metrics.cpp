@@ -12,7 +12,7 @@ double percentile_sorted(const std::vector<double>& sorted, double p) {
   if (sorted.empty()) {
     return 0.0;
   }
-  const double pos = (static_cast<double>(sorted.size()) - 1.0) * p;
+  const double pos = (static_cast<double>(sorted.size()) - 1.0) * p;  // 线性插值。
   const auto lower = static_cast<std::size_t>(pos);
   const auto upper = std::min(lower + 1, sorted.size() - 1);
   const double fraction = pos - static_cast<double>(lower);
@@ -33,7 +33,7 @@ double recall_at_k(const std::vector<std::vector<SearchResult>>& results,
 
   double total = 0.0;
   for (std::size_t i = 0; i < results.size(); ++i) {
-    std::unordered_set<std::uint32_t> truth_ids;
+    std::unordered_set<std::uint32_t> truth_ids;  // 每个 query 单独计算命中率。
     const std::size_t truth_k = std::min(k, truth[i].size());
     for (std::size_t j = 0; j < truth_k; ++j) {
       truth_ids.insert(truth[i][j]);
@@ -46,7 +46,7 @@ double recall_at_k(const std::vector<std::vector<SearchResult>>& results,
         ++hits;
       }
     }
-    total += truth_k == 0 ? 0.0 : static_cast<double>(hits) / truth_k;
+    total += truth_k == 0 ? 0.0 : static_cast<double>(hits) / truth_k;  // macro 平均。
   }
 
   return total / static_cast<double>(results.size());
@@ -58,7 +58,7 @@ LatencyStats summarize_latency(const std::vector<double>& latencies_ms) {
     return stats;
   }
 
-  std::vector<double> sorted = latencies_ms;
+  std::vector<double> sorted = latencies_ms;  // 不改变调用方保留的原始采样顺序。
   std::sort(sorted.begin(), sorted.end());
   stats.avg_ms =
       std::accumulate(sorted.begin(), sorted.end(), 0.0) /
@@ -77,4 +77,3 @@ double queries_per_second(std::size_t query_count, double elapsed_seconds) {
 }
 
 }  // namespace agentmem
-
