@@ -107,6 +107,8 @@ struct Args {  // 汇总 CLI 参数，后续实验路径只传递这一份配置
   std::size_t pq_train_iterations = 4;
   std::size_t rerank_topk = 0;
   std::size_t io_batch_size = 1;
+  std::size_t memory_budget_bytes = 0;
+  double memory_budget_ratio = 0.20;
   bool synthetic = true;
   bool build_index = false;
   bool wal_replay = false;
@@ -115,7 +117,30 @@ struct Args {  // 汇总 CLI 参数，后续实验路径只传递这一份配置
   bool adaptive_early_stop = false;
   bool pq_enable = false;
   bool adc_enable = false;
+  bool enforce_memory_budget = false;
+  bool allow_over_budget_for_debug = false;
   agentmem::SyntheticConfig synthetic_config;
+};
+
+struct MemoryReport {
+  std::size_t raw_vector_bytes = 0;
+  std::size_t budget_bytes = 0;
+  std::size_t resident_bytes = 0;
+  std::size_t bytes_raw_vectors_resident = 0;
+  std::size_t bytes_pq_codes = 0;
+  std::size_t bytes_pq_codebooks = 0;
+  std::size_t bytes_graph_metadata = 0;
+  std::size_t bytes_cache = 0;
+  std::size_t bytes_path_cache = 0;
+  std::size_t bytes_router = 0;
+  std::size_t bytes_delta = 0;
+  std::size_t bytes_tombstone = 0;
+  std::size_t bytes_temporary_peak = 0;
+  double budget_ratio = 0.20;
+  double resident_ratio = 0.0;
+  bool budget_pass = true;
+  bool memory_mode = false;
+  bool over_budget_allowed = false;
 };
 
 struct RunOutput {  // 保留逐 query 原始样本，最终统一计算分位数和吞吐。
@@ -167,6 +192,7 @@ struct RunOutput {  // 保留逐 query 原始样本，最终统一计算分位�
   std::size_t hotpath_train_queries = 0;
   std::size_t hotpath_unique_visited_nodes = 0;
   std::size_t hotpath_top_node_visit_count = 0;
+  MemoryReport memory;
 };
 
 void print_usage(const char* program) {
@@ -277,6 +303,10 @@ void print_usage(const char* program) {
       << "  --rerank-topk N      Raw-vector rerank candidates, default 0\n"
       << "  --io-mode NAME       pread, odirect, or io_uring, default pread\n"
       << "  --io-batch-size N    Requested async I/O batch size, default 1\n"
+      << "  --memory-budget-ratio X  Resident memory budget/raw vectors, default 0.20\n"
+      << "  --memory-budget-bytes N  Hard resident memory budget in bytes\n"
+      << "  --enforce-memory-budget  Fail if resident engine memory exceeds budget\n"
+      << "  --allow-over-budget-for-debug  Report but do not fail over-budget runs\n"
       << "  --help               Show this help\n";
 }
 
@@ -298,6 +328,48 @@ double parse_double(const std::string& value, const std::string& name) {
     throw std::runtime_error("Invalid numeric value for " + name + ": " + value);
   }
   return parsed;
+}
+
+std::size_t checked_add(std::size_t lhs, std::size_t rhs,
+                        const std::string& label) {
+  if (rhs > std::numeric_limits<std::size_t>::max() - lhs) {
+    throw std::runtime_error("Memory estimate overflow while adding " + label);
+  }
+  return lhs + rhs;
+}
+
+std::size_t checked_mul(std::size_t lhs, std::size_t rhs,
+                        const std::string& label) {
+  if (lhs != 0 && rhs > std::numeric_limits<std::size_t>::max() / lhs) {
+    throw std::runtime_error("Memory estimate overflow while multiplying " +
+                             label);
+  }
+  return lhs * rhs;
+}
+
+void add_memory_component(std::size_t& total, std::size_t bytes,
+                          const std::string& label) {
+  total = checked_add(total, bytes, label);
+}
+
+std::size_t ratio_budget_bytes(std::size_t raw_vector_bytes,
+                               double memory_budget_ratio) {
+  if (raw_vector_bytes == 0) {
+    return 0;
+  }
+  const double budget =
+      std::floor(static_cast<double>(raw_vector_bytes) * memory_budget_ratio);
+  return static_cast<std::size_t>(std::max(1.0, budget));
+}
+
+std::size_t memory_budget_bytes(const Args& args,
+                                std::size_t raw_vector_bytes) {
+  const std::size_t ratio_budget =
+      ratio_budget_bytes(raw_vector_bytes, args.memory_budget_ratio);
+  if (args.memory_budget_bytes == 0) {
+    return ratio_budget;
+  }
+  return std::min(args.memory_budget_bytes, ratio_budget);
 }
 
 std::string join_path(const std::string& dir, const std::string& name) {
@@ -510,6 +582,14 @@ Args parse_args(int argc, char** argv) {
       args.io_mode = require_value(opt);
     } else if (opt == "--io-batch-size") {
       args.io_batch_size = parse_size(require_value(opt), opt);
+    } else if (opt == "--memory-budget-ratio") {
+      args.memory_budget_ratio = parse_double(require_value(opt), opt);
+    } else if (opt == "--memory-budget-bytes") {
+      args.memory_budget_bytes = parse_size(require_value(opt), opt);
+    } else if (opt == "--enforce-memory-budget") {
+      args.enforce_memory_budget = true;
+    } else if (opt == "--allow-over-budget-for-debug") {
+      args.allow_over_budget_for_debug = true;
     } else {
       throw std::runtime_error("Unknown option: " + opt);
     }
@@ -675,6 +755,9 @@ Args parse_args(int argc, char** argv) {
   if (args.io_batch_size == 0) {
     throw std::runtime_error("--io-batch-size must be positive");
   }
+  if (args.memory_budget_ratio <= 0.0 || args.memory_budget_ratio > 1.0) {
+    throw std::runtime_error("--memory-budget-ratio must be in (0, 1]");
+  }
 
   return args;
 }
@@ -777,6 +860,23 @@ class QueryPathCache {
 
   bool enabled() const {
     return policy_ == "reuse" && capacity_ > 0;
+  }
+
+  std::size_t estimated_capacity_bytes(std::size_t entry_count,
+                                       std::size_t top_k) const {
+    if (!enabled()) {
+      return 0;
+    }
+    std::size_t bytes = checked_mul(capacity_, sizeof(PathCacheEntry),
+                                    "path cache entries");
+    const std::size_t ids_per_entry = checked_add(entry_count, top_k,
+                                                  "path cache ids/entry");
+    const std::size_t id_bytes =
+        checked_mul(ids_per_entry, sizeof(std::uint32_t), "path cache ids");
+    add_memory_component(bytes, checked_mul(capacity_, id_bytes,
+                                            "path cache capacity ids"),
+                         "path cache ids");
+    return bytes;
   }
 
   const PathCacheEntry* lookup(std::uint32_t signature) {
@@ -897,6 +997,40 @@ class ResidentQueryRouter {
 
     routed.signature = signature_for(query, routed.signature);
     return routed;
+  }
+
+  std::size_t estimated_bytes() const {
+    std::size_t bytes = sizeof(*this);
+    add_memory_component(
+        bytes,
+        checked_mul(sample_ids_.capacity(), sizeof(std::uint32_t),
+                    "router sample ids"),
+        "router sample ids");
+    add_memory_component(
+        bytes,
+        checked_mul(checked_mul(sample_ids_.size(), base_.dim,
+                                "router sampled vectors"),
+                    sizeof(float), "router sampled vector bytes"),
+        "router sampled vectors");
+    add_memory_component(
+        bytes,
+        checked_mul(simhash_planes_.capacity(), sizeof(float),
+                    "router simhash planes"),
+        "router simhash planes");
+    add_memory_component(
+        bytes,
+        checked_mul(pq_subspaces_.capacity(),
+                    sizeof(std::size_t) * 2 + sizeof(std::vector<float>),
+                    "router pq subspaces"),
+        "router pq subspaces");
+    for (const auto& subspace : pq_subspaces_) {
+      add_memory_component(
+          bytes,
+          checked_mul(subspace.centroids.capacity(), sizeof(float),
+                      "router pq centroids"),
+          "router pq centroids");
+    }
+    return bytes;
   }
 
  private:
@@ -1127,6 +1261,161 @@ class ResidentQueryRouter {
   std::vector<float> simhash_planes_;
   std::vector<PqSubspace> pq_subspaces_;
 };
+
+std::size_t estimate_temporary_peak_bytes(const Args& args, std::size_t dim) {
+  const std::size_t expansions =
+      std::max({args.search_width, args.max_expansions,
+                args.search_early_stop_min_expansions, args.min_expansions});
+  std::size_t candidates = checked_add(expansions, args.entry_count,
+                                       "temporary candidates");
+  candidates = checked_add(candidates, args.k, "temporary top-k");
+  candidates = checked_add(candidates, args.rerank_topk, "temporary rerank");
+
+  std::size_t bytes = checked_mul(candidates, sizeof(agentmem::SearchResult),
+                                  "temporary search results");
+  add_memory_component(
+      bytes,
+      checked_mul(candidates, sizeof(std::uint32_t), "temporary visited ids"),
+      "temporary visited ids");
+  add_memory_component(bytes, checked_mul(dim, sizeof(float), "query vector"),
+                       "query vector");
+  if (args.adc_enable && args.pq_enable) {
+    add_memory_component(
+        bytes,
+        checked_mul(checked_mul(args.pq_m, args.pq_ks, "ADC table entries"),
+                    sizeof(float), "ADC table bytes"),
+        "ADC table");
+  }
+  return bytes;
+}
+
+std::size_t estimate_graph_metadata_bytes(const Args& args,
+                                          const agentmem::DiskGraphMetadata& md) {
+  std::size_t bytes = sizeof(md);
+  if (args.layout == "packed") {
+    add_memory_component(
+        bytes,
+        checked_mul(static_cast<std::size_t>(md.vector_count),
+                    sizeof(std::uint32_t), "packed node-to-page directory"),
+        "packed node-to-page directory");
+  }
+  return bytes;
+}
+
+std::size_t estimate_cache_bytes(const Args& args,
+                                 const agentmem::DiskGraphMetadata& md) {
+  if (args.layout != "packed" || args.cache_policy == "none" ||
+      args.cache_pages == 0) {
+    return 0;
+  }
+  return checked_mul(args.cache_pages, static_cast<std::size_t>(md.page_size),
+                     "page cache bytes");
+}
+
+std::size_t estimate_delta_bytes(const Args& args, const RunOutput& output,
+                                 std::size_t dim) {
+  const std::size_t total_delta =
+      checked_add(output.delta_active_size, output.delta_sealed_size,
+                  "delta vector count");
+  std::size_t bytes = checked_mul(
+      total_delta,
+      checked_add(sizeof(std::uint32_t),
+                  checked_mul(dim, sizeof(float), "delta vector bytes"),
+                  "delta record bytes"),
+      "delta flat bytes");
+  if (args.delta_index_policy == "ivf-flat" && total_delta > 0) {
+    add_memory_component(bytes, bytes, "delta IVF mirrored vectors");
+    add_memory_component(
+        bytes,
+        checked_mul(checked_mul(args.delta_ivf_centroids, dim,
+                                "delta IVF centroids"),
+                    sizeof(float), "delta IVF centroid bytes"),
+        "delta IVF centroids");
+  }
+  return bytes;
+}
+
+std::size_t estimate_tombstone_bytes(const RunOutput& output,
+                                     std::size_t base_count) {
+  if (output.tombstone_count == 0) {
+    return 0;
+  }
+  return checked_add((base_count + 7) / 8, output.tombstone_count,
+                     "tombstone bitmap plus sparse deletes");
+}
+
+void finalize_memory_report(const Args& args, MemoryReport& report) {
+  report.budget_ratio = args.memory_budget_ratio;
+  report.budget_bytes = memory_budget_bytes(args, report.raw_vector_bytes);
+  report.over_budget_allowed = args.allow_over_budget_for_debug;
+
+  std::size_t resident = 0;
+  add_memory_component(resident, report.bytes_raw_vectors_resident,
+                       "raw resident vectors");
+  add_memory_component(resident, report.bytes_pq_codes, "PQ codes");
+  add_memory_component(resident, report.bytes_pq_codebooks, "PQ codebooks");
+  add_memory_component(resident, report.bytes_graph_metadata, "graph metadata");
+  add_memory_component(resident, report.bytes_cache, "page cache");
+  add_memory_component(resident, report.bytes_path_cache, "path cache");
+  add_memory_component(resident, report.bytes_router, "router");
+  add_memory_component(resident, report.bytes_delta, "delta");
+  add_memory_component(resident, report.bytes_tombstone, "tombstone");
+  add_memory_component(resident, report.bytes_temporary_peak, "temporary peak");
+  report.resident_bytes = resident;
+  report.resident_ratio =
+      report.raw_vector_bytes == 0
+          ? 0.0
+          : static_cast<double>(report.resident_bytes) /
+                static_cast<double>(report.raw_vector_bytes);
+  report.budget_pass = report.resident_bytes <= report.budget_bytes;
+
+  if (args.enforce_memory_budget && !report.budget_pass &&
+      !args.allow_over_budget_for_debug) {
+    throw std::runtime_error(
+        "Resident engine memory exceeds --memory-budget-ratio/bytes; "
+        "rerun with --allow-over-budget-for-debug to collect debug metrics");
+  }
+}
+
+MemoryReport build_exact_memory_report(const Args& args,
+                                       const agentmem::VectorSet& base) {
+  MemoryReport report;
+  report.memory_mode = true;
+  report.raw_vector_bytes = checked_mul(base.values.size(), sizeof(float),
+                                        "raw exact vectors");
+  report.bytes_raw_vectors_resident = report.raw_vector_bytes;
+  report.bytes_temporary_peak = estimate_temporary_peak_bytes(args, base.dim);
+  finalize_memory_report(args, report);
+  return report;
+}
+
+template <typename Index>
+MemoryReport build_graph_memory_report(
+    const Args& args, const Index& index, const agentmem::VectorSet& base,
+    const agentmem::PqAdcModel* pq_model, const QueryPathCache& path_cache,
+    const ResidentQueryRouter& router, const RunOutput& output) {
+  MemoryReport report;
+  report.memory_mode = false;
+  report.raw_vector_bytes = checked_mul(base.values.size(), sizeof(float),
+                                        "raw graph vectors");
+  if (pq_model != nullptr) {
+    report.bytes_pq_codes = pq_model->code_bytes();
+    report.bytes_pq_codebooks =
+        checked_add(pq_model->codebook_bytes(), pq_model->offset_bytes(),
+                    "PQ codebooks and offsets");
+  }
+  report.bytes_graph_metadata =
+      estimate_graph_metadata_bytes(args, index.metadata());
+  report.bytes_cache = estimate_cache_bytes(args, index.metadata());
+  report.bytes_path_cache =
+      path_cache.estimated_capacity_bytes(args.entry_count, args.k);
+  report.bytes_router = router.estimated_bytes();
+  report.bytes_delta = estimate_delta_bytes(args, output, base.dim);
+  report.bytes_tombstone = estimate_tombstone_bytes(output, base.size());
+  report.bytes_temporary_peak = estimate_temporary_peak_bytes(args, base.dim);
+  finalize_memory_report(args, report);
+  return report;
+}
 
 template <typename Index>
 agentmem::DiskGraphSearchResult search_graph_one_with_routing(
@@ -1897,8 +2186,6 @@ RunOutput run_graph_with_index(Index& index, const Args& args,
     pq_train_seconds =
         std::chrono::duration<double>(pq_end - pq_start).count();
   }
-  const std::size_t raw_vector_bytes = base.values.size() * sizeof(float);
-  const std::size_t pq_code_bytes = pq_model ? pq_model->code_bytes() : 0;
   std::cout << "pq_enable=" << (args.pq_enable ? 1 : 0) << "\n";
   std::cout << "pq_m=" << args.pq_m << "\n";
   std::cout << "pq_ks=" << args.pq_ks << "\n";
@@ -1907,14 +2194,6 @@ RunOutput run_graph_with_index(Index& index, const Args& args,
   std::cout << "pq_train_seconds=" << pq_train_seconds << "\n";
   std::cout << "adc_enable=" << (args.adc_enable ? 1 : 0) << "\n";
   std::cout << "rerank_topk=" << args.rerank_topk << "\n";
-  std::cout << "memory_bytes_raw_vectors=" << raw_vector_bytes << "\n";
-  std::cout << "memory_bytes_pq_codes=" << pq_code_bytes << "\n";
-  std::cout << "memory_compression_ratio="
-            << (pq_code_bytes == 0
-                    ? 0.0
-                    : static_cast<double>(raw_vector_bytes) /
-                          static_cast<double>(pq_code_bytes))
-            << "\n";
 
   QueryPathCache path_cache(args.path_cache_policy, args.path_cache_capacity);
   ResidentQueryRouter router(args, base);
@@ -1931,6 +2210,9 @@ RunOutput run_graph_with_index(Index& index, const Args& args,
                                    router, pq_model.get());
   }
   output.pq_train_seconds = pq_train_seconds;
+  output.memory =
+      build_graph_memory_report(args, index, base, pq_model.get(), path_cache,
+                                router, output);
   return output;
 }
 
@@ -2010,6 +2292,42 @@ double sum_values(const std::vector<double>& values) {
   return sum;
 }
 
+void print_memory_report(const Args& args, const MemoryReport& report) {
+  std::cout << "memory_budget_ratio=" << report.budget_ratio << "\n";
+  std::cout << "memory_budget_bytes=" << report.budget_bytes << "\n";
+  std::cout << "memory_budget_bytes_user=" << args.memory_budget_bytes << "\n";
+  std::cout << "memory_budget_enforced="
+            << (args.enforce_memory_budget ? 1 : 0) << "\n";
+  std::cout << "memory_over_budget_allowed="
+            << (report.over_budget_allowed ? 1 : 0) << "\n";
+  std::cout << "memory_resident_bytes=" << report.resident_bytes << "\n";
+  std::cout << "memory_resident_ratio=" << report.resident_ratio << "\n";
+  std::cout << "memory_budget_pass=" << (report.budget_pass ? 1 : 0) << "\n";
+  std::cout << "memory_mode=" << (report.memory_mode ? 1 : 0) << "\n";
+  std::cout << "memory_accounting_scope=engine_resident\n";
+  std::cout << "memory_bytes_raw_vectors=" << report.raw_vector_bytes << "\n";
+  std::cout << "memory_bytes_raw_vectors_resident="
+            << report.bytes_raw_vectors_resident << "\n";
+  std::cout << "memory_bytes_pq_codes=" << report.bytes_pq_codes << "\n";
+  std::cout << "memory_bytes_pq_codebooks="
+            << report.bytes_pq_codebooks << "\n";
+  std::cout << "memory_bytes_graph_metadata="
+            << report.bytes_graph_metadata << "\n";
+  std::cout << "memory_bytes_cache=" << report.bytes_cache << "\n";
+  std::cout << "memory_bytes_path_cache=" << report.bytes_path_cache << "\n";
+  std::cout << "memory_bytes_router=" << report.bytes_router << "\n";
+  std::cout << "memory_bytes_delta=" << report.bytes_delta << "\n";
+  std::cout << "memory_bytes_tombstone=" << report.bytes_tombstone << "\n";
+  std::cout << "memory_bytes_temporary_peak="
+            << report.bytes_temporary_peak << "\n";
+  std::cout << "memory_compression_ratio="
+            << (report.bytes_pq_codes == 0
+                    ? 0.0
+                    : static_cast<double>(report.raw_vector_bytes) /
+                          static_cast<double>(report.bytes_pq_codes))
+            << "\n";
+}
+
 struct TruthValidation {
   bool has_out_of_range_ids = false;
   std::size_t checked_ids = 0;
@@ -2082,6 +2400,7 @@ int main(int argc, char** argv) {
     RunOutput output;
     if (args.engine == "exact") {
       output = run_exact(base, queries, args.k);
+      output.memory = build_exact_memory_report(args, base);
     } else {
       output = run_graph(args, base, queries);
     }
@@ -2156,6 +2475,7 @@ int main(int argc, char** argv) {
     std::cout << "p50_latency_ms=" << latency.p50_ms << "\n";
     std::cout << "p95_latency_ms=" << latency.p95_ms << "\n";
     std::cout << "p99_latency_ms=" << latency.p99_ms << "\n";
+    print_memory_report(args, output.memory);
     print_optional_stats("ssd_reads_per_query", output.ssd_reads);
     print_optional_stats("page_cache_requests_per_query",
                          output.cache_requests);

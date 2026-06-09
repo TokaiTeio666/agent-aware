@@ -5,7 +5,8 @@ The current codebase contains V0-V9 baselines: exact search, naive SSD graph
 search, packed page layout, Agent-aware cache, query path cache, WAL + Delta
 Index + SLA-aware compaction, file-backed compaction I/O, query signature
 policy comparison, FreshVamana + LSM-style StreamMerge for delete-heavy
-dynamic updates, and FreshLSH-Vamana construction for SIFT1M-oriented builds.
+dynamic updates, FreshLSH-Vamana construction for SIFT1M-oriented builds, and
+memory-budget accounting for 10%-20% resident-engine-memory experiments.
 
 ## V0 features
 
@@ -123,6 +124,24 @@ Delta IVF-flat tuning knobs:
 - Optional adaptive graph search stop via `--search-early-stop` and
   `--search-early-stop-min`.
 - SIFT helper defaults now target SIFT1M construction with `lsh-rp`.
+
+## Memory budget controls
+
+`--memory-budget-ratio` defaults to `0.20` and reports whether estimated
+resident engine memory fits within that fraction of the raw vector bytes.
+`--memory-budget-bytes` can set a stricter absolute cap. Use
+`--enforce-memory-budget` to fail over-budget runs, or
+`--allow-over-budget-for-debug` to keep collecting metrics while still
+reporting `memory_budget_pass=0`.
+
+Key output fields:
+
+- `memory_budget_bytes`
+- `memory_resident_bytes`
+- `memory_resident_ratio`
+- `memory_budget_pass`
+- `memory_accounting_scope=engine_resident`
+- `memory_bytes_*` component breakdown
 
 ## Query signature policies
 

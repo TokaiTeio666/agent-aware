@@ -76,7 +76,34 @@ ssd_reads_per_query
 
 对于 V0/V1 的 smoke test，可以暂时标记为 `smoke run`；从 V2 开始，涉及 I/O 布局和缓存的版本必须区分 cold/warm。
 
-## 4. 版本通过标准
+## 4. 受限内存验证
+
+正式受限内存实验必须记录 resident engine memory，而不是只记录机器总内存。默认达标预算为：
+
+```text
+memory_budget_ratio <= 0.20
+memory_budget_bytes = raw_vector_bytes * memory_budget_ratio
+```
+
+必须输出并归档：
+
+- `memory_budget_ratio`
+- `memory_budget_bytes`
+- `memory_resident_bytes`
+- `memory_resident_ratio`
+- `memory_budget_pass`
+- `memory_accounting_scope`
+- `memory_bytes_*` 组件拆分
+
+通过标准：
+
+- `memory_budget_pass=1`。
+- `memory_resident_ratio <= 0.20`；严格档可使用 `<= 0.10`。
+- exact / memory mode 只能作为正确性或上界对照，不能作为受限内存达标证据。
+- 如果使用 `--allow-over-budget-for-debug`，报告必须明确标注该结果不算达标。
+- 如果开启 `--enforce-memory-budget`，超预算运行必须失败。
+
+## 5. 版本通过标准
 
 每个版本必须设置 pass criteria，不能只描述“测了什么”。
 
@@ -96,10 +123,11 @@ ssd_reads_per_query
 | V7 | Query signature policy 对比归档完整；Recall@10 不明显下降；path cache hit rate 可观测；SSD reads/query 和 expanded/query 相比 no path cache 下降 |
 | V8 | `approx-rp` 建图可完成 SIFT10K 回归；mixed delete workload 中 `delete_count == tombstone_count`；`wal_records == insert_count + delete_count`；StreamMerge 指标可观测并写出新 LTI；dynamic Recall@10 >= 0.95 |
 | V9 | `lsh-rp` 建图可完成 SIFT100K 现场构建；SIFT10K 构建时间显著低于 V8；early-stop 档在 Recall@10 >= 0.95 时降低 P99 和 SSD reads/query；FreshVamana + StreamMerge smoke 仍通过 |
+| M1+ | 受限内存实验必须输出 `memory_budget_pass=1`；若 `memory_budget_pass=0`，只能作为 debug 或对照结果 |
 
 如果某个标准未通过，报告必须明确写出原因和降级计划。
 
-## 5. 归档要求
+## 6. 归档要求
 
 每个版本至少归档以下内容：
 
@@ -126,6 +154,10 @@ archive/build_info/vX-*.txt
 - index 参数。
 - run 类型：cold / warm / smoke。
 - ground truth 来源。
+- memory budget ratio / bytes。
+- memory resident bytes / ratio。
+- memory budget pass。
+- memory component breakdown。
 
 V8 之后还必须记录：
 

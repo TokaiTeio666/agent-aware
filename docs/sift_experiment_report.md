@@ -9,8 +9,10 @@ only recorded when they come from real `key=value` result files in
 ## Environment
 
 - Local validation host: Windows, MinGW GCC 8.1.0.
+- WSL2 validation host: Ubuntu under WSL2.
 - Target experiment scripts: Linux Bash.
-- Local Linux limitation: no WSL distribution is installed on this host.
+- Latest WSL2 SIFT10K/SIFT100K memory-budget report:
+  `docs/WSL2_SIFT_VALIDATION_REPORT.md`.
 - Dataset files are present under `data/sift/`, including the SIFT1M base,
   query, learn, and official ground-truth files.
 
@@ -81,6 +83,27 @@ The current SIFT100K recommendation under the required Recall@10 >= 0.95 rule
 is `SEARCH_WIDTH=768`, `SEARCH_EARLY_STOP_MIN=160`. It has the lower P99 and
 SSD reads/query of the two verified qualifying profiles.
 
+## Verified WSL2 20% Memory-Budget Results
+
+These runs were executed on WSL2 Ubuntu from `/mnt/d/agent-aware` with
+`--memory-budget-ratio 0.20 --enforce-memory-budget`. Because the project and
+SIFT files were accessed through the Windows-mounted `/mnt/d` path, latency
+numbers are functional WSL2 smoke results rather than final ext4/NVMe claims.
+
+| Dataset | Profile | Recall@10 | QPS | P99 ms | SSD reads/query | Resident/raw | Budget pass |
+|---|---|---:|---:|---:|---:|---:|---|
+| SIFT10K | lsh-rp BFS, early-stop min 192 | 0.9990 | 3.8299 | 731.7332 | 561.7500 | 11.42% | yes |
+| SIFT100K | lsh-rp BFS, early-stop min 192 | 0.9640 | 2.4614 | 1678.1738 | 1934.1100 | 9.06% | yes |
+| SIFT10K | PQ4x16 + ADC + rerank64 | 0.4460 | 4.6187 | 648.3881 | 594.5700 | 12.86% | yes |
+
+The SIFT10K/SIFT100K subset runs detected that the official SIFT1M truth file
+contains ids outside the loaded subset and recomputed exact truth for the
+current subset. Raw logs:
+
+- `archive/results/wsl-sift10k-lsh-budget-20260605-130016.txt`
+- `archive/results/wsl-sift100k-lsh-budget-20260605-130120.txt`
+- `archive/results/wsl-sift10k-m2-pq-budget-20260605-125914.txt`
+
 ## Current Findings
 
 - PQ8 codes reduce resident vector-code storage by 64x in the verified smoke.
@@ -96,8 +119,10 @@ SSD reads/query of the two verified qualifying profiles.
 
 `scripts/linux/run_sift1m_full.sh` runs exact and graph profiles in cold and
 warm modes. It supports `DROP_OS_CACHE=1` when passwordless `sudo` is
-available. No SIFT1M cold/warm numbers are reported yet because this local
-Windows host has no WSL distribution.
+available. No SIFT1M cold/warm numbers are reported yet. WSL2 is now
+available on this host, but the verified SIFT10K/SIFT100K runs above used
+`/mnt/d`; final cold and warm numbers should be rerun from WSL ext4 or native
+Linux storage.
 
 ## I/O Mode Status
 
@@ -115,7 +140,8 @@ wrappers emit an explicit failure status when their run commands are missing.
 
 ## Pending Full Experiments
 
-- SIFT10K and SIFT100K sequential sweeps still need to run on Linux.
+- Broader SIFT10K and SIFT100K sequential sweeps still need to run on Linux
+  storage with multiple search-width and early-stop settings.
 - SIFT1M cold/warm experiments are scripted but have not been executed.
 - `IO_MODE=odirect` and `IO_MODE=io_uring` currently accept configuration,
   compile, report explicit fallback fields, and run through `pread`. Native

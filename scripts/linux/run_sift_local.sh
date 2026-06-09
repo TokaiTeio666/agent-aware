@@ -21,6 +21,7 @@ PACKING_STRATEGY="${PACKING_STRATEGY:-${PACKING:-bfs}}"
 RUN_CACHE_MODE="${RUN_CACHE_MODE:-${RUN_TYPE:-smoke}}"
 IO_MODE="${IO_MODE:-pread}"
 RUN_TYPE_EFFECTIVE="${RUN_TYPE:-$RUN_CACHE_MODE}"
+MEMORY_BUDGET_RATIO="${MEMORY_BUDGET_RATIO:-0.20}"
 
 mkdir -p "$RUN_DIR" "$RESULT_DIR" "$LOG_DIR"
 
@@ -51,6 +52,17 @@ COMMON=(
   --k "$K"
 )
 
+MEMORY_FLAG=(--memory-budget-ratio "$MEMORY_BUDGET_RATIO")
+if [[ -n "${MEMORY_BUDGET_BYTES:-}" ]]; then
+  MEMORY_FLAG+=(--memory-budget-bytes "$MEMORY_BUDGET_BYTES")
+fi
+if [[ "${ENFORCE_MEMORY_BUDGET:-0}" == "1" ]]; then
+  MEMORY_FLAG+=(--enforce-memory-budget)
+fi
+if [[ "${ALLOW_OVER_BUDGET_FOR_DEBUG:-0}" == "1" ]]; then
+  MEMORY_FLAG+=(--allow-over-budget-for-debug)
+fi
+
 RESULT="$RESULT_DIR/sift-local-$ENGINE-$DATE_TAG.txt"
 LOG="$LOG_DIR/sift-local-$ENGINE-$DATE_TAG.log"
 
@@ -65,7 +77,7 @@ case "$ENGINE" in
       echo "io_mode_effective=pread"
       echo "io_direct_enabled=0"
       echo "io_uring_enabled=0"
-      "$BIN" "${COMMON[@]}"
+      "$BIN" "${COMMON[@]}" "${MEMORY_FLAG[@]}"
     } 2>&1 | tee "$RESULT" | tee "$LOG" >/dev/null
     ;;
   graph)
@@ -156,6 +168,7 @@ case "$ENGINE" in
       --stream-merge-index "${STREAM_MERGE_INDEX:-$RUN_DIR/sift_streammerge.idx}" \
       --run-type "$RUN_TYPE_EFFECTIVE" \
       --warmup-runs "${WARMUP_RUNS:-0}" \
+      "${MEMORY_FLAG[@]}" \
       2>&1
     } | tee "$RESULT" | tee "$LOG" >/dev/null
     ;;

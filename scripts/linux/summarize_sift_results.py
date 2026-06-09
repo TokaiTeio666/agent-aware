@@ -66,8 +66,27 @@ FIELDS = [
     "io_batch_size",
     "io_amplification_reads_per_result",
     "page_cache_hit_rate",
+    "memory_budget_ratio",
+    "memory_budget_bytes",
+    "memory_budget_bytes_user",
+    "memory_budget_enforced",
+    "memory_over_budget_allowed",
+    "memory_resident_bytes",
+    "memory_resident_ratio",
+    "memory_budget_pass",
+    "memory_mode",
+    "memory_accounting_scope",
     "memory_bytes_raw_vectors",
+    "memory_bytes_raw_vectors_resident",
     "memory_bytes_pq_codes",
+    "memory_bytes_pq_codebooks",
+    "memory_bytes_graph_metadata",
+    "memory_bytes_cache",
+    "memory_bytes_path_cache",
+    "memory_bytes_router",
+    "memory_bytes_delta",
+    "memory_bytes_tombstone",
+    "memory_bytes_temporary_peak",
     "memory_compression_ratio",
     "elapsed_seconds",
     "index_build_seconds",
@@ -116,6 +135,8 @@ def markdown(rows: list[dict[str, str]]) -> None:
         "pq_enable",
         "adc_enable",
         "io_mode_effective",
+        "memory_budget_pass",
+        "memory_resident_ratio",
     ]
     print("| " + " | ".join(columns) + " |")
     print("|" + "|".join(["---"] * len(columns)) + "|")
@@ -132,6 +153,7 @@ def recommendations(rows: list[dict[str, str]]) -> None:
             if row.get("engine") == "graph"
             and row.get("base_count") == base
             and number(row, "recall_at_10", 0.0) >= 0.95
+            and row.get("memory_budget_pass", "1") != "0"
         ]
         if not eligible:
             print(f"\nNo graph config for SIFT{base} reached Recall@10 >= 0.95")

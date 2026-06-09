@@ -2,13 +2,41 @@
 
 ## 1. 项目名称
 
-中文名：AgentMem-Flow：面向 Agent 记忆访问局部性的自适应分层向量检索 I/O 引擎
+中文名：AgentMem-Flow：面向 Agent 记忆访问局部性的受限内存 SSD 向量检索 I/O 引擎
 
-英文名：AgentMem-Flow: An Agent-Aware Adaptive Hierarchical Vector Retrieval I/O Engine
+英文名：AgentMem-Flow: A Memory-Bounded SSD Vector Retrieval I/O Engine for Agent Memory
 
-## 2. 项目定位
+## 2. 赛题背景
 
-AgentMem-Flow 面向大模型 Agent 长期记忆系统中的向量检索 I/O 优化。项目不是单纯复现 DiskANN、HNSW、Vamana、PQ、LSM 或 io_uring 的已有组合，而是围绕 Agent memory 的访问局部性进行系统设计：
+在大模型 Agent 的实际应用中，长期记忆不仅规模庞大，常常远超物理内存，而且高度动态。Agent 会在交互过程中持续写入新的记忆，也会频繁回忆历史关联信息。
+
+当高维向量被组织成图索引并存储在 SSD 等外存上时，传统操作系统文件 I/O 机制会遇到明显瓶颈：图遍历检索会产生大量随机读，使顺序预取和默认 Page Cache 难以发挥作用；实时写入和后台合并又会放大写 I/O 与查询 P99 延迟。
+
+本项目面向这类 Agent memory 场景，设计一个在严格受限内存下运行的底层 I/O 存储与向量检索引擎。系统目标是在数据集原始向量远大于内存预算时，仍能提供可复现的 Top-K 检索、较高 Recall@10、可控查询延迟，以及实时写入/更新能力。
+
+## 3. 赛题任务与硬约束
+
+系统应在严格受限内存下运行，内存预算按数据集原始向量大小计算：
+
+- 推荐实验预算：原始向量数据大小的 10%-20%。
+- 默认达标预算：`memory_budget_ratio <= 0.20`。
+- 召回指标：`Recall@10 >= 0.85` 作为最低达标线；开发推荐线为 `Recall@10 >= 0.95`。
+- 负载类型：支持高并发 Top-K 查询、实时向量插入/更新、读写混合负载和后台合并。
+- 硬件适配：支持 Intel/AMD 多核 CPU 与高速 SSD，Linux 环境优先支持 `O_DIRECT` / `io_uring` 等异步 I/O 能力。
+- 集成方式：对上层 Agent 框架提供标准 API，不要求修改 LangChain 等上层逻辑。
+
+本项目的核心评价指标：
+
+- 查询准确性：`Recall@10`、`1-Recall@10`。
+- 查询吞吐：QPS。
+- 查询延迟：Avg/P50/P95/P99 latency。
+- I/O 效率：SSD reads/query、I/O amplification、cache hit rate。
+- 动态写入：insert latency、WAL records、delta size、compaction interference。
+- 内存合规：resident memory bytes、memory budget ratio、memory budget pass。
+
+## 4. 项目定位
+
+AgentMem-Flow 不是单纯复现 DiskANN、HNSW、Vamana、PQ、LSM 或 `io_uring`，而是围绕 Agent memory 的访问局部性进行系统设计：
 
 - 同一会话连续查询具有会话局部性。
 - 相似 query 的图检索路径高度相似。
@@ -16,11 +44,11 @@ AgentMem-Flow 面向大模型 Agent 长期记忆系统中的向量检索 I/O 优
 - 历史热点 memory 会被反复召回。
 - 读写混合和后台合并会放大查询 P99 延迟。
 
-项目目标是在受限内存下构建一个可验证、可演进的 SSD 向量检索 I/O 引擎 baseline，并逐步实现共访问磁盘布局、Agent-aware cache、Query Path Cache、Delta Index、WAL 和 SLA-aware compaction。
+项目目标是在受限内存下构建一个可验证、可演进的 SSD 向量检索 I/O 引擎，并逐步实现受限内存管理、共访问磁盘布局、Agent-aware cache、Query Path Cache、异步预取、Delta Index、WAL、删除修补和 SLA-aware compaction。
 
-## 3. 计划书问题编号
+## 5. 问题编号
 
-后续每个版本分析报告都必须说明解决了哪些计划书问题。
+后续每个大版本分析报告都必须说明解决了哪些计划书问题。
 
 | 编号 | 问题 | 为什么重要 |
 |---|---|---|
@@ -37,280 +65,248 @@ AgentMem-Flow 面向大模型 Agent 长期记忆系统中的向量检索 I/O 优
 | P10 | exact kNN 图构建无法支撑 SIFT100K/SIFT1M | O(N^2) 建图会成为标准数据集验证的主要瓶颈，需要可控召回的近似建图路径 |
 | P11 | 删除会破坏图索引连通性和召回 | 动态索引不能只追加插入；删除后的入边/出边修补和批量合并决定长期召回稳定性 |
 | P12 | 低延迟目标不能只靠扩大 search width | 需要让构图质量、候选生成、反向边裁剪和搜索停止策略共同减少实际扩展与 SSD 读放大 |
+| P13 | 缺少严格内存预算机制 | 如果只口头声明受限内存，不能证明系统满足赛题 10%-20% 内存约束 |
+| P14 | 缺少异步 I/O 和下一跳预取闭环 | Agent 图检索的随机 I/O 需要通过非阻塞预取隐藏磁盘延迟 |
 
-## 4. 当前 Baseline
+## 6. 受限内存机制
 
-### V0：内存精确检索基线
+### 6.1 预算定义
 
-定位：提供正确性上界和评测闭环。
+原始数据集大小定义为：
 
-已实现：
+```text
+raw_vector_bytes = vector_count * dim * sizeof(float)
+```
 
-- C++17 工程骨架。
-- 内存向量容器 `VectorSet`。
+搜索运行期内存预算定义为：
+
+```text
+memory_budget_bytes = min(user_budget_bytes, raw_vector_bytes * memory_budget_ratio)
+```
+
+默认参数：
+
+- `memory_budget_ratio = 0.20`。
+- 可选严格档：`memory_budget_ratio = 0.10`。
+- 如果用户显式指定 `--memory-budget-bytes`，则以 bytes 上限为准。
+- 构图阶段和搜索阶段分别统计；最终达标以搜索运行期 resident memory 为准。
+
+### 6.2 计入预算的常驻内存
+
+以下内容必须计入 resident memory：
+
+- PQ codes 与 PQ codebooks。
+- 图索引常驻元数据：page directory、node-to-page 映射、degree/offset 元信息。
+- 应用级 page cache / BufferPool。
+- Query Path Cache 与 query signature 表。
+- Resident router sample 或 centroid/PQ router。
+- Delta Index active/sealed segments。
+- WAL replay 后恢复到内存中的 delta records。
+- tombstone bitmap、visited bitmap、临时 frontier 上限。
+- LSH routing/candidate 结构中搜索期仍常驻的部分。
+
+以下内容不应在搜索期全量常驻：
+
+- 原始全精度 base vectors。
+- 完整 SSD graph page 内容。
+- 完整 SIFT1M base 文件。
+
+原始向量应存放在 SSD 上，只在 rerank、精排或必要距离计算时按页读取。若实验使用内存模式，必须标注为 `memory_mode=true`，并且不能作为受限内存达标证据。
+
+### 6.3 运行时强制机制
+
+计划新增 `MemoryBudgetManager`，所有常驻结构必须通过统一接口登记内存占用：
+
+```text
+register_component(name, bytes, required_or_elastic)
+update_component(name, bytes)
+resident_bytes()
+remaining_budget()
+assert_within_budget()
+```
+
+强制策略：
+
+- 启动时计算 `memory_budget_bytes`。
+- 固定必需结构超过预算时，直接 fail fast，并输出超预算组件。
+- 弹性结构按剩余预算自动缩容：cache pages、path cache capacity、router sample count、delta active threshold。
+- mixed workload 中 delta 超预算时，触发 seal/flush/StreamMerge 或拒绝继续插入。
+- search frontier、visited bitmap、rerank buffer 必须设置上限，避免高并发下临时内存膨胀。
+- 除非显式传入 `--allow-over-budget-for-debug`，否则 `resident_bytes > memory_budget_bytes` 的结果不得标记为达标。
+
+### 6.4 输出与归档字段
+
+每次实验必须输出：
+
+```text
+memory_budget_ratio
+memory_budget_bytes
+memory_resident_bytes
+memory_resident_ratio
+memory_budget_pass
+memory_bytes_pq_codes
+memory_bytes_pq_codebooks
+memory_bytes_graph_metadata
+memory_bytes_cache
+memory_bytes_path_cache
+memory_bytes_router
+memory_bytes_delta
+memory_bytes_tombstone
+memory_bytes_temporary_peak
+memory_mode
+```
+
+报告中必须区分：
+
+- 搜索期 resident memory。
+- 构图期 peak memory。
+- OS Page Cache 是否参与。
+- `pread`、`O_DIRECT`、`io_uring` 的实际生效模式。
+
+## 7. 大版本路线图
+
+旧的 V0-V9 版本保留为迭代证据，但计划书对外合并为五个大版本。
+
+| 大版本 | 合并旧版本 | 目标 |
+|---|---|---|
+| M0：验证与基线层 | V0、V1、V2 | 建立 exact truth、naive SSD graph baseline、packed layout 和可复现评测闭环 |
+| M1：受限内存读优化层 | V3、V4、V7，吸收 PQ/ADC rerank | 在 10%-20% 内存预算下完成缓存、路径复用、PQ 压缩和内存预算强制 |
+| M2：异步 I/O 与预取层 | V6 的真实 I/O，新增 `O_DIRECT` / `io_uring` / 下一跳预取 | 绕开低效 Page Cache，使用非阻塞预取隐藏随机 I/O 延迟 |
+| M3：动态写入与合并层 | V5、V5.1、V5.2、V8 动态更新部分 | 支持 WAL、Delta Index、replay、删除 tombstone、FreshVamana patch 和 StreamMerge |
+| M4：大规模构图与最终评测层 | V8 构图、V9、Final | 支撑 SIFT100K/SIFT1M 构图、early-stop 低延迟搜索和正式 cold/warm 归档 |
+
+### M0：验证与基线层
+
+定位：先建立可信评测闭环，再建立 SSD 图索引对照组。
+
+已实现/必须保留：
+
+- C++ 工程骨架。
 - SIFT `fvecs` / `ivecs` 加载。
 - synthetic 数据生成。
-- squared L2 精确暴力 Top-K。
-- Recall@K、1-Recall@K、QPS、Avg/P50/P95/P99 latency 指标。
-
-解决问题：P1，部分解决 P0/P9。
-
-### V1：naive SSD graph baseline
-
-定位：建立后续 I/O 优化的磁盘图检索对照组。
-
-已实现：
-
-- exact kNN graph builder。
-- `NaiveDiskGraphIndex` 二进制图索引。
-- one-node-per-page 固定 4 KB page 布局。
-- `--engine graph` 图检索模式。
-- resident sampled router。
-- `ssd_reads_per_query`、visited/query、expanded/query、I/O amplification 指标。
-
-解决问题：P2，并暴露 P3。
-
-### V2：Co-Access Packed Page Layout
-
-定位：将 one-node-per-page 升级为 packed page layout，降低图遍历过程中的随机 page read 次数。
-
-已实现：
-
-- `--layout one-node|packed`。
-- `--packing random|bfs|coaccess`。
-- packed page 文件格式。
-- node id 到 packed page 的 directory。
-- page-level SoA：page 内部分离存储 node id、degree、vector block、neighbor block。
-- random packing、BFS packing、co-access packing 三种策略。
-- Agent-style synthetic trace co-access score。
-- `--run-type cold|warm|smoke` 和 `--warmup-runs`。
-
-解决问题：P3，部分解决 P0/P9。
-
-### V3：Agent-Aware Cache
-
-定位：在 V2 packed layout 上增加应用级 page cache，验证 Agent memory 局部性对缓存策略的收益。
-
-已实现：
-
-- `--cache-policy none|lru|agent`。
-- `--cache-pages` 控制全局 packed page cache 容量。
-- 跨 query 的 global page cache。
-- LRU eviction baseline。
-- Agent-aware eviction score：综合访问频率、最近访问时间和 page 内节点密度。
-- page cache hit rate、hits/query、misses/query、requests/query 指标。
-
-解决问题：部分解决 P4，继续缓解 P3，部分解决 P0/P9。
-
-局限：当前 Agent-aware score 仍是最小可落地版本，尚未显式接入 session id、semantic cluster id 或 path hotness。
-
-### V4：Query Path Cache
-
-定位：利用相似连续 query 的路径局部性，复用历史入口点和 Top-K 候选，减少重复图遍历。
-
-已实现：
-
-- Agent-style synthetic workload：`--synthetic-workload agent`。
-- `--session-length` 控制连续相似查询长度。
-- `--path-cache-policy none|reuse`。
-- `--path-cache-capacity`。
-- `--path-cache-hit-search-width`。
-- query signature：支持 resident routed entry、SimHash、PQ prefix 和 SimHash+PQ hybrid。
-- path cache 命中后复用历史 seeds 和 Top-K ids，并降低 search width。
-- path cache hit rate、hits/query、requests/query 指标。
-
-解决问题：部分解决 P5，并为 P4 提供 path hotness 信号。
-
-局限：当前 PQ prefix 使用 resident sample 训练小码本，仍是轻量 baseline；复用对象是 seeds 和 Top-K ids，不是完整 frontier。
-
-### V5：Delta Index + WAL + SLA-aware Compaction
-
-定位：把系统推进到动态读写场景，支持实时插入、查询时 Main + Delta Top-K merge，并验证后台合并对 P99 的影响。
-
-已实现：
-
-- `WalWriter`：插入先写 WAL。
-- WAL replay：`--wal-replay` 启动时解析 WAL insert record 并恢复 Delta。
-- `DeltaFlatIndex`：active delta + sealed delta，支持精确搜索。
-- `DeltaIvfFlatIndex`：小型 IVF-flat Delta ANN，使用 farthest-point 初始化和周期性 k-means rebuild，可用 flat delta 计算 delta recall。
-- Delta IVF 训练参数：`--delta-ivf-train-iterations`、`--delta-ivf-rebuild-interval`。
-- Main Graph ANN 结果与 Delta exact 结果 Top-K merge。
-- mixed workload：`--workload-mode mixed`、`--operation-count`、`--write-ratio`。
-- delta index policy：`--delta-index-policy flat|ivf-flat`。
-- compaction policy：`none`、`aggressive`、`sla`。
-- SLA-aware compaction：把合并工作移到写入路径，并在近期 P99 超预算时跳过。
-- insert latency、WAL records/replay records、delta active/sealed size、delta search latency、delta recall、compaction ops、query compaction interference 指标。
-
-解决问题：部分解决 P6/P7，继续补强 P0/P9。
-
-局限：
-
-- Delta IVF-flat 是最小 ANN baseline，不是完整 HNSW；大规模 delta 仍可继续升级为 Delta HNSW 或分层 delta segment。
-- compaction 目前是 active-to-sealed 内存合并，尚未真正重写 Main Graph SSD 文件。
-- 当前 compaction I/O 干扰使用可控时间片模拟，正式实验应在 Linux/WSL 下替换为真实后台文件 I/O。
-
-## 5. 已完成扩展与未来规划
-
-### V5.1：WAL Replay
-
-目标：补齐崩溃恢复语义。
-
-已完成：
-
-- 解析 V5 WAL 文件。
-- 程序启动时通过 `--wal-replay` replay insert record。
-- replay 后继续以 append 模式写 WAL，避免覆盖已有记录。
-- 输出 `wal_replay_records`、`wal_replay_bytes`、`wal_replay_delta_size`。
-- 本地脚本：`scripts/run_v5_1_wal_replay.ps1`。
+- exact brute force Top-K。
+- Recall@K、1-Recall@K、QPS、Avg/P50/P95/P99 latency。
+- one-node-per-page SSD graph baseline。
+- packed page layout：`random`、`bfs`、`coaccess`。
+- `ssd_reads_per_query`、visited/query、expanded/query、I/O amplification。
+- `smoke`、`cold`、`warm` run 类型。
 
 通过标准：
 
-- WAL replay 后 `wal_records == delta_total_size`。
-- replay 前后同一 workload Recall@10 一致。
+- exact baseline 在 synthetic self-check 上 `Recall@10 = 1.0`。
+- SSD graph baseline 能输出完整 I/O 指标。
+- packed layout 相比 one-node-per-page 降低 SSD reads/query，Recall@10 不明显下降。
+- 每次实验归档配置、日志、环境、随机种子和 commit hash。
 
-### V5.2：Delta HNSW 或 IVF-flat
+解决问题：P0、P1、P2、P3、P8、P9。
 
-目标：降低大规模 delta 的查询成本。
+### M1：受限内存读优化层
 
-已完成：
+定位：把“受限内存”从文档目标落实为运行时机制，同时用 Agent 访问局部性降低 SSD 随机读。
 
-- 保留 Delta flat 作为正确性对照。
-- 增加小型 `DeltaIvfFlatIndex`。
-- 输出 `delta_search_ms_*`、`delta_exact_search_ms_*` 和 `delta_recall_at_10`。
-- 本地脚本：`scripts/run_v5_2_delta_ann_compare.ps1`。
+核心能力：
 
-通过标准：
-
-- Delta ANN Recall@10 不明显低于 flat。
-- delta search latency 随 delta size 增长更慢。
-- IVF 训练成本通过 insert latency 可观测。
-
-### V6：AutoDL 部署版与真实文件 I/O Compaction
-
-目标：将 V5 的 compaction 时间片模拟替换为真实文件读写，并将最终实验环境固定为 AutoDL Linux 服务器。
-
-已完成：
-
-- `--compaction-io-mode time|file`。
-- `--compaction-io-path`。
-- `--compaction-io-bytes-per-vector`。
-- Linux 下 file compaction 使用 `open/write/fsync/close`。
-- `compaction_io_bytes` 指标。
-- AutoDL synthetic 实验脚本。
-- AutoDL SIFT 官方 `.ivecs` 实验模板。
-- AutoDL 环境采集、drop caches 和证据打包脚本。
+- `MemoryBudgetManager`。
+- `--memory-budget-ratio` 与 `--memory-budget-bytes`。
+- page cache / BufferPool 根据剩余预算动态设定容量。
+- Agent-aware cache：频率、最近访问、page density、path hotness 共同决定淘汰。
+- Query Path Cache：复用历史 seeds、Top-K ids 和可选 frontier 摘要。
+- query signature：`routed`、`simhash`、`pq-prefix`、`simhash-pq`。
+- PQ8 + ADC 预筛，配合 `rerank_topk` 恢复召回。
+- 内存模式与 SSD 模式分开统计，内存模式仅作上界对照。
 
 通过标准：
 
-- SLA 策略在真实 I/O 干扰下仍降低 P99。
-- compaction backlog 和 query latency 都可观测。
-- `compaction_io_bytes > 0`。
-- AutoDL warm/cold 结果完整归档。
+- `memory_resident_ratio <= 0.20`，严格档可跑 `<= 0.10`。
+- `memory_budget_pass=1`。
+- `Recall@10 >= 0.85`，推荐实验 `>= 0.95`。
+- PQ + rerank 后召回明显高于纯 PQ + ADC。
+- cache/path cache hit rate 可观测，且 reads/query 或 P99 有下降。
 
-局限：
+解决问题：P3、P4、P5、P12、P13。
 
-- 当前是真实文件 I/O compaction，不是完整 io_uring/O_DIRECT 后台合并。
-- V6 本身仍没有近似建图器；该限制在 V8 中通过 `approx-rp` 原型开始补齐。
+### M2：异步 I/O 与预取层
 
-### V7：Query Signature Policy 对比
+定位：针对图遍历随机读，放弃完全依赖 OS 顺序预取和默认 Page Cache，在用户态做下一跳预取与异步 I/O 调度。
 
-目标：将 V4 Query Path Cache 的签名策略独立归档验证，明确不同 signature 对路径复用命中率和 I/O 放大的影响。
+核心能力：
 
-已完成：
-
-- `scripts/run_v7_signature_compare.ps1`。
-- 对比 `routed`、`simhash`、`pq-prefix`、`simhash-pq`。
-- 记录 path cache hit rate、SSD reads/query、expanded/query、visited/query。
-- 补齐 V7 结果、配置、日志、build info 和分析报告。
-
-通过标准：
-
-- Recall@10 不明显下降。
-- path cache hit rate 可观测。
-- SSD reads/query 相比 no path cache 下降。
-- V7 归档完整。
-
-局限：
-
-- 当前 V7 是 synthetic agent warm/smoke；正式 SIFT cold/warm 结论仍需后续运行。
-- Path cache 仍复用 seeds 和 Top-K ids，不是完整 frontier。
-
-### V8：FreshVamana + LSM-style StreamMerge
-
-目标：支持删除密集的动态更新，并替换 SIFT100K/SIFT1M 上不可承受的 exact kNN 建图路径。
-
-已完成：
-
-- `--graph-build-policy exact|approx-rp`。
-- 近似随机投影候选建图：`--approx-projections`、`--approx-window`、`--approx-random-samples`、`--approx-candidate-limit`。
-- FreshVamana-style RobustPrune：`--robust-prune-alpha`。
-- 删除 patch：删除节点后连接入点和出点，并对超度数节点运行 RobustPrune。
-- WAL insert/delete record 和 replay counters。
-- `--delete-ratio` mixed workload。
-- tombstone 查询过滤。
-- `--compaction-policy stream-merge`。
-- `--stream-merge-index` 输出新的 LTI index。
-- WSL/SIFT 本地脚本默认使用 approx-rp + BFS packing。
+- `--io-mode pread|odirect|io_uring`。
+- `io_mode_effective` 必须真实反映后端是否生效。
+- `O_DIRECT` 使用对齐 buffer，减少 OS Page Cache 干扰。
+- `io_uring` 批量提交 SQE，减少 syscall 与阻塞等待。
+- beam-style 下一跳预取：在计算当前候选距离时，后台拉取下一批邻居页。
+- prefetch queue 受内存预算约束，不能无限堆积。
+- 记录 submit/complete、batch size、pending depth、short read/fallback reason。
 
 通过标准：
 
-- `approx-rp` 可以完成 SIFT10K FreshVamana 回归。
-- mixed delete workload 中 `delete_count == tombstone_count`。
+- Linux 上 `odirect` 或 `io_uring` 至少一种后端真实生效。
+- cold run 中 `O_DIRECT` / `io_uring` 相比 `pread` 降低 P99 或 reads stall。
+- fallback 时必须输出原因，不能把 fallback 结果标记为 native I/O 成果。
+- prefetch 队列内存计入 `memory_resident_bytes`。
+
+解决问题：P0、P3、P9、P12、P14。
+
+### M3：动态写入与合并层
+
+定位：支持 Agent 实时写入、更新和删除，避免每次写入都重写主图索引。
+
+核心能力：
+
+- WAL append。
+- WAL replay。
+- Delta flat index 与 Delta IVF-flat。
+- Main Graph ANN + Delta Top-K merge。
+- mixed workload：query + insert + delete。
+- tombstone bitmap 和查询过滤。
+- FreshVamana delete patch：删除后修补入边/出边并重新裁剪。
+- StreamMerge 输出新 LTI index。
+- SLA-aware compaction：根据查询 P99 动态暂停、限速或转移合并工作。
+- 真实 file compaction I/O，并在后续接入 M2 的异步 I/O 后端。
+
+通过标准：
+
 - `wal_records == insert_count + delete_count`。
-- `stream_merge_ops > 0` 并写出新 LTI index。
-- dynamic Recall@10 不低于 0.95。
+- replay 后 delta size 与 WAL 记录一致。
+- mixed delete workload 中 `delete_count == tombstone_count`。
+- dynamic Recall@10 不低于 0.85，推荐不低于 0.95。
+- SLA compaction 的 query P99 低于 aggressive compaction。
+- compaction I/O bytes、interference、backlog 均可观测。
 
-局限：
+解决问题：P6、P7、P11、P13。
 
-- 当前是 FreshVamana + LSM-style StreamMerge 原型，不是完整 FreshDiskANN 生产级 block merge。
-- StreamMerge 写出新 LTI 后不在同一进程热切换；下一次运行需使用 merged index。
-- SIFT100K/SIFT1M 正式 cold/warm 还需要在 WSL2/AutoDL 上完成。
+### M4：大规模构图与最终评测层
 
-### V9：FreshLSH-Vamana SIFT1M 构图与低延迟搜索
+定位：解决 exact kNN 构图无法支撑 SIFT100K/SIFT1M 的问题，并形成最终可答辩的标准实验。
 
-目标：在保留 FreshVamana 删除语义的同时，替换 V8 中仍偏重的 `approx-rp + RobustPrune` 建图路径，让项目能支撑 SIFT100K/SIFT1M 现场构建，并通过自适应停止降低查询扩展数。
+核心能力：
 
-已完成：
-
-- `--graph-build-policy lsh-rp`。
-- 多表 SimHash LSH 候选生成：`--lsh-tables`、`--lsh-bits`、`--lsh-probe-radius`、`--lsh-bucket-limit`。
-- 构图阶段使用快速 top-k prune，避免对大候选集做完整 RobustPrune 两两距离比较。
-- 反向边改为批量收集后一次性裁剪，减少反复插入和距离重算。
-- FreshVamana 删除 patch 改为批量构建 incoming edges，不再每个 delete 全图扫描一次。
-- `--search-early-stop` 与 `--search-early-stop-min`，将固定 search width 改为“上限 + 最小探索 + frontier 自适应停止”。
-- WSL/SIFT 和 AutoDL SIFT helper 默认切到 `lsh-rp`，并开启稳健 early-stop 档。
+- `exact`、`approx-rp`、`lsh-rp` 三类 graph build policy。
+- FreshLSH-Vamana：多表 SimHash LSH 候选生成 + fast top-k prune。
+- 批量反向边收集与一次性裁剪。
+- 批量 FreshVamana delete patch，避免每个 delete 全图扫描。
+- `--search-early-stop` 与 `--search-early-stop-min`。
+- SIFT100K / SIFT1M 官方数据集实验脚本。
+- cold/warm 对比、受限内存档、低延迟档、高召回档。
 
 通过标准：
 
-- SIFT10K 建图时间显著低于 V8 `approx-rp + RobustPrune`，Recall@10 不低于 0.95。
-- SIFT100K 可以现场建图并保持 Recall@10 不低于 0.95。
-- early-stop 档能在 Recall@10 不低于 0.95 时降低 P99 和 SSD reads/query。
-- FreshVamana + StreamMerge 删除 smoke 仍通过。
+- SIFT100K 可现场建图，Recall@10 不低于 0.95。
+- SIFT1M full base 使用官方 `.ivecs`，不依赖 brute force truth。
+- early-stop 在 Recall@10 达标时降低 P99、SSD reads/query 或 expanded/query。
+- 最终报告必须同时给出 memory budget pass、I/O mode effective、cold/warm、设备信息和完整命令。
 
-局限：
+解决问题：P8、P9、P10、P12、P13、P14。
 
-- 当前 V9 是 FreshLSH-Vamana 原型，还没有 PQ 压缩、O_DIRECT、io_uring 和 SSD-resident vector offload。
-- SIFT1M 需要在 WSL2 ext4 或 AutoDL SSD 上正式跑 full base + 官方 `.ivecs`；本地 Windows 已验证 SIFT100K。
-- `lsh_bits` 需要随规模调节：SIFT10K 建议 10-12，SIFT100K/SIFT1M 默认 14 起步。
-
-### Final：SIFT100K/SIFT1M 标准实验
-
-目标：补齐正式数据集验证。
-
-必须做：
-
-- SIFT100K 开发实验。
-- SIFT1M 优先使用官方 `.ivecs` ground truth。
-- cold/warm 正式对比。
-- 与 naive SSD layout、LRU、Graph-Aware Cache、DiskANN-style baseline 做消融对比。
-
-## 6. 统一实验设计
+## 8. 统一实验设计
 
 数据集：
 
 - synthetic smoke：快速验证功能。
-- SIFT10K / SIFT100K：开发和消融实验。
-- SIFT1M：最终展示，优先使用官方 `.ivecs`。
+- SIFT10K：开发、调参和 feature smoke。
+- SIFT100K：主要消融与推荐配置验证。
+- SIFT1M：最终展示，必须优先使用官方 `.ivecs`。
 
 Workload：
 
@@ -320,6 +316,7 @@ Workload：
 - Agent session-local 查询。
 - recent-memory 查询。
 - 读写混合：95% query + 5% insert，80% query + 20% insert/update。
+- 删除密集混合负载。
 - compaction 干扰场景。
 
 Run 类型：
@@ -327,65 +324,89 @@ Run 类型：
 - smoke run：快速功能验证，不做最终性能结论。
 - cold run：清空应用缓存并尽量清空 OS Page Cache，体现磁盘 I/O 压力。
 - warm run：预热后测试稳态性能。
+- memory-bounded run：必须启用 `memory_budget_ratio` 或 `memory_budget_bytes`，并输出 memory budget pass。
 
-## 7. 指标体系
+## 9. 指标体系
 
-必须记录：
+基础指标：
 
 - Recall@10。
 - 1-Recall@10。
 - QPS。
-- Avg Latency。
-- P95 Latency。
-- P99 Latency。
-- SSD Reads / Query。
-- I/O Amplification。
+- Avg/P50/P95/P99 latency。
+- SSD reads/query。
+- I/O amplification。
 - run type。
 - random seed。
 - ground truth 来源。
 
-V3 之后增加：
+内存指标：
 
-- Cache Hit Rate。
-- Path Cache Hit Rate。
-- Query Signature Policy。
+- memory budget ratio。
+- memory budget bytes。
+- resident memory bytes。
+- resident memory ratio。
+- memory budget pass。
+- memory component breakdown。
+- temporary peak memory。
+- memory mode。
 
-V5 之后增加：
+缓存与路径指标：
 
-- Insert Latency。
-- Query Latency under Write Load。
-- WAL Records / WAL Bytes。
-- Delta Active Size / Delta Sealed Size。
-- Compaction Ops。
-- Compaction Interference。
+- cache hit rate。
+- cache requests/hits/misses per query。
+- path cache hit rate。
+- query signature policy。
+- expanded/query。
+- visited/query。
 
-V8 之后增加：
+I/O 指标：
 
-- Graph Build Policy。
-- RobustPrune Alpha。
-- Delete Count。
-- Tombstone Count。
-- WAL Replay Inserts / Deletes。
-- StreamMerge Ops / Vectors / Inserted / Deleted / Seconds。
+- requested I/O mode。
+- effective I/O mode。
+- `O_DIRECT` enabled。
+- `io_uring` enabled。
+- fallback reason。
+- submit/complete count。
+- batch size。
+- pending depth。
 
-V9 之后增加：
+动态写入指标：
 
-- LSH Tables / Bits / Probe Radius / Bucket Limit。
-- Search Early Stop / Min Expansions。
-- Actual Expanded / Query under early-stop。
+- insert latency。
+- query latency under write load。
+- WAL records / WAL bytes。
+- WAL replay inserts/deletes。
+- delta active/sealed size。
+- delete count。
+- tombstone count。
+- compaction ops。
+- compaction I/O bytes。
+- compaction interference。
 
-## 8. 归档要求
+大规模构图指标：
 
-每个版本必须归档：
+- graph build policy。
+- graph build seconds。
+- LSH tables/bits/probe radius/bucket limit。
+- RobustPrune alpha。
+- search early stop / min expansions。
+- actual expanded/query under early-stop。
+
+## 10. 归档要求
+
+每个大版本必须归档：
 
 ```text
-docs/iterations/vX-analysis.md
-archive/results/vX-*.txt
-archive/configs/vX-*.json
-archive/logs/vX-*.log
-archive/build_info/vX-*.txt
+docs/iterations/mX-analysis.md
+archive/results/mX-*.txt
+archive/configs/mX-*.json
+archive/logs/mX-*.log
+archive/build_info/mX-*.txt
 archive/validation/validation-method-YYYY-MM-DD.md
 ```
+
+如果保留旧版本编号，也必须在 M 版本报告中说明来源，例如 `M3 includes V5/V5.1/V5.2/V8-dynamic`。
 
 必须记录：
 
@@ -399,31 +420,33 @@ archive/validation/validation-method-YYYY-MM-DD.md
 - 数据集路径。
 - 随机种子。
 - index 参数。
+- memory budget 参数。
+- memory budget pass。
+- I/O mode requested / effective。
 - pass criteria。
 - 是否通过。
 
-## 9. 推荐优先级
+## 11. 推荐优先级
 
-必须完成：
+第一优先级：
 
-- V0：精确检索和评测闭环。
-- V1：naive SSD graph baseline。
-- V2：Packed Page Layout。
-- V3：Agent-Aware Cache。
-- V4：Query Path Cache。
-- V5：Delta Index + WAL + SLA-aware Compaction 最小闭环。
-- V7：Query signature policy 对比归档。
-- V8：FreshVamana + LSM-style StreamMerge 原型。
-- V9：FreshLSH-Vamana SIFT1M 构图和低延迟搜索档。
-- 验证规范和归档规范。
+- M0：验证与基线层。
+- M1：受限内存读优化层，尤其是 `MemoryBudgetManager` 与 `memory_budget_pass`。
+- M4：SIFT100K/SIFT1M 标准实验链路。
+
+第二优先级：
+
+- M3：动态写入、删除、WAL replay 和 StreamMerge。
+- M2：native `O_DIRECT` / `io_uring` 与下一跳预取。
 
 加分项：
 
-- V5.1 WAL replay。
-- V5.2 Delta HNSW。
-- V6 真实后台 I/O compaction。
-- SIFT1M 官方 `.ivecs` 完整实验。
+- 更完整的 frontier/path reuse。
+- Delta HNSW。
+- Graph-aware 2Q BufferPool。
+- 与 DiskANN/FreshDiskANN 的同机对比。
+- AutoDL Linux SSD 上的 SIFT1M full cold/warm 归档。
 
-## 10. 一句话总结
+## 12. 一句话总结
 
-AgentMem-Flow 的核心路线是：先建立可复现的 exact 和 naive SSD baseline，再逐步把 Agent 记忆的时间、语义、会话和路径局部性转化为磁盘布局、缓存策略、路径复用、动态写入、删除修补和批量合并优化。
+AgentMem-Flow 的核心路线是：先建立可复现的 exact 和 naive SSD baseline，再在 10%-20% 受限内存下，把 Agent 记忆的时间、语义、会话和路径局部性转化为磁盘布局、缓存策略、路径复用、异步预取、动态写入、删除修补和批量合并优化。

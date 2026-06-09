@@ -40,6 +40,14 @@ class PqAdcModel {
     return codes_.size();
   }
 
+  std::size_t codebook_bytes() const {
+    return codebooks_.size() * sizeof(float);
+  }
+
+  std::size_t offset_bytes() const {
+    return offsets_.size() * sizeof(std::size_t);
+  }
+
   std::vector<float> build_adc_table(const float* query) const;
   float adc_distance(std::uint32_t id, const std::vector<float>& table) const;
 
