@@ -1156,6 +1156,11 @@ class RawIoUring {
   RawIoUring(const RawIoUring&) = delete;
   RawIoUring& operator=(const RawIoUring&) = delete;
 
+  struct Completion {
+    std::uint64_t user_data = 0;
+    int result = 0;
+  };
+
   bool open(std::size_t entries, std::string& reason) {
     close();
     io_uring_params params{};
@@ -1254,10 +1259,12 @@ class RawIoUring {
       ring_fd_ = -1;
     }
     single_mmap_ = false;
+    queued_submissions_ = 0;
   }
 
-  bool read(int fd, std::uint64_t offset, void* buffer, std::size_t bytes,
-            DiskGraphSearchStats& stats, std::string& reason) {
+  bool queue_read(int fd, std::uint64_t offset, void* buffer,
+                  std::size_t bytes, std::uint64_t user_data,
+                  std::string& reason) {
     const unsigned head = *sq_head_;
     const unsigned tail = *sq_tail_;
     if (tail - head >= *sq_ring_entries_) {
@@ -1273,21 +1280,45 @@ class RawIoUring {
     sqe.off = offset;
     sqe.addr = reinterpret_cast<std::uint64_t>(buffer);
     sqe.len = static_cast<std::uint32_t>(bytes);
-    sqe.user_data = next_user_data_++;
+    sqe.user_data = user_data;
     sq_array_[index] = index;
     std::atomic_thread_fence(std::memory_order_release);
     *sq_tail_ = tail + 1;
+    ++queued_submissions_;
+    return true;
+  }
 
-    const int submitted = static_cast<int>(
-        syscall(__NR_io_uring_enter, ring_fd_, 1, 1,
-                IORING_ENTER_GETEVENTS, nullptr, 0));
-    if (submitted < 0) {
-      reason = errno_reason("io_uring_enter_failed_errno");
-      return false;
+  bool submit_queued(std::string& reason,
+                     std::size_t* submit_syscalls = nullptr) {
+    std::size_t syscall_count = 0;
+    while (queued_submissions_ > 0) {
+      const int submitted = static_cast<int>(
+          syscall(__NR_io_uring_enter, ring_fd_, queued_submissions_, 0, 0,
+                  nullptr, 0));
+      if (submitted < 0) {
+        reason = errno_reason("io_uring_enter_failed_errno");
+        return false;
+      }
+      if (submitted == 0) {
+        reason = "io_uring_enter_submitted_zero";
+        return false;
+      }
+      ++syscall_count;
+      queued_submissions_ -= static_cast<unsigned>(submitted);
     }
-    ++stats.io_submits;
+    if (submit_syscalls != nullptr) {
+      *submit_syscalls += syscall_count;
+    }
+    return true;
+  }
 
-    while (*cq_head_ == *cq_tail_) {
+  bool has_completion() const {
+    return *cq_head_ != *cq_tail_;
+  }
+
+  bool pop_completion(Completion& completion, bool wait,
+                      std::string& reason) {
+    if (!has_completion() && wait) {
       const int waited = static_cast<int>(
           syscall(__NR_io_uring_enter, ring_fd_, 0, 1,
                   IORING_ENTER_GETEVENTS, nullptr, 0));
@@ -1296,13 +1327,39 @@ class RawIoUring {
         return false;
       }
     }
+    if (!has_completion()) {
+      return false;
+    }
 
     std::atomic_thread_fence(std::memory_order_acquire);
     const unsigned cq_head = *cq_head_;
     const io_uring_cqe& cqe = cqes_[cq_head & *cq_ring_mask_];
-    const int result = cqe.res;
+    completion.user_data = cqe.user_data;
+    completion.result = cqe.res;
     *cq_head_ = cq_head + 1;
+    return true;
+  }
+
+  bool read(int fd, std::uint64_t offset, void* buffer, std::size_t bytes,
+            DiskGraphSearchStats& stats, std::string& reason) {
+    const std::uint64_t user_data = next_user_data_++;
+    std::size_t submit_syscalls = 0;
+    if (!queue_read(fd, offset, buffer, bytes, user_data, reason) ||
+        !submit_queued(reason, &submit_syscalls)) {
+      return false;
+    }
+    ++stats.io_submits;
+    stats.io_submit_syscalls += submit_syscalls;
+
+    Completion completion;
+    do {
+      if (!pop_completion(completion, true, reason)) {
+        return false;
+      }
+    } while (completion.user_data != user_data);
+
     ++stats.io_completions;
+    const int result = completion.result;
     if (result != static_cast<int>(bytes)) {
       reason = result < 0
                    ? "io_uring_read_failed_errno_" + std::to_string(-result)
@@ -1331,6 +1388,7 @@ class RawIoUring {
   unsigned* cq_ring_mask_ = nullptr;
   io_uring_cqe* cqes_ = nullptr;
   std::uint64_t next_user_data_ = 1;
+  unsigned queued_submissions_ = 0;
 };
 #endif
 
@@ -1423,12 +1481,152 @@ class DiskPageReader {
     return status_;
   }
 
+  struct CompletedRead {
+    std::uint64_t token = 0;
+    std::vector<char> data;
+  };
+
+  bool async_enabled() const {
+#ifdef __linux__
+    return status_.effective_mode == "io_uring";
+#else
+    return false;
+#endif
+  }
+
+  std::size_t max_pending_reads() const {
+    return async_enabled() ? std::max<std::size_t>(1, status_.batch_size) : 0;
+  }
+
+  std::size_t pending_async_reads() const {
+    return async_buffers_.size();
+  }
+
+  std::uint64_t start_async_read(std::uint64_t offset, std::size_t bytes,
+                                 DiskGraphSearchStats& stats) {
+    if (!async_enabled()) {
+      throw std::runtime_error("Async graph reads require io_uring mode");
+    }
+#ifdef __linux__
+#if AGENTMEM_HAS_IO_URING && defined(__NR_io_uring_setup) && \
+    defined(__NR_io_uring_enter)
+    if (status_.direct_enabled &&
+        (offset % kDirectIoAlignment != 0 || bytes % kDirectIoAlignment != 0)) {
+      throw std::runtime_error(
+          "Direct graph I/O requires aligned page offsets and lengths");
+    }
+
+    void* aligned = nullptr;
+    if (posix_memalign(&aligned, kDirectIoAlignment, bytes) != 0) {
+      throw std::runtime_error("Failed to allocate aligned graph I/O buffer");
+    }
+
+    const std::uint64_t token = next_async_token_++;
+    std::string reason;
+    if (!ring_.queue_read(fd_, offset, aligned, bytes, token, reason)) {
+      std::free(aligned);
+      throw std::runtime_error("Graph page async read failed: " + reason);
+    }
+
+    async_buffers_.emplace(token, AsyncBuffer{aligned, bytes});
+    ++stats.io_submits;
+    return token;
+#else
+    (void)offset;
+    (void)bytes;
+    (void)stats;
+    throw std::runtime_error("io_uring headers or syscalls are unavailable");
+#endif
+#else
+    (void)offset;
+    (void)bytes;
+    (void)stats;
+    throw std::runtime_error("Async graph reads require Linux");
+#endif
+  }
+
+  void submit_async_reads(DiskGraphSearchStats& stats) {
+    if (!async_enabled()) {
+      return;
+    }
+#ifdef __linux__
+#if AGENTMEM_HAS_IO_URING && defined(__NR_io_uring_setup) && \
+    defined(__NR_io_uring_enter)
+    std::string reason;
+    std::size_t submit_syscalls = 0;
+    if (!ring_.submit_queued(reason, &submit_syscalls)) {
+      throw std::runtime_error("Graph page async submit failed: " + reason);
+    }
+    stats.io_submit_syscalls += submit_syscalls;
+#endif
+#endif
+  }
+
+  bool reap_async_read(bool wait, CompletedRead& completed,
+                       DiskGraphSearchStats& stats) {
+    if (!async_enabled()) {
+      return false;
+    }
+#ifdef __linux__
+#if AGENTMEM_HAS_IO_URING && defined(__NR_io_uring_setup) && \
+    defined(__NR_io_uring_enter)
+    RawIoUring::Completion completion;
+    std::string reason;
+    if (!ring_.pop_completion(completion, wait, reason)) {
+      if (!reason.empty()) {
+        throw std::runtime_error("Graph page async wait failed: " + reason);
+      }
+      return false;
+    }
+
+    auto found = async_buffers_.find(completion.user_data);
+    if (found == async_buffers_.end()) {
+      throw std::runtime_error("Unknown graph async completion token");
+    }
+    AsyncBuffer buffer = found->second;
+    async_buffers_.erase(found);
+    ++stats.io_completions;
+
+    if (completion.result != static_cast<int>(buffer.bytes)) {
+      const std::string failure =
+          completion.result < 0
+              ? "io_uring_read_failed_errno_" +
+                    std::to_string(-completion.result)
+              : "io_uring_short_read_" + std::to_string(completion.result);
+      std::free(buffer.aligned);
+      throw std::runtime_error("Graph page async read failed: " + failure);
+    }
+
+    completed.token = completion.user_data;
+    completed.data.assign(static_cast<const char*>(buffer.aligned),
+                          static_cast<const char*>(buffer.aligned) +
+                              buffer.bytes);
+    std::free(buffer.aligned);
+    return true;
+#else
+    (void)wait;
+    (void)completed;
+    (void)stats;
+    return false;
+#endif
+#else
+    (void)wait;
+    (void)completed;
+    (void)stats;
+    return false;
+#endif
+  }
+
   std::vector<char> read(std::uint64_t offset, std::size_t bytes,
                          DiskGraphSearchStats& stats) {
     std::vector<char> output(bytes, 0);
 #ifdef __linux__
     if (status_.effective_mode == "odirect" ||
         status_.effective_mode == "io_uring") {
+      if (status_.effective_mode == "io_uring" && !async_buffers_.empty()) {
+        throw std::runtime_error(
+            "Cannot perform synchronous io_uring read with pending async reads");
+      }
       if (status_.direct_enabled &&
           (offset % kDirectIoAlignment != 0 ||
            bytes % kDirectIoAlignment != 0)) {
@@ -1481,6 +1679,11 @@ class DiskPageReader {
   }
 
  private:
+  struct AsyncBuffer {
+    void* aligned = nullptr;
+    std::size_t bytes = 0;
+  };
+
 #ifdef __linux__
   bool direct_io_layout_supported() const {
     return page_size_ % kDirectIoAlignment == 0;
@@ -1542,6 +1745,10 @@ class DiskPageReader {
 #endif
 
   void close_native() {
+    for (auto& entry : async_buffers_) {
+      std::free(entry.second.aligned);
+    }
+    async_buffers_.clear();
 #ifdef __linux__
 #if AGENTMEM_HAS_IO_URING && defined(__NR_io_uring_setup) && \
     defined(__NR_io_uring_enter)
@@ -1561,6 +1768,8 @@ class DiskPageReader {
   std::string path_;
   std::size_t page_size_ = 0;
   DiskGraphIoStatus status_;
+  std::unordered_map<std::uint64_t, AsyncBuffer> async_buffers_;
+  std::uint64_t next_async_token_ = 1;
 #ifdef __linux__
   int fd_ = -1;
 #if AGENTMEM_HAS_IO_URING && defined(__NR_io_uring_setup) && \
@@ -1841,8 +2050,8 @@ NaiveDiskGraphIndex::DiskNode NaiveDiskGraphIndex::read_node(
   const std::uint64_t offset =
       metadata_.records_offset +
       static_cast<std::uint64_t>(id) * metadata_.page_size;
-  std::vector<char> page = page_reader_->read(offset, metadata_.page_size,
-                                               stats);
+  std::vector<char> page =
+      page_reader_->read(offset, metadata_.page_size, stats);
 
   std::size_t cursor = 0;
   DiskNode node;
@@ -2249,7 +2458,11 @@ PackedDiskGraphIndex::DecodedPage PackedDiskGraphIndex::read_page(
       static_cast<std::uint64_t>(page_id) * metadata_.page_size;
   std::vector<char> page = page_reader_->read(offset, metadata_.page_size,
                                                stats);
+  return decode_page(page_id, page);
+}
 
+PackedDiskGraphIndex::DecodedPage PackedDiskGraphIndex::decode_page(
+    std::uint32_t page_id, const std::vector<char>& page) const {
   std::size_t cursor = 0;
   DecodedPage decoded;
   decoded.page_id = get_bytes<std::uint32_t>(page, cursor);
@@ -2303,6 +2516,56 @@ PackedDiskGraphIndex::DecodedPage PackedDiskGraphIndex::read_page(
   return decoded;
 }
 
+bool PackedDiskGraphIndex::cache_enabled() const {
+  return cache_policy_ != "none" && cache_capacity_pages_ > 0;
+}
+
+const PackedDiskGraphIndex::DecodedPage*
+PackedDiskGraphIndex::lookup_cached_page(std::uint32_t page_id,
+                                         DiskGraphSearchStats& stats) {
+  if (!cache_enabled()) {
+    return nullptr;
+  }
+
+  auto found = page_cache_.find(page_id);
+  if (found == page_cache_.end()) {
+    return nullptr;
+  }
+
+  ++stats.page_cache_hits;
+  found->second.last_access = ++cache_clock_;
+  ++found->second.frequency;
+  return &found->second.page;
+}
+
+const PackedDiskGraphIndex::DecodedPage&
+PackedDiskGraphIndex::store_cached_page(DecodedPage page) {
+  if (!cache_enabled()) {
+    scratch_page_ = std::move(page);
+    return scratch_page_;
+  }
+
+  const std::uint32_t page_id = page.page_id;
+  auto found = page_cache_.find(page_id);
+  if (found != page_cache_.end()) {
+    found->second.page = std::move(page);
+    found->second.last_access = ++cache_clock_;
+    ++found->second.frequency;
+    return found->second.page;
+  }
+
+  if (page_cache_.size() >= cache_capacity_pages_) {
+    evict_one_page();
+  }
+
+  CacheEntry entry;
+  entry.page = std::move(page);
+  entry.last_access = ++cache_clock_;
+  entry.frequency = 1;
+  auto inserted = page_cache_.emplace(page_id, std::move(entry));
+  return inserted.first->second.page;
+}
+
 double PackedDiskGraphIndex::cache_score(const CacheEntry& entry) const {
   if (cache_policy_ == "lru") {
     return static_cast<double>(entry.last_access);
@@ -2335,6 +2598,10 @@ void PackedDiskGraphIndex::evict_one_page() {
 const PackedDiskGraphIndex::DecodedPage& PackedDiskGraphIndex::load_page(
     std::uint32_t page_id, DiskGraphSearchStats& stats) {
   ++stats.page_requests;
+
+  if (const DecodedPage* cached = lookup_cached_page(page_id, stats)) {
+    return *cached;
+  }
 
   if (cache_policy_ != "none" && cache_capacity_pages_ > 0) {
     auto found = page_cache_.find(page_id);
@@ -2382,9 +2649,206 @@ DiskGraphSearchResult PackedDiskGraphIndex::search_one(
   std::priority_queue<SearchResult, std::vector<SearchResult>, WorseResultFirst>
       best;
 
+  const bool async_prefetch = page_reader_->async_enabled() &&
+                              page_reader_->max_pending_reads() > 0;
+  const std::size_t prefetch_budget_pages =
+      async_prefetch ? page_reader_->max_pending_reads() : 0;
+  std::unordered_map<std::uint32_t, DecodedPage> ready_prefetch_pages;
+  std::unordered_map<std::uint64_t, std::uint32_t> token_to_page;
+  std::unordered_set<std::uint32_t> pending_pages;
+  std::unordered_set<std::uint32_t> completed_prefetch_pages;
+
+  auto async_page_footprint = [&]() {
+    return pending_pages.size() + ready_prefetch_pages.size();
+  };
+  auto update_pending_peak = [&]() {
+    output.stats.io_pending_pages_peak = std::max(
+        output.stats.io_pending_pages_peak, async_page_footprint());
+  };
+  auto page_in_cache = [&](std::uint32_t page_id) {
+    return cache_enabled() && page_cache_.find(page_id) != page_cache_.end();
+  };
+  auto page_offset = [&](std::uint32_t page_id) {
+    return metadata_.records_offset +
+           static_cast<std::uint64_t>(page_id) * metadata_.page_size;
+  };
+  auto materialize_page = [&](const DecodedPage& page) {
+    for (const auto& node : page.nodes) {
+      local_nodes.emplace(node.id, node);
+    }
+  };
+
+  auto harvest_prefetch = [&](bool wait) {
+    if (!async_prefetch) {
+      return false;
+    }
+    page_reader_->submit_async_reads(output.stats);
+
+    bool harvested = false;
+    DiskPageReader::CompletedRead completed;
+    while (page_reader_->reap_async_read(wait && !harvested, completed,
+                                         output.stats)) {
+      harvested = true;
+      const auto token_found = token_to_page.find(completed.token);
+      if (token_found == token_to_page.end()) {
+        throw std::runtime_error("Packed graph async page token is unknown");
+      }
+      const std::uint32_t page_id = token_found->second;
+      token_to_page.erase(token_found);
+      pending_pages.erase(page_id);
+
+      DecodedPage decoded = decode_page(page_id, completed.data);
+      completed_prefetch_pages.insert(page_id);
+      if (cache_enabled()) {
+        (void)store_cached_page(std::move(decoded));
+      } else if (ready_prefetch_pages.size() < prefetch_budget_pages) {
+        ready_prefetch_pages.emplace(page_id, std::move(decoded));
+      }
+      update_pending_peak();
+      completed = DiskPageReader::CompletedRead{};
+    }
+    return harvested;
+  };
+
+  auto wait_for_prefetch_page = [&](std::uint32_t page_id) {
+    while (pending_pages.find(page_id) != pending_pages.end()) {
+      ++output.stats.io_prefetch_waits;
+      if (!harvest_prefetch(true)) {
+        throw std::runtime_error("Failed to wait for packed graph prefetch");
+      }
+    }
+  };
+
+  auto prefetch_page = [&](std::uint32_t page_id) {
+    if (!async_prefetch || page_id >= metadata_.page_count ||
+        page_in_cache(page_id) ||
+        ready_prefetch_pages.find(page_id) != ready_prefetch_pages.end() ||
+        pending_pages.find(page_id) != pending_pages.end()) {
+      return;
+    }
+
+    if (async_page_footprint() >= prefetch_budget_pages) {
+      (void)harvest_prefetch(false);
+    }
+    if (async_page_footprint() >= prefetch_budget_pages) {
+      return;
+    }
+
+    const std::uint64_t token = page_reader_->start_async_read(
+        page_offset(page_id), metadata_.page_size, output.stats);
+    token_to_page[token] = page_id;
+    pending_pages.insert(page_id);
+    ++output.stats.node_reads;
+    ++output.stats.io_prefetches;
+    update_pending_peak();
+  };
+
+  auto submit_prefetches = [&]() {
+    if (async_prefetch) {
+      page_reader_->submit_async_reads(output.stats);
+      (void)harvest_prefetch(false);
+    }
+  };
+
+  auto prefetch_ids = [&](const std::vector<std::uint32_t>& ids) {
+    if (!async_prefetch) {
+      return;
+    }
+    for (const auto id : ids) {
+      if (id < metadata_.vector_count &&
+          visited.find(id) == visited.end() &&
+          local_nodes.find(id) == local_nodes.end()) {
+        prefetch_page(node_to_page_[id]);
+      }
+    }
+    submit_prefetches();
+  };
+
+  auto prefetch_frontier = [&]() {
+    if (!async_prefetch || candidates.empty()) {
+      return;
+    }
+
+    auto frontier = candidates;
+    while (!frontier.empty() &&
+           async_page_footprint() < prefetch_budget_pages) {
+      const auto next = frontier.top();
+      frontier.pop();
+      if (local_nodes.find(next.id) == local_nodes.end()) {
+        prefetch_page(node_to_page_[next.id]);
+      }
+    }
+    submit_prefetches();
+  };
+
   auto load_node = [&](std::uint32_t id) -> DiskNode& {
     auto node_found = local_nodes.find(id);
     if (node_found != local_nodes.end()) {
+      return node_found->second;
+    }
+
+    {
+      const std::uint32_t page_id = node_to_page_[id];
+      ++output.stats.page_requests;
+
+      if (const DecodedPage* cached =
+              lookup_cached_page(page_id, output.stats)) {
+        if (completed_prefetch_pages.erase(page_id) > 0) {
+          ++output.stats.io_prefetch_hits;
+        }
+        materialize_page(*cached);
+      } else {
+        auto ready = ready_prefetch_pages.find(page_id);
+        if (ready != ready_prefetch_pages.end()) {
+          ++output.stats.page_cache_hits;
+          ++output.stats.io_prefetch_hits;
+          materialize_page(ready->second);
+          ready_prefetch_pages.erase(ready);
+        } else {
+          if (pending_pages.find(page_id) == pending_pages.end() &&
+              async_prefetch) {
+            while (async_page_footprint() >= prefetch_budget_pages &&
+                   !pending_pages.empty()) {
+              (void)harvest_prefetch(true);
+            }
+            prefetch_page(page_id);
+            submit_prefetches();
+          }
+
+          if (pending_pages.find(page_id) != pending_pages.end()) {
+            wait_for_prefetch_page(page_id);
+          }
+
+          if (const DecodedPage* prefetched =
+                  lookup_cached_page(page_id, output.stats)) {
+            if (completed_prefetch_pages.erase(page_id) > 0) {
+              ++output.stats.io_prefetch_hits;
+            }
+            materialize_page(*prefetched);
+          } else {
+            ready = ready_prefetch_pages.find(page_id);
+            if (ready != ready_prefetch_pages.end()) {
+              ++output.stats.page_cache_hits;
+              ++output.stats.io_prefetch_hits;
+              materialize_page(ready->second);
+              ready_prefetch_pages.erase(ready);
+            } else {
+              while (async_prefetch && !pending_pages.empty()) {
+                (void)harvest_prefetch(true);
+              }
+              ++output.stats.page_cache_misses;
+              ++output.stats.node_reads;
+              DecodedPage page = read_page(page_id, output.stats);
+              materialize_page(page);
+            }
+          }
+        }
+      }
+
+      node_found = local_nodes.find(id);
+      if (node_found == local_nodes.end()) {
+        throw std::runtime_error("Node is missing from packed page");
+      }
       return node_found->second;
     }
 
@@ -2470,6 +2934,7 @@ DiskGraphSearchResult PackedDiskGraphIndex::search_one(
           ? entry_points(metadata_.vector_count, config.entry_count)
           : config.seed_ids;
 
+  prefetch_ids(entries);
   for (const auto entry : entries) {
     if (entry >= metadata_.vector_count) {
       continue;
@@ -2485,6 +2950,7 @@ DiskGraphSearchResult PackedDiskGraphIndex::search_one(
   }
 
   while (!candidates.empty() && output.stats.expanded < config.search_width) {
+    prefetch_frontier();
     if (config.adaptive_early_stop &&
         output.stats.expanded >= config.min_expansions &&
         stagnant_expansions >= config.early_stop_patience) {
@@ -2498,6 +2964,7 @@ DiskGraphSearchResult PackedDiskGraphIndex::search_one(
     const DiskNode& node = load_node(current.id);
     ++output.stats.expanded;
 
+    prefetch_ids(node.neighbors);
     for (const auto neighbor_id : node.neighbors) {
       if (neighbor_id >= metadata_.vector_count ||
           !visited.insert(neighbor_id).second) {
@@ -2510,6 +2977,10 @@ DiskGraphSearchResult PackedDiskGraphIndex::search_one(
       add_best(candidate);
     }
     update_adaptive_stop();
+  }
+
+  while (async_prefetch && !pending_pages.empty()) {
+    (void)harvest_prefetch(true);
   }
 
   output.stats.visited = visited.size();

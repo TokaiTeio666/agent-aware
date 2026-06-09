@@ -156,6 +156,11 @@ struct RunOutput {  // 保留逐 query 原始样本，最终统一计算分位�
   std::vector<double> visited;
   std::vector<double> io_submits;
   std::vector<double> io_completions;
+  std::vector<double> io_submit_syscalls;
+  std::vector<double> io_prefetches;
+  std::vector<double> io_prefetch_hits;
+  std::vector<double> io_prefetch_waits;
+  std::vector<double> io_pending_pages_peak;
   std::vector<double> adc_table_build_us;
   std::vector<double> insert_latencies_ms;
   std::vector<double> query_compaction_ms;
@@ -1485,6 +1490,11 @@ RunOutput execute_graph_queries(Index& index, const Args& args,
     output.visited.reserve(queries.size());
     output.io_submits.reserve(queries.size());
     output.io_completions.reserve(queries.size());
+    output.io_submit_syscalls.reserve(queries.size());
+    output.io_prefetches.reserve(queries.size());
+    output.io_prefetch_hits.reserve(queries.size());
+    output.io_prefetch_waits.reserve(queries.size());
+    output.io_pending_pages_peak.reserve(queries.size());
     output.adc_table_build_us.reserve(queries.size());
   }
 
@@ -1516,6 +1526,16 @@ RunOutput execute_graph_queries(Index& index, const Args& args,
           static_cast<double>(result.stats.io_submits));
       output.io_completions.push_back(
           static_cast<double>(result.stats.io_completions));
+      output.io_submit_syscalls.push_back(
+          static_cast<double>(result.stats.io_submit_syscalls));
+      output.io_prefetches.push_back(
+          static_cast<double>(result.stats.io_prefetches));
+      output.io_prefetch_hits.push_back(
+          static_cast<double>(result.stats.io_prefetch_hits));
+      output.io_prefetch_waits.push_back(
+          static_cast<double>(result.stats.io_prefetch_waits));
+      output.io_pending_pages_peak.push_back(
+          static_cast<double>(result.stats.io_pending_pages_peak));
       output.adc_table_build_us.push_back(result.stats.adc_table_build_us);
       output.results.push_back(std::move(result.topk));
     }
@@ -1845,6 +1865,11 @@ RunOutput run_mixed_graph_with_index(Index& index, const Args& args,
   output.cache_misses.reserve(output.operation_count);
   output.io_submits.reserve(output.operation_count);
   output.io_completions.reserve(output.operation_count);
+  output.io_submit_syscalls.reserve(output.operation_count);
+  output.io_prefetches.reserve(output.operation_count);
+  output.io_prefetch_hits.reserve(output.operation_count);
+  output.io_prefetch_waits.reserve(output.operation_count);
+  output.io_pending_pages_peak.reserve(output.operation_count);
   output.adc_table_build_us.reserve(output.operation_count);
   output.path_cache_requests.reserve(output.operation_count);
   output.path_cache_hits.reserve(output.operation_count);
@@ -2043,6 +2068,16 @@ RunOutput run_mixed_graph_with_index(Index& index, const Args& args,
         static_cast<double>(main_result.stats.io_submits));
     output.io_completions.push_back(
         static_cast<double>(main_result.stats.io_completions));
+    output.io_submit_syscalls.push_back(
+        static_cast<double>(main_result.stats.io_submit_syscalls));
+    output.io_prefetches.push_back(
+        static_cast<double>(main_result.stats.io_prefetches));
+    output.io_prefetch_hits.push_back(
+        static_cast<double>(main_result.stats.io_prefetch_hits));
+    output.io_prefetch_waits.push_back(
+        static_cast<double>(main_result.stats.io_prefetch_waits));
+    output.io_pending_pages_peak.push_back(
+        static_cast<double>(main_result.stats.io_pending_pages_peak));
     output.adc_table_build_us.push_back(main_result.stats.adc_table_build_us);
     output.results.push_back(merged);
     output.dynamic_truth.push_back(ids_from_results(truth_results));
@@ -2488,6 +2523,15 @@ int main(int argc, char** argv) {
     print_optional_stats("graph_visited_per_query", output.visited);
     print_optional_stats("io_submit_count_per_query", output.io_submits);
     print_optional_stats("io_complete_count_per_query", output.io_completions);
+    print_optional_stats("io_submit_syscall_count_per_query",
+                         output.io_submit_syscalls);
+    print_optional_stats("io_prefetch_count_per_query", output.io_prefetches);
+    print_optional_stats("io_prefetch_hit_count_per_query",
+                         output.io_prefetch_hits);
+    print_optional_stats("io_prefetch_wait_count_per_query",
+                         output.io_prefetch_waits);
+    print_optional_stats("io_pending_pages_peak_per_query",
+                         output.io_pending_pages_peak);
     print_optional_stats("adc_table_build_us", output.adc_table_build_us);
     print_optional_stats("insert_latency_ms", output.insert_latencies_ms);
     print_optional_stats("query_compaction_ms", output.query_compaction_ms);

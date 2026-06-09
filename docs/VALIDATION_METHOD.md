@@ -1,91 +1,46 @@
 # AgentMem-Flow 验证方法
 
-本文档定义 AgentMem-Flow 各版本必须遵守的验证方法。后续每个版本的分析报告、结果归档和答辩材料都应以本文档为准。
+本文档定义当前正式验证口径。自 2026-06-09 起，正式验证只采用 `SIFT10K` 与 `SIFT100K`，不再使用本地 synthetic / local smoke 结果作为验证依据。
 
-## 1. Recall@10 与 1-Recall@10 定义
+## 1. Recall@10 定义
 
 对查询集合 `Q`，每个 query `q` 有：
 
-- `GT_10(q)`：ground truth Top-10 向量 id 集合。
-- `R_10(q)`：系统返回的 Top-10 向量 id 集合。
-
-单个 query 的召回率：
+- `GT_10(q)`：ground truth Top-10 id 集合
+- `R_10(q)`：系统返回的 Top-10 id 集合
 
 ```text
 recall@10(q) = |R_10(q) ∩ GT_10(q)| / 10
-```
-
-整个查询集的召回率：
-
-```text
 Recall@10 = average(recall@10(q) for q in Q)
-```
-
-召回缺失率：
-
-```text
 1-Recall@10 = 1 - Recall@10
 ```
 
-例如 `Recall@10 = 0.95` 表示平均每个 query 的 Top-10 ground truth 中有 9.5 个被召回；`1-Recall@10 = 0.05` 表示平均缺失比例为 5%。
+## 2. 数据集与 Ground Truth
 
-## 2. Ground Truth 选择原则
+当前正式验证范围：
 
-标准数据集优先使用官方 ground truth：
+| 数据集 | Base Count | Query Count | Ground Truth |
+|---|---:|---:|---|
+| SIFT10K | 10,000 | 100 | subset exact brute force fallback |
+| SIFT100K | 100,000 | 100 | subset exact brute force fallback |
 
-- SIFT1M 必须优先使用官方 `.ivecs`，不依赖 V0 暴力搜索。
-- SIFT100K / SIFT10K 如果由 SIFT1M 子集构造，优先使用对应子集的官方或预处理 ground truth。
-- 如果直接用官方 SIFT1M `.ivecs` 验证 base subset，程序必须检查 truth id 是否越过当前 `base_count`；一旦越界，报告必须标注并切换为当前子集的 exact brute force truth，或使用预先生成的子集 truth。
-- 只有 synthetic workload 或没有官方 ground truth 的小规模实验，才允许使用 V0 exact brute force 生成 ground truth。
-- 动态读写实验必须使用“按查询时刻”的 dynamic ground truth：对每次 query，ground truth 应基于当时已经可见的 `Main Index + Delta Index - delete-list/tombstones` 逻辑全集计算，不能用运行结束后的全集倒推，不能忽略新插入向量，也不能把已删除向量算入 ground truth。
+规则如下：
 
-报告中必须明确记录：
+- 输入数据必须来自 `data/sift/` 下的真实 SIFT 文件。
+- `SIFT1M` 官方 `.ivecs` 仅适用于 full-base；对子集运行时必须检查 truth id 是否越界。
+- 一旦 `sift_groundtruth.ivecs` 中存在超出当前 `base_limit` 的 id，必须切换到当前子集的 exact brute force truth，并在结果中记录 `truth=file_out_of_range_exact_bruteforce`。
+- 当前正式报告必须写明 truth 来源，不允许只写“用默认 truth”。
 
-- ground truth 文件路径或生成方式；
-- 是否使用官方 `.ivecs`；
-- 若使用 V0 暴力搜索，必须说明数据规模和原因。
+## 3. 受限内存验证
 
-## 3. Cold Run 与 Warm Run
-
-AgentMem-Flow 是 I/O 优化项目，因此正式性能实验必须区分 cold run 和 warm run。
-
-Cold run：
-
-- 目标：体现磁盘 I/O 压力和冷启动行为。
-- 要求：清空系统 Page Cache 或尽可能降低系统缓存影响；同时清空应用内缓存。
-- Linux 推荐方式：在有权限时使用 `sync` 后写入 `/proc/sys/vm/drop_caches`。
-- WSL/Linux 严格 cold run 推荐使用 `scripts/linux/run_v2_strict_cold_warm.sh`，并尽量将仓库和 index 文件放在 WSL ext4 文件系统中，而不是 `/mnt/c`。
-- Windows 开发环境：如果不能可靠清空系统缓存，必须在报告中标注“未能严格清 OS cache”，并将结果视为 smoke/warm-like，不作为最终 cold 结论。
-
-Warm run：
-
-- 目标：体现缓存预热后的稳态性能。
-- 要求：先执行至少一轮预热查询，再记录正式指标。
-- V2/V3 之后必须报告 warm run，因为 packed layout 和 cache 优化都可能显著影响稳态性能。
-
-每个正式实验至少记录：
-
-```text
-cold_qps
-cold_p99_latency
-warm_qps
-warm_p99_latency
-cache_hit_rate
-ssd_reads_per_query
-```
-
-对于 V0/V1 的 smoke test，可以暂时标记为 `smoke run`；从 V2 开始，涉及 I/O 布局和缓存的版本必须区分 cold/warm。
-
-## 4. 受限内存验证
-
-正式受限内存实验必须记录 resident engine memory，而不是只记录机器总内存。默认达标预算为：
+正式验证必须记录 resident engine memory，而不是机器总内存。默认预算口径为：
 
 ```text
 memory_budget_ratio <= 0.20
 memory_budget_bytes = raw_vector_bytes * memory_budget_ratio
 ```
 
-必须输出并归档：
+必须归档以下字段：
 
 - `memory_budget_ratio`
 - `memory_budget_bytes`
@@ -93,88 +48,72 @@ memory_budget_bytes = raw_vector_bytes * memory_budget_ratio
 - `memory_resident_ratio`
 - `memory_budget_pass`
 - `memory_accounting_scope`
-- `memory_bytes_*` 组件拆分
+- `memory_bytes_*`
 
 通过标准：
 
-- `memory_budget_pass=1`。
-- `memory_resident_ratio <= 0.20`；严格档可使用 `<= 0.10`。
-- exact / memory mode 只能作为正确性或上界对照，不能作为受限内存达标证据。
-- 如果使用 `--allow-over-budget-for-debug`，报告必须明确标注该结果不算达标。
-- 如果开启 `--enforce-memory-budget`，超预算运行必须失败。
+- `memory_budget_pass=1`
+- `memory_resident_ratio <= 0.20`
+- exact / 全量内存模式不能作为受限内存达标证据
+- 如果启用 `--allow-over-budget-for-debug`，结果只能作为调试反例，不能算通过
 
-## 5. 版本通过标准
+## 4. 运行环境口径
 
-每个版本必须设置 pass criteria，不能只描述“测了什么”。
+当前正式验证允许使用 WSL2，但必须在报告中明确：
 
-建议标准如下。
+- 运行路径是否位于 `/mnt/d` 之类的 Windows 挂载路径
+- 当前 `io_mode_requested` 与 `io_mode_effective`
+- 是否仍然落回 `pread`
 
-| 版本 | 通过标准 |
+解释规则：
+
+- WSL2 `/mnt/d` 结果可用于验证功能、召回和内存预算。
+- WSL2 `/mnt/d` 结果不能作为最终 ext4 / NVMe 性能结论。
+- 只有在原生 Linux 或 WSL ext4 上完成复跑后，P99 / QPS 才能作为更强的 I/O 结论。
+
+## 5. 当前通过标准
+
+当前主线只认以下通过条件：
+
+| 项目 | 通过标准 |
 |---|---|
-| V0 | synthetic Recall@10 = 1.0；1-Recall@10 = 0；能输出完整指标；build/run/archive 流程正常 |
-| V1 | graph Recall@10 达到设定阈值；visited/query 和 expanded/query 能正常统计；resident router 相比关闭 router 有明显 Recall 提升；SSD reads/query 可观测 |
-| V2 | packed page layout 的 SSD reads/query 低于 one-node-per-page；co-access packing 优于 random packing；Recall@10 不明显下降 |
-| V3 | cache hit rate 可观测；warm run P95/P99 latency 下降；SSD reads/query 下降 |
-| V4 | path cache hit rate 可观测；相似连续查询的 latency 和 SSD reads/query 下降；Recall@10 不明显下降 |
-| V5 | WAL records 等于成功 insert 数；Delta 与 Main Top-K 合并后 Recall@10 不明显下降；insert latency 可观测；读写混合下 SLA compaction 的 query P99 低于 aggressive compaction；compaction interference 可量化 |
-| V5.1 | `--wal-replay` 后 `wal_replay_records == wal_replay_delta_size`；append 写入不覆盖已有 WAL；replay 后动态查询 Recall@10 不明显下降 |
-| V5.2 | 保留 flat delta truth；`ivf-flat` 输出 delta search latency 和 delta recall；Delta ANN Recall@10 不明显低于 flat；delta search latency 相比 flat 可观测 |
-| V6 | 真实 file compaction 的 `compaction_io_bytes` 可观测；AutoDL warm/cold 归档完整；SLA compaction 在真实文件 I/O 干扰下 P99 低于 aggressive compaction；SIFT 实验使用官方 `.ivecs` |
-| V7 | Query signature policy 对比归档完整；Recall@10 不明显下降；path cache hit rate 可观测；SSD reads/query 和 expanded/query 相比 no path cache 下降 |
-| V8 | `approx-rp` 建图可完成 SIFT10K 回归；mixed delete workload 中 `delete_count == tombstone_count`；`wal_records == insert_count + delete_count`；StreamMerge 指标可观测并写出新 LTI；dynamic Recall@10 >= 0.95 |
-| V9 | `lsh-rp` 建图可完成 SIFT100K 现场构建；SIFT10K 构建时间显著低于 V8；early-stop 档在 Recall@10 >= 0.95 时降低 P99 和 SSD reads/query；FreshVamana + StreamMerge smoke 仍通过 |
-| M1+ | 受限内存实验必须输出 `memory_budget_pass=1`；若 `memory_budget_pass=0`，只能作为 debug 或对照结果 |
-
-如果某个标准未通过，报告必须明确写出原因和降级计划。
+| SIFT10K | `memory_budget_pass=1` 且 `Recall@10` 保持高召回，结果可复现 |
+| SIFT100K | `memory_budget_pass=1` 且 `Recall@10 >= 0.95` |
+| 近 20% 对照 | 只用于说明预算分配影响，不替代主线达标配置 |
+| PQ/ADC 变体 | 只要 Recall 不达标，就归类为反例或调参对象 |
 
 ## 6. 归档要求
 
-每个版本至少归档以下内容：
+正式验证至少保留以下文件：
 
 ```text
-docs/iterations/vX-analysis.md
-archive/results/vX-*.txt
-archive/configs/vX-*.json
-archive/logs/vX-*.log
-archive/build_info/vX-*.txt
+docs/WSL2_SIFT_VALIDATION_REPORT.md
+docs/sift_experiment_report.md
+archive/results/wsl-sift10k-*.txt
+archive/results/wsl-sift100k-*.txt
+archive/logs/wsl-sift10k-*.log
+archive/logs/wsl-sift100k-*.log
 ```
 
 归档内容必须包含：
 
-- git commit hash；如果尚未产生 commit，记录为 `no commit yet` 并保存 `git status --short`。
-- 编译时间。
-- 编译器版本。
-- CPU 信息。
-- 内存信息。
-- 磁盘 / 文件系统信息，如能采集则记录。
-- 系统版本。
-- 运行命令。
-- 随机种子。
-- 数据集路径。
-- index 参数。
-- run 类型：cold / warm / smoke。
-- ground truth 来源。
-- memory budget ratio / bytes。
-- memory resident bytes / ratio。
-- memory budget pass。
-- memory component breakdown。
+- git commit hash
+- 构建时间与编译器版本
+- 运行命令
+- 数据集路径
+- truth 来源
+- `io_mode_requested`
+- `io_mode_effective`
+- memory budget / resident memory 字段
+- `Recall@10`、QPS、P95/P99 latency、`ssd_reads_per_query`
 
-V8 之后还必须记录：
+## 7. 当前不再纳入正式验证的内容
 
-- `graph_build_policy`、`approx_*` 参数和 `robust_prune_alpha`。
-- `delete_count`、`tombstone_count`。
-- `wal_replay_inserts`、`wal_replay_deletes`。
-- `stream_merge_ops`、`stream_merge_vectors`、`stream_merge_inserted`、`stream_merge_deleted`、`stream_merge_seconds`。
-- StreamMerge 输出 index 路径，以及该 index 是否已在后续进程中重新加载验证。
+以下内容不再作为正式验证证据：
 
-V9 之后还必须记录：
+- 本地 synthetic clustered workload
+- Windows local smoke
+- `run_type=smoke` 的本地功能回归结果
+- 基于 synthetic 的 PQ/ADC、mixed workload 结论
 
-- `lsh_tables`、`lsh_bits`、`lsh_probe_radius`、`lsh_bucket_limit`。
-- `search_early_stop`、`search_early_stop_min_expansions`。
-- early-stop 前后的 Recall@10、P99、SSD reads/query 和 graph expanded/query 对照。
-
-验证方法本身也要归档快照，避免后续规范变化导致旧版本不可解释：
-
-```text
-archive/validation/validation-method-YYYY-MM-DD.md
-```
+这些内容如果保留，也只能作为开发期调试或历史材料，不能出现在当前正式验证结论中。

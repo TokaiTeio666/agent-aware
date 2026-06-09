@@ -1,6 +1,6 @@
 # AgentMem-Flow 版本分析报告模板
 
-每次版本迭代完成后，都必须先按照本模板归档分析报告，再进入下一个版本。
+每次版本迭代完成后，优先按本模板归档分析报告。当前模板默认采用 `SIFT10K` / `SIFT100K` 正式验证口径。
 
 ## 版本信息
 
@@ -23,10 +23,10 @@
 
 ## 验证定义
 
-- Recall@10：对每个 query，计算返回 Top-10 与 ground truth Top-10 的交集比例，然后对所有 query 取平均。
-- 1-Recall@10：召回缺失率，定义为 `1 - Recall@10`。
-- Ground Truth 来源：SIFT1M 等标准数据集优先使用官方 `.ivecs`；只有 synthetic 或小规模子集没有官方 ground truth 时，才允许使用 V0 暴力检索生成。
-- Run 类型：cold run / warm run / smoke run。
+- Recall@10：对每个 query，计算返回 Top-10 与 ground truth Top-10 的交集比例，再对所有 query 取平均。
+- 1-Recall@10：定义为 `1 - Recall@10`。
+- Ground Truth 来源：当前正式验证优先使用 `data/sift/` 下的真实 SIFT 文件；若 `sift_groundtruth.ivecs` 对子集越界，必须记录回退到 subset exact brute force truth。
+- 数据集：正式验证只使用 `SIFT10K` 或 `SIFT100K`。
 
 ## 实现范围
 
@@ -38,11 +38,12 @@
 
 - 构建命令：
 - 运行命令：
-- 数据集 / workload：
-- Run 类型：
-- 随机种子：
+- 数据集：`SIFT10K` / `SIFT100K`
 - Ground Truth 来源：
+- I/O mode requested：
+- I/O mode effective：
 - 运行环境：
+- 内存预算参数：
 
 ## 通过标准
 
@@ -50,8 +51,9 @@
 |---|---|---|
 | 构建成功 | | |
 | 指标输出完整 | | |
+| `memory_budget_pass=1` | | |
+| `memory_resident_ratio <= 0.20` | | |
 | Recall@10 达到版本目标 | | |
-| 版本核心指标达到目标 | | |
 | 结果、配置、日志、环境信息已归档 | | |
 
 ## 指标结果
@@ -64,13 +66,14 @@
 | Avg Latency ms | |
 | P95 Latency ms | |
 | P99 Latency ms | |
-| Cache Hit Rate | N/A |
-| SSD Reads / Query | N/A |
-| Insert Latency | N/A |
+| SSD Reads / Query | |
+| memory_budget_bytes | |
+| memory_resident_bytes | |
+| memory_resident_ratio | |
 
 ## 结果分析
 
-解释实验结果说明了什么，该版本是否达到目标，以及对后续版本有什么影响。
+解释实验结果说明了什么，该版本是否达到目标，以及对后续版本的影响。
 
 ## 风险与局限
 
@@ -79,9 +82,9 @@
 ## 归档结果
 
 - `archive/results/...`
-- `archive/configs/...`
 - `archive/logs/...`
-- `archive/build_info/...`
+- 如有保留：`archive/configs/...`
+- 如有保留：`archive/build_info/...`
 
 ## 下一步
 

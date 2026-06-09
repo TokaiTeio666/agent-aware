@@ -110,6 +110,11 @@ struct DiskGraphSearchStats {
   std::size_t page_cache_misses = 0;
   std::size_t io_submits = 0;
   std::size_t io_completions = 0;
+  std::size_t io_submit_syscalls = 0;
+  std::size_t io_prefetches = 0;
+  std::size_t io_prefetch_hits = 0;
+  std::size_t io_prefetch_waits = 0;
+  std::size_t io_pending_pages_peak = 0;
   double adc_table_build_us = 0.0;
 };
 
@@ -219,8 +224,14 @@ class PackedDiskGraphIndex {
   };
 
   DecodedPage read_page(std::uint32_t page_id, DiskGraphSearchStats& stats);
+  DecodedPage decode_page(std::uint32_t page_id,
+                          const std::vector<char>& page) const;
   const DecodedPage& load_page(std::uint32_t page_id,
                                DiskGraphSearchStats& stats);
+  const DecodedPage* lookup_cached_page(std::uint32_t page_id,
+                                        DiskGraphSearchStats& stats);
+  const DecodedPage& store_cached_page(DecodedPage page);
+  bool cache_enabled() const;
   void evict_one_page();
   double cache_score(const CacheEntry& entry) const;
 
