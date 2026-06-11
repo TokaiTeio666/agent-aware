@@ -116,6 +116,10 @@ case "$ENGINE" in
     if [[ "${ADC_ENABLE:-0}" == "1" ]]; then
       ADC_FLAG=(--adc-enable)
     fi
+    IO_FALLBACK_FLAG=()
+    if [[ "${ALLOW_IO_FALLBACK:-0}" == "1" ]]; then
+      IO_FALLBACK_FLAG=(--allow-io-fallback)
+    fi
     INDEX="${INDEX:-$RUN_DIR/sift_graph.idx}"
     {
       echo "system_name=agent-aware"
@@ -159,6 +163,12 @@ case "$ENGINE" in
       --rerank-topk "${RERANK_TOPK:-0}" \
       --io-mode "$IO_MODE" \
       --io-batch-size "${IO_BATCH_SIZE:-1}" \
+      --io-depth "${IO_DEPTH:-1}" \
+      --prefetch-width "${PREFETCH_WIDTH:-0}" \
+      --prefetch-policy "${PREFETCH_POLICY:-frontier-next-hop}" \
+      --page-dedup "${PAGE_DEDUP:-1}" \
+      --same-page-reuse "${SAME_PAGE_REUSE:-1}" \
+      "${IO_FALLBACK_FLAG[@]}" \
       --workload-mode "${WORKLOAD_MODE:-read-only}" \
       --operation-count "${OPERATION_COUNT:-0}" \
       --write-ratio "${WRITE_RATIO:-0}" \

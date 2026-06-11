@@ -84,6 +84,8 @@ FIELDS = [
     "memory_bytes_cache",
     "memory_bytes_path_cache",
     "memory_bytes_router",
+    "memory_bytes_query_workspace",
+    "memory_bytes_io_buffers",
     "memory_bytes_delta",
     "memory_bytes_tombstone",
     "memory_bytes_temporary_peak",

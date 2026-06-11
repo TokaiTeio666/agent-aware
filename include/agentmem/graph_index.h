@@ -99,6 +99,10 @@ struct DiskGraphSearchConfig {
   const PqAdcModel* pq_model = nullptr;
   bool adc_enable = false;
   std::size_t rerank_topk = 0;
+  std::size_t prefetch_width = 0;
+  std::string prefetch_policy = "frontier-next-hop";
+  bool page_dedup = true;
+  bool same_page_reuse = true;
 };
 
 struct DiskGraphSearchStats {
@@ -115,6 +119,14 @@ struct DiskGraphSearchStats {
   std::size_t io_prefetch_hits = 0;
   std::size_t io_prefetch_waits = 0;
   std::size_t io_pending_pages_peak = 0;
+  std::size_t prefetch_submitted_pages = 0;
+  std::size_t prefetch_useful_pages = 0;
+  std::size_t prefetch_wasted_pages = 0;
+  std::size_t demand_read_waits = 0;
+  double demand_read_wait_us = 0.0;
+  std::size_t page_dedup_requests = 0;
+  std::size_t page_dedup_hits = 0;
+  std::size_t same_page_node_reuse = 0;
   double adc_table_build_us = 0.0;
 };
 
@@ -130,6 +142,7 @@ struct DiskGraphIoStatus {
   bool direct_enabled = false;
   bool io_uring_enabled = false;
   std::size_t batch_size = 1;
+  std::size_t depth = 1;
 };
 
 struct DiskGraphMetadata {
@@ -160,7 +173,8 @@ class NaiveDiskGraphIndex {
     return metadata_;
   }
 
-  void configure_io(const std::string& mode, std::size_t batch_size);
+  void configure_io(const std::string& mode, std::size_t batch_size,
+                    std::size_t io_depth = 1);
 
   const DiskGraphIoStatus& io_status() const;
 
@@ -198,7 +212,8 @@ class PackedDiskGraphIndex {
   }
 
   void configure_cache(const std::string& policy, std::size_t capacity_pages);
-  void configure_io(const std::string& mode, std::size_t batch_size);
+  void configure_io(const std::string& mode, std::size_t batch_size,
+                    std::size_t io_depth = 1);
 
   const DiskGraphIoStatus& io_status() const;
 

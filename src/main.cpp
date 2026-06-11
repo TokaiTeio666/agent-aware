@@ -107,8 +107,11 @@ struct Args {  // 汇总 CLI 参数，后续实验路径只传递这一份配置
   std::size_t pq_train_iterations = 4;
   std::size_t rerank_topk = 0;
   std::size_t io_batch_size = 1;
+  std::size_t io_depth = 1;
+  std::size_t prefetch_width = 0;
   std::size_t memory_budget_bytes = 0;
   double memory_budget_ratio = 0.20;
+  std::string prefetch_policy = "frontier-next-hop";
   bool synthetic = true;
   bool build_index = false;
   bool wal_replay = false;
@@ -119,6 +122,10 @@ struct Args {  // 汇总 CLI 参数，后续实验路径只传递这一份配置
   bool adc_enable = false;
   bool enforce_memory_budget = false;
   bool allow_over_budget_for_debug = false;
+  bool allow_io_fallback = false;
+  bool page_dedup = true;
+  bool same_page_reuse = true;
+  bool release_raw_base_after_prepare = false;
   agentmem::SyntheticConfig synthetic_config;
 };
 
@@ -133,6 +140,8 @@ struct MemoryReport {
   std::size_t bytes_cache = 0;
   std::size_t bytes_path_cache = 0;
   std::size_t bytes_router = 0;
+  std::size_t bytes_query_workspace = 0;
+  std::size_t bytes_io_buffers = 0;
   std::size_t bytes_delta = 0;
   std::size_t bytes_tombstone = 0;
   std::size_t bytes_temporary_peak = 0;
@@ -161,6 +170,13 @@ struct RunOutput {  // 保留逐 query 原始样本，最终统一计算分位�
   std::vector<double> io_prefetch_hits;
   std::vector<double> io_prefetch_waits;
   std::vector<double> io_pending_pages_peak;
+  std::vector<double> prefetch_submitted_pages;
+  std::vector<double> prefetch_useful_pages;
+  std::vector<double> prefetch_wasted_pages;
+  std::vector<double> demand_read_waits;
+  std::vector<double> demand_read_wait_us;
+  std::vector<double> page_dedup_ratios;
+  std::vector<double> same_page_node_reuse;
   std::vector<double> adc_table_build_us;
   std::vector<double> insert_latencies_ms;
   std::vector<double> query_compaction_ms;
@@ -308,6 +324,12 @@ void print_usage(const char* program) {
       << "  --rerank-topk N      Raw-vector rerank candidates, default 0\n"
       << "  --io-mode NAME       pread, odirect, or io_uring, default pread\n"
       << "  --io-batch-size N    Requested async I/O batch size, default 1\n"
+      << "  --io-depth N         Max async page reads in flight, default 1\n"
+      << "  --prefetch-width N   Frontier pages to prefetch, 0 uses io-depth\n"
+      << "  --prefetch-policy NAME  none, frontier, next-hop, or frontier-next-hop\n"
+      << "  --page-dedup 0|1     Deduplicate cached/pending/seen pages, default 1\n"
+      << "  --same-page-reuse 0|1 Count same-page decoded node reuse, default 1\n"
+      << "  --allow-io-fallback  Permit odirect/io_uring to fall back to pread\n"
       << "  --memory-budget-ratio X  Resident memory budget/raw vectors, default 0.20\n"
       << "  --memory-budget-bytes N  Hard resident memory budget in bytes\n"
       << "  --enforce-memory-budget  Fail if resident engine memory exceeds budget\n"
@@ -587,6 +609,26 @@ Args parse_args(int argc, char** argv) {
       args.io_mode = require_value(opt);
     } else if (opt == "--io-batch-size") {
       args.io_batch_size = parse_size(require_value(opt), opt);
+    } else if (opt == "--io-depth") {
+      args.io_depth = parse_size(require_value(opt), opt);
+    } else if (opt == "--prefetch-width") {
+      args.prefetch_width = parse_size(require_value(opt), opt);
+    } else if (opt == "--prefetch-policy") {
+      args.prefetch_policy = require_value(opt);
+    } else if (opt == "--page-dedup") {
+      const std::size_t value = parse_size(require_value(opt), opt);
+      if (value > 1) {
+        throw std::runtime_error("--page-dedup must be 0 or 1");
+      }
+      args.page_dedup = value != 0;
+    } else if (opt == "--same-page-reuse") {
+      const std::size_t value = parse_size(require_value(opt), opt);
+      if (value > 1) {
+        throw std::runtime_error("--same-page-reuse must be 0 or 1");
+      }
+      args.same_page_reuse = value != 0;
+    } else if (opt == "--allow-io-fallback") {
+      args.allow_io_fallback = true;
     } else if (opt == "--memory-budget-ratio") {
       args.memory_budget_ratio = parse_double(require_value(opt), opt);
     } else if (opt == "--memory-budget-bytes") {
@@ -759,6 +801,16 @@ Args parse_args(int argc, char** argv) {
   }
   if (args.io_batch_size == 0) {
     throw std::runtime_error("--io-batch-size must be positive");
+  }
+  if (args.io_depth == 0) {
+    throw std::runtime_error("--io-depth must be positive");
+  }
+  if (args.prefetch_policy != "none" &&
+      args.prefetch_policy != "frontier" &&
+      args.prefetch_policy != "next-hop" &&
+      args.prefetch_policy != "frontier-next-hop") {
+    throw std::runtime_error(
+        "--prefetch-policy must be none, frontier, next-hop, or frontier-next-hop");
   }
   if (args.memory_budget_ratio <= 0.0 || args.memory_budget_ratio > 1.0) {
     throw std::runtime_error("--memory-budget-ratio must be in (0, 1]");
@@ -971,14 +1023,15 @@ bool signature_uses_pq_prefix(const std::string& policy) {
 class ResidentQueryRouter {
  public:
   ResidentQueryRouter(const Args& args, const agentmem::VectorSet& base)
-      : base_(base),
+      : dim_(base.dim),
         policy_(args.query_signature_policy),
         simhash_bits_(args.simhash_bits),
         pq_prefix_subspaces_(args.pq_prefix_subspaces),
         pq_prefix_centroids_(args.pq_prefix_centroids),
         pq_prefix_train_iterations_(args.pq_prefix_train_iterations),
         seed_(args.synthetic_config.seed) {
-    build_sample_ids(args.routing_sample_count);
+    build_sample_ids(args.routing_sample_count, base);
+    copy_sample_vectors(base);
     if (signature_uses_simhash(policy_)) {
       build_simhash_planes();
     }
@@ -1013,9 +1066,8 @@ class ResidentQueryRouter {
         "router sample ids");
     add_memory_component(
         bytes,
-        checked_mul(checked_mul(sample_ids_.size(), base_.dim,
-                                "router sampled vectors"),
-                    sizeof(float), "router sampled vector bytes"),
+        checked_mul(sample_vectors_.capacity(), sizeof(float),
+                    "router sampled vector bytes"),
         "router sampled vectors");
     add_memory_component(
         bytes,
@@ -1045,16 +1097,17 @@ class ResidentQueryRouter {
     std::vector<float> centroids;
   };
 
-  void build_sample_ids(std::size_t routing_sample_count) {
-    if (routing_sample_count == 0 || base_.empty()) {
+  void build_sample_ids(std::size_t routing_sample_count,
+                        const agentmem::VectorSet& base) {
+    if (routing_sample_count == 0 || base.empty()) {
       return;
     }
     const std::size_t sample_count =
-        std::min(routing_sample_count, base_.size());
+        std::min(routing_sample_count, base.size());
     sample_ids_.reserve(sample_count);
     for (std::size_t i = 0; i < sample_count; ++i) {
       const std::size_t id =  // 均匀采样保证覆盖整个 base id 空间。
-          sample_count == 1 ? 0 : (i * (base_.size() - 1)) / (sample_count - 1);
+          sample_count == 1 ? 0 : (i * (base.size() - 1)) / (sample_count - 1);
       if (!sample_ids_.empty() && sample_ids_.back() == id) {
         continue;
       }
@@ -1062,12 +1115,29 @@ class ResidentQueryRouter {
     }
   }
 
+  void copy_sample_vectors(const agentmem::VectorSet& base) {
+    if (sample_ids_.empty() || dim_ == 0) {
+      return;
+    }
+    sample_vectors_.reserve(
+        checked_mul(sample_ids_.size(), dim_, "router sampled vectors"));
+    for (const auto id : sample_ids_) {
+      const float* row = base.row(id);
+      sample_vectors_.insert(sample_vectors_.end(), row, row + dim_);
+    }
+  }
+
+  const float* sample_row(std::size_t sample_index) const {
+    return sample_vectors_.data() + sample_index * dim_;
+  }
+
   std::vector<agentmem::SearchResult> score_samples(const float* query) const {
     std::vector<agentmem::SearchResult> scored;
     scored.reserve(sample_ids_.size());
-    for (const auto id : sample_ids_) {
+    for (std::size_t i = 0; i < sample_ids_.size(); ++i) {
+      const auto id = sample_ids_[i];
       scored.push_back(agentmem::SearchResult{
-          id, agentmem::squared_l2(query, base_.row(id), base_.dim)});
+          id, agentmem::squared_l2(query, sample_row(i), dim_)});
     }
 
     std::sort(scored.begin(), scored.end(),
@@ -1082,12 +1152,12 @@ class ResidentQueryRouter {
   }
 
   void build_simhash_planes() {
-    if (base_.dim == 0) {
+    if (dim_ == 0) {
       return;
     }
     std::mt19937 rng(seed_ ^ 0x9e3779b9u);
     std::normal_distribution<float> dist(0.0f, 1.0f);
-    simhash_planes_.resize(simhash_bits_ * base_.dim);
+    simhash_planes_.resize(simhash_bits_ * dim_);
     for (float& value : simhash_planes_) {
       value = dist(rng);
     }
@@ -1099,9 +1169,9 @@ class ResidentQueryRouter {
     }
     std::uint32_t signature = 0;
     for (std::size_t bit = 0; bit < simhash_bits_; ++bit) {
-      const float* plane = simhash_planes_.data() + bit * base_.dim;
+      const float* plane = simhash_planes_.data() + bit * dim_;
       float dot = 0.0f;
-      for (std::size_t d = 0; d < base_.dim; ++d) {
+      for (std::size_t d = 0; d < dim_; ++d) {
         dot += query[d] * plane[d];
       }
       if (dot >= 0.0f) {
@@ -1112,12 +1182,12 @@ class ResidentQueryRouter {
   }
 
   void train_pq_prefix() {
-    if (sample_ids_.empty() || base_.dim == 0) {
+    if (sample_ids_.empty() || dim_ == 0) {
       return;
     }
 
     const std::size_t subspaces =
-        std::min(pq_prefix_subspaces_, base_.dim);
+        std::min(pq_prefix_subspaces_, dim_);
     const std::size_t centroids =
         std::min(pq_prefix_centroids_, sample_ids_.size());
     if (subspaces == 0 || centroids < 2) {
@@ -1127,15 +1197,15 @@ class ResidentQueryRouter {
     pq_subspaces_.reserve(subspaces);  // 小型 PQ 仅用于签名，不参与最终距离排序。
     for (std::size_t m = 0; m < subspaces; ++m) {
       PqSubspace subspace;
-      subspace.start = (base_.dim * m) / subspaces;
-      const std::size_t end = (base_.dim * (m + 1)) / subspaces;
+      subspace.start = (dim_ * m) / subspaces;
+      const std::size_t end = (dim_ * (m + 1)) / subspaces;
       subspace.length = end - subspace.start;
       subspace.centroids.assign(centroids * subspace.length, 0.0f);
 
       for (std::size_t c = 0; c < centroids; ++c) {
         const std::size_t sample_index =
             centroids == 1 ? 0 : (c * (sample_ids_.size() - 1)) / (centroids - 1);
-        const float* row = base_.row(sample_ids_[sample_index]) + subspace.start;
+        const float* row = sample_row(sample_index) + subspace.start;
         std::copy(row, row + subspace.length,
                   subspace.centroids.begin() +
                       static_cast<std::ptrdiff_t>(c * subspace.length));
@@ -1155,8 +1225,8 @@ class ResidentQueryRouter {
       std::fill(sums.begin(), sums.end(), 0.0f);
       std::fill(counts.begin(), counts.end(), 0);
 
-      for (const auto id : sample_ids_) {
-        const float* row = base_.row(id) + subspace.start;
+      for (std::size_t i = 0; i < sample_ids_.size(); ++i) {
+        const float* row = sample_row(i) + subspace.start;
         const std::size_t best = nearest_pq_centroid(row, subspace, centroids);
         ++counts[best];
         float* sum = sums.data() + best * subspace.length;
@@ -1170,8 +1240,7 @@ class ResidentQueryRouter {
         if (counts[c] == 0) {
           const std::size_t sample_index =
               (c + iteration) % sample_ids_.size();
-          const float* row =
-              base_.row(sample_ids_[sample_index]) + subspace.start;
+          const float* row = sample_row(sample_index) + subspace.start;
           std::copy(row, row + subspace.length, centroid);
           continue;
         }
@@ -1255,7 +1324,7 @@ class ResidentQueryRouter {
                    0x5a17f00du);
   }
 
-  const agentmem::VectorSet& base_;
+  std::size_t dim_ = 0;
   std::string policy_;
   std::size_t simhash_bits_ = 16;
   std::size_t pq_prefix_subspaces_ = 4;
@@ -1263,6 +1332,7 @@ class ResidentQueryRouter {
   std::size_t pq_prefix_train_iterations_ = 4;
   std::uint32_t seed_ = 42;
   std::vector<std::uint32_t> sample_ids_;
+  std::vector<float> sample_vectors_;
   std::vector<float> simhash_planes_;
   std::vector<PqSubspace> pq_subspaces_;
 };
@@ -1307,14 +1377,116 @@ std::size_t estimate_graph_metadata_bytes(const Args& args,
   return bytes;
 }
 
+std::size_t estimate_decoded_node_bytes(
+    const agentmem::DiskGraphMetadata& md) {
+  std::size_t bytes = sizeof(std::uint32_t);
+  add_memory_component(
+      bytes,
+      checked_mul(static_cast<std::size_t>(md.dim), sizeof(float),
+                  "decoded vector bytes"),
+      "decoded vector bytes");
+  add_memory_component(
+      bytes,
+      checked_mul(static_cast<std::size_t>(md.degree), sizeof(std::uint32_t),
+                  "decoded neighbor bytes"),
+      "decoded neighbor bytes");
+  add_memory_component(bytes, sizeof(std::vector<float>),
+                       "decoded vector handle");
+  add_memory_component(bytes, sizeof(std::vector<std::uint32_t>),
+                       "decoded neighbor handle");
+  add_memory_component(bytes, 64, "decoded node container overhead");
+  return bytes;
+}
+
+std::size_t estimate_decoded_page_bytes(
+    const agentmem::DiskGraphMetadata& md) {
+  std::size_t bytes = sizeof(std::uint32_t);
+  add_memory_component(bytes, sizeof(std::vector<std::uint32_t>),
+                       "decoded page node vector handle");
+  add_memory_component(
+      bytes,
+      checked_mul(static_cast<std::size_t>(md.nodes_per_page),
+                  estimate_decoded_node_bytes(md), "decoded page nodes"),
+      "decoded page nodes");
+  return bytes;
+}
+
 std::size_t estimate_cache_bytes(const Args& args,
                                  const agentmem::DiskGraphMetadata& md) {
   if (args.layout != "packed" || args.cache_policy == "none" ||
       args.cache_pages == 0) {
     return 0;
   }
-  return checked_mul(args.cache_pages, static_cast<std::size_t>(md.page_size),
-                     "page cache bytes");
+  return checked_mul(args.cache_pages, estimate_decoded_page_bytes(md),
+                     "decoded page cache bytes");
+}
+
+std::size_t estimate_graph_workspace_bytes(
+    const Args& args, const agentmem::DiskGraphMetadata& md) {
+  const std::size_t expansion_budget =
+      args.adaptive_early_stop
+          ? std::min(args.search_width, args.max_expansions)
+          : args.search_width;
+  std::size_t candidate_nodes = checked_add(
+      args.entry_count,
+      checked_mul(expansion_budget, static_cast<std::size_t>(md.degree),
+                  "graph frontier nodes"),
+      "graph candidate nodes");
+  candidate_nodes = std::min<std::size_t>(
+      candidate_nodes, static_cast<std::size_t>(md.vector_count));
+
+  std::size_t bytes = 0;
+  add_memory_component(
+      bytes,
+      checked_mul(candidate_nodes, sizeof(std::uint32_t),
+                  "visited set ids"),
+      "visited set ids");
+  add_memory_component(
+      bytes,
+      checked_mul(candidate_nodes, estimate_decoded_node_bytes(md),
+                  "query-local decoded nodes"),
+      "query-local decoded nodes");
+  add_memory_component(
+      bytes,
+      checked_mul(candidate_nodes, 48, "query hash table overhead"),
+      "query hash table overhead");
+  return bytes;
+}
+
+std::size_t estimate_io_buffer_bytes(const Args& args,
+                                     const agentmem::DiskGraphMetadata& md) {
+  if (args.layout != "packed" && args.io_mode == "pread") {
+    return 0;
+  }
+
+  const std::size_t page_size = static_cast<std::size_t>(md.page_size);
+  std::size_t bytes = estimate_decoded_page_bytes(md);
+  add_memory_component(bytes, page_size, "graph page read buffer");
+
+  if (args.io_mode == "odirect") {
+    add_memory_component(bytes, page_size, "O_DIRECT aligned page buffer");
+  } else if (args.io_mode == "io_uring") {
+    const std::size_t batch =
+        std::max<std::size_t>(1, std::min<std::size_t>(args.io_depth, 4096));
+    add_memory_component(
+        bytes, checked_mul(batch, page_size, "io_uring pending buffers"),
+        "io_uring pending buffers");
+    add_memory_component(
+        bytes, checked_mul(batch, page_size, "io_uring completion copies"),
+        "io_uring completion copies");
+    add_memory_component(
+        bytes,
+        checked_mul(batch, estimate_decoded_page_bytes(md),
+                    "io_uring decoded ready pages"),
+        "io_uring decoded ready pages");
+    add_memory_component(
+        bytes,
+        checked_add(checked_mul(batch, 128, "io_uring sqe/cqe estimate"),
+                    16 * 4096, "io_uring ring mmap estimate"),
+        "io_uring ring mmap estimate");
+  }
+
+  return bytes;
 }
 
 std::size_t estimate_delta_bytes(const Args& args, const RunOutput& output,
@@ -1363,6 +1535,9 @@ void finalize_memory_report(const Args& args, MemoryReport& report) {
   add_memory_component(resident, report.bytes_cache, "page cache");
   add_memory_component(resident, report.bytes_path_cache, "path cache");
   add_memory_component(resident, report.bytes_router, "router");
+  add_memory_component(resident, report.bytes_query_workspace,
+                       "query workspace");
+  add_memory_component(resident, report.bytes_io_buffers, "I/O buffers");
   add_memory_component(resident, report.bytes_delta, "delta");
   add_memory_component(resident, report.bytes_tombstone, "tombstone");
   add_memory_component(resident, report.bytes_temporary_peak, "temporary peak");
@@ -1396,13 +1571,16 @@ MemoryReport build_exact_memory_report(const Args& args,
 
 template <typename Index>
 MemoryReport build_graph_memory_report(
-    const Args& args, const Index& index, const agentmem::VectorSet& base,
+    const Args& args, const Index& index,
     const agentmem::PqAdcModel* pq_model, const QueryPathCache& path_cache,
     const ResidentQueryRouter& router, const RunOutput& output) {
   MemoryReport report;
   report.memory_mode = false;
-  report.raw_vector_bytes = checked_mul(base.values.size(), sizeof(float),
-                                        "raw graph vectors");
+  report.raw_vector_bytes = checked_mul(
+      checked_mul(static_cast<std::size_t>(index.metadata().vector_count),
+                  static_cast<std::size_t>(index.metadata().dim),
+                  "raw graph vector entries"),
+      sizeof(float), "raw graph vectors");
   if (pq_model != nullptr) {
     report.bytes_pq_codes = pq_model->code_bytes();
     report.bytes_pq_codebooks =
@@ -1415,9 +1593,14 @@ MemoryReport build_graph_memory_report(
   report.bytes_path_cache =
       path_cache.estimated_capacity_bytes(args.entry_count, args.k);
   report.bytes_router = router.estimated_bytes();
-  report.bytes_delta = estimate_delta_bytes(args, output, base.dim);
-  report.bytes_tombstone = estimate_tombstone_bytes(output, base.size());
-  report.bytes_temporary_peak = estimate_temporary_peak_bytes(args, base.dim);
+  report.bytes_query_workspace =
+      estimate_graph_workspace_bytes(args, index.metadata());
+  report.bytes_io_buffers = estimate_io_buffer_bytes(args, index.metadata());
+  report.bytes_delta = estimate_delta_bytes(args, output, index.metadata().dim);
+  report.bytes_tombstone = estimate_tombstone_bytes(
+      output, static_cast<std::size_t>(index.metadata().vector_count));
+  report.bytes_temporary_peak =
+      estimate_temporary_peak_bytes(args, index.metadata().dim);
   finalize_memory_report(args, report);
   return report;
 }
@@ -1441,6 +1624,10 @@ agentmem::DiskGraphSearchResult search_graph_one_with_routing(
   per_query_config.pq_model = pq_model;
   per_query_config.adc_enable = args.adc_enable;
   per_query_config.rerank_topk = args.rerank_topk;
+  per_query_config.prefetch_width = args.prefetch_width;
+  per_query_config.prefetch_policy = args.prefetch_policy;
+  per_query_config.page_dedup = args.page_dedup;
+  per_query_config.same_page_reuse = args.same_page_reuse;
   if (args.adaptive_early_stop) {
     per_query_config.search_width =
         std::min(per_query_config.search_width, args.max_expansions);
@@ -1495,6 +1682,13 @@ RunOutput execute_graph_queries(Index& index, const Args& args,
     output.io_prefetch_hits.reserve(queries.size());
     output.io_prefetch_waits.reserve(queries.size());
     output.io_pending_pages_peak.reserve(queries.size());
+    output.prefetch_submitted_pages.reserve(queries.size());
+    output.prefetch_useful_pages.reserve(queries.size());
+    output.prefetch_wasted_pages.reserve(queries.size());
+    output.demand_read_waits.reserve(queries.size());
+    output.demand_read_wait_us.reserve(queries.size());
+    output.page_dedup_ratios.reserve(queries.size());
+    output.same_page_node_reuse.reserve(queries.size());
     output.adc_table_build_us.reserve(queries.size());
   }
 
@@ -1536,6 +1730,22 @@ RunOutput execute_graph_queries(Index& index, const Args& args,
           static_cast<double>(result.stats.io_prefetch_waits));
       output.io_pending_pages_peak.push_back(
           static_cast<double>(result.stats.io_pending_pages_peak));
+      output.prefetch_submitted_pages.push_back(
+          static_cast<double>(result.stats.prefetch_submitted_pages));
+      output.prefetch_useful_pages.push_back(
+          static_cast<double>(result.stats.prefetch_useful_pages));
+      output.prefetch_wasted_pages.push_back(
+          static_cast<double>(result.stats.prefetch_wasted_pages));
+      output.demand_read_waits.push_back(
+          static_cast<double>(result.stats.demand_read_waits));
+      output.demand_read_wait_us.push_back(result.stats.demand_read_wait_us);
+      output.page_dedup_ratios.push_back(
+          result.stats.page_dedup_requests == 0
+              ? 0.0
+              : static_cast<double>(result.stats.page_dedup_hits) /
+                    static_cast<double>(result.stats.page_dedup_requests));
+      output.same_page_node_reuse.push_back(
+          static_cast<double>(result.stats.same_page_node_reuse));
       output.adc_table_build_us.push_back(result.stats.adc_table_build_us);
       output.results.push_back(std::move(result.topk));
     }
@@ -1870,6 +2080,13 @@ RunOutput run_mixed_graph_with_index(Index& index, const Args& args,
   output.io_prefetch_hits.reserve(output.operation_count);
   output.io_prefetch_waits.reserve(output.operation_count);
   output.io_pending_pages_peak.reserve(output.operation_count);
+  output.prefetch_submitted_pages.reserve(output.operation_count);
+  output.prefetch_useful_pages.reserve(output.operation_count);
+  output.prefetch_wasted_pages.reserve(output.operation_count);
+  output.demand_read_waits.reserve(output.operation_count);
+  output.demand_read_wait_us.reserve(output.operation_count);
+  output.page_dedup_ratios.reserve(output.operation_count);
+  output.same_page_node_reuse.reserve(output.operation_count);
   output.adc_table_build_us.reserve(output.operation_count);
   output.path_cache_requests.reserve(output.operation_count);
   output.path_cache_hits.reserve(output.operation_count);
@@ -2078,6 +2295,23 @@ RunOutput run_mixed_graph_with_index(Index& index, const Args& args,
         static_cast<double>(main_result.stats.io_prefetch_waits));
     output.io_pending_pages_peak.push_back(
         static_cast<double>(main_result.stats.io_pending_pages_peak));
+    output.prefetch_submitted_pages.push_back(
+        static_cast<double>(main_result.stats.prefetch_submitted_pages));
+    output.prefetch_useful_pages.push_back(
+        static_cast<double>(main_result.stats.prefetch_useful_pages));
+    output.prefetch_wasted_pages.push_back(
+        static_cast<double>(main_result.stats.prefetch_wasted_pages));
+    output.demand_read_waits.push_back(
+        static_cast<double>(main_result.stats.demand_read_waits));
+    output.demand_read_wait_us.push_back(
+        main_result.stats.demand_read_wait_us);
+    output.page_dedup_ratios.push_back(
+        main_result.stats.page_dedup_requests == 0
+            ? 0.0
+            : static_cast<double>(main_result.stats.page_dedup_hits) /
+                  static_cast<double>(main_result.stats.page_dedup_requests));
+    output.same_page_node_reuse.push_back(
+        static_cast<double>(main_result.stats.same_page_node_reuse));
     output.adc_table_build_us.push_back(main_result.stats.adc_table_build_us);
     output.results.push_back(merged);
     output.dynamic_truth.push_back(ids_from_results(truth_results));
@@ -2113,7 +2347,7 @@ std::uint64_t file_size_bytes(const std::string& path) {
 
 template <typename Index>
 RunOutput run_graph_with_index(Index& index, const Args& args,
-                               const agentmem::VectorSet& base,
+                               agentmem::VectorSet& base,
                                const agentmem::VectorSet& queries) {
   if (index.metadata().dim != base.dim) {
     throw std::runtime_error("Graph index dimension does not match loaded base");
@@ -2121,8 +2355,23 @@ RunOutput run_graph_with_index(Index& index, const Args& args,
   if (index.metadata().vector_count != base.size()) {
     throw std::runtime_error("Graph index vector count does not match loaded base");
   }
-  index.configure_io(args.io_mode, args.io_batch_size);  // 记录 requested/effective I/O。
+  index.configure_io(args.io_mode, args.io_batch_size,
+                     args.io_depth);  // 记录 requested/effective I/O。
   const auto& io_status = index.io_status();
+  if (!args.allow_io_fallback && args.io_mode != "pread") {
+    if (io_status.effective_mode != args.io_mode) {
+      throw std::runtime_error(
+          "Requested --io-mode " + args.io_mode + " fell back to " +
+          io_status.effective_mode +
+          "; use --allow-io-fallback only for compatibility runs");
+    }
+    if (args.io_mode == "odirect" && !io_status.direct_enabled) {
+      throw std::runtime_error("Requested O_DIRECT but direct I/O is inactive");
+    }
+    if (args.io_mode == "io_uring" && !io_status.io_uring_enabled) {
+      throw std::runtime_error("Requested io_uring but io_uring is inactive");
+    }
+  }
 
   std::cout << "graph_index_path=" << args.index_path << "\n";
   std::cout << "run_type=" << args.run_type << "\n";
@@ -2205,6 +2454,12 @@ RunOutput run_graph_with_index(Index& index, const Args& args,
   std::cout << "io_uring_enabled=" << (io_status.io_uring_enabled ? 1 : 0)
             << "\n";
   std::cout << "io_batch_size=" << io_status.batch_size << "\n";
+  std::cout << "io_depth=" << io_status.depth << "\n";
+  std::cout << "prefetch_width=" << args.prefetch_width << "\n";
+  std::cout << "prefetch_policy=" << args.prefetch_policy << "\n";
+  std::cout << "page_dedup=" << (args.page_dedup ? 1 : 0) << "\n";
+  std::cout << "same_page_reuse=" << (args.same_page_reuse ? 1 : 0)
+            << "\n";
   if (!io_status.fallback_reason.empty()) {
     std::cout << "io_fallback_reason=" << io_status.fallback_reason << "\n";
   }
@@ -2232,6 +2487,13 @@ RunOutput run_graph_with_index(Index& index, const Args& args,
 
   QueryPathCache path_cache(args.path_cache_policy, args.path_cache_capacity);
   ResidentQueryRouter router(args, base);
+  const bool raw_base_released =
+      args.release_raw_base_after_prepare && args.workload_mode == "read-only";
+  if (raw_base_released) {
+    std::vector<float>().swap(base.values);
+  }
+  std::cout << "raw_base_released_before_search="
+            << (raw_base_released ? 1 : 0) << "\n";
   for (std::size_t i = 0; i < args.warmup_runs; ++i) {
     (void)execute_graph_queries(index, args, queries, false, path_cache,
                                 router, pq_model.get());
@@ -2246,12 +2508,12 @@ RunOutput run_graph_with_index(Index& index, const Args& args,
   }
   output.pq_train_seconds = pq_train_seconds;
   output.memory =
-      build_graph_memory_report(args, index, base, pq_model.get(), path_cache,
+      build_graph_memory_report(args, index, pq_model.get(), path_cache,
                                 router, output);
   return output;
 }
 
-RunOutput run_graph(const Args& args, const agentmem::VectorSet& base,
+RunOutput run_graph(const Args& args, agentmem::VectorSet& base,
                     const agentmem::VectorSet& queries) {
   if (args.build_index) {
     agentmem::DiskGraphBuildConfig build_config;
@@ -2351,6 +2613,9 @@ void print_memory_report(const Args& args, const MemoryReport& report) {
   std::cout << "memory_bytes_cache=" << report.bytes_cache << "\n";
   std::cout << "memory_bytes_path_cache=" << report.bytes_path_cache << "\n";
   std::cout << "memory_bytes_router=" << report.bytes_router << "\n";
+  std::cout << "memory_bytes_query_workspace="
+            << report.bytes_query_workspace << "\n";
+  std::cout << "memory_bytes_io_buffers=" << report.bytes_io_buffers << "\n";
   std::cout << "memory_bytes_delta=" << report.bytes_delta << "\n";
   std::cout << "memory_bytes_tombstone=" << report.bytes_tombstone << "\n";
   std::cout << "memory_bytes_temporary_peak="
@@ -2426,6 +2691,22 @@ int main(int argc, char** argv) {
       throw std::runtime_error("Base and query dimensions do not match");
     }
 
+    TruthValidation truth_validation;
+    bool truth_validation_ready = false;
+    if (truth_from_file) {
+      if (truth.size() != queries.size()) {
+        throw std::runtime_error(
+            "Ground-truth query count does not match loaded queries");
+      }
+      truth_validation = validate_truth_ids(truth, args.k, base.size());
+      truth_validation_ready = true;
+    }
+
+    Args run_args = args;
+    run_args.release_raw_base_after_prepare =
+        args.engine == "graph" && args.workload_mode == "read-only" &&
+        truth_validation_ready && !truth_validation.has_out_of_range_ids;
+
     std::cout << "engine=" << args.engine << "\n";
     std::cout << "base_count=" << base.size() << "\n";
     std::cout << "query_count=" << queries.size() << "\n";
@@ -2437,27 +2718,22 @@ int main(int argc, char** argv) {
       output = run_exact(base, queries, args.k);
       output.memory = build_exact_memory_report(args, base);
     } else {
-      output = run_graph(args, base, queries);
+      output = run_graph(run_args, base, queries);
     }
 
     if (!output.dynamic_truth.empty()) {  // 混合负载必须使用包含 Delta 的动态 truth。
       truth = output.dynamic_truth;
       std::cout << "truth=dynamic_exact_bruteforce\n";
     } else if (truth_from_file) {
-      if (truth.size() != queries.size()) {
-        throw std::runtime_error(
-            "Ground-truth query count does not match loaded queries");
-      }
-      const auto validation = validate_truth_ids(truth, args.k, base.size());
       std::cout << "truth_file_rows=" << truth.size() << "\n";
-      std::cout << "truth_file_checked_ids=" << validation.checked_ids << "\n";
+      std::cout << "truth_file_checked_ids=" << truth_validation.checked_ids << "\n";
       std::cout << "truth_file_max_checked_id="
-                << validation.max_checked_id << "\n";
+                << truth_validation.max_checked_id << "\n";
       std::cout << "truth_file_out_of_range_ids="
-                << validation.out_of_range_ids << "\n";
+                << truth_validation.out_of_range_ids << "\n";
       std::cout << "truth_file_usable="
-                << (validation.has_out_of_range_ids ? 0 : 1) << "\n";
-      if (validation.has_out_of_range_ids) {
+                << (truth_validation.has_out_of_range_ids ? 0 : 1) << "\n";
+      if (truth_validation.has_out_of_range_ids) {
         std::cerr
             << "warning: ground-truth ids exceed loaded base_count; "
             << "recomputing exact truth for the current base subset.\n";
@@ -2532,6 +2808,39 @@ int main(int argc, char** argv) {
                          output.io_prefetch_waits);
     print_optional_stats("io_pending_pages_peak_per_query",
                          output.io_pending_pages_peak);
+    print_optional_stats("prefetch_submitted_pages_per_query",
+                         output.prefetch_submitted_pages);
+    print_optional_stats("prefetch_useful_pages_per_query",
+                         output.prefetch_useful_pages);
+    print_optional_stats("prefetch_wasted_pages_per_query",
+                         output.prefetch_wasted_pages);
+    print_optional_stats("demand_read_wait_count_per_query",
+                         output.demand_read_waits);
+    print_optional_stats("demand_read_wait_us_per_query",
+                         output.demand_read_wait_us);
+    print_optional_stats("same_page_node_reuse_per_query",
+                         output.same_page_node_reuse);
+    const double total_io_submits = sum_values(output.io_submits);
+    const double total_io_submit_syscalls =
+        sum_values(output.io_submit_syscalls);
+    if (total_io_submit_syscalls > 0.0) {
+      std::cout << "io_batch_size_avg="
+                << (total_io_submits / total_io_submit_syscalls) << "\n";
+    }
+    const double total_prefetch_submitted =
+        sum_values(output.prefetch_submitted_pages);
+    if (total_prefetch_submitted > 0.0) {
+      std::cout << "prefetch_hit_rate="
+                << (sum_values(output.prefetch_useful_pages) /
+                    total_prefetch_submitted)
+                << "\n";
+    }
+    if (!output.page_dedup_ratios.empty()) {
+      std::cout << "page_dedup_ratio="
+                << (sum_values(output.page_dedup_ratios) /
+                    static_cast<double>(output.page_dedup_ratios.size()))
+                << "\n";
+    }
     print_optional_stats("adc_table_build_us", output.adc_table_build_us);
     print_optional_stats("insert_latency_ms", output.insert_latencies_ms);
     print_optional_stats("query_compaction_ms", output.query_compaction_ms);

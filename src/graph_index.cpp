@@ -1130,6 +1130,125 @@ std::vector<std::uint32_t> packed_order(
                            config.packing_strategy);
 }
 
+class AlignedBufferPool {
+ public:
+  AlignedBufferPool() = default;
+
+  AlignedBufferPool(std::size_t count, std::size_t bytes,
+                    std::size_t alignment) {
+    reset(count, bytes, alignment);
+  }
+
+  ~AlignedBufferPool() {
+    clear();
+  }
+
+  AlignedBufferPool(const AlignedBufferPool&) = delete;
+  AlignedBufferPool& operator=(const AlignedBufferPool&) = delete;
+
+  void reset(std::size_t count, std::size_t bytes, std::size_t alignment) {
+    clear();
+    if (count == 0 || bytes == 0) {
+      return;
+    }
+    bytes_ = bytes;
+    alignment_ = alignment;
+    buffers_.reserve(count);
+    free_list_.reserve(count);
+    for (std::size_t i = 0; i < count; ++i) {
+      void* block = nullptr;
+#ifdef __linux__
+      if (posix_memalign(&block, alignment_, bytes_) != 0) {
+        clear();
+        throw std::runtime_error("Failed to allocate aligned I/O buffer pool");
+      }
+#else
+      block = std::malloc(bytes_);
+      if (block == nullptr) {
+        clear();
+        throw std::runtime_error("Failed to allocate graph I/O buffer pool");
+      }
+#endif
+      buffers_.push_back(block);
+      free_list_.push_back(i);
+    }
+  }
+
+  void clear() {
+    for (void* buffer : buffers_) {
+      std::free(buffer);
+    }
+    buffers_.clear();
+    free_list_.clear();
+    bytes_ = 0;
+    alignment_ = 0;
+  }
+
+  bool acquire(std::size_t& index, void*& buffer) {
+    if (free_list_.empty()) {
+      return false;
+    }
+    index = free_list_.back();
+    free_list_.pop_back();
+    buffer = buffers_[index];
+    return true;
+  }
+
+  void release(std::size_t index) {
+    if (index >= buffers_.size()) {
+      throw std::runtime_error("Invalid graph I/O buffer pool release");
+    }
+    free_list_.push_back(index);
+  }
+
+  std::size_t capacity() const {
+    return buffers_.size();
+  }
+
+ private:
+  std::vector<void*> buffers_;
+  std::vector<std::size_t> free_list_;
+  std::size_t bytes_ = 0;
+  std::size_t alignment_ = 0;
+};
+
+using PageId = std::uint32_t;
+
+enum class PrefetchTag {
+  Demand,
+  Entry,
+  Frontier,
+  NextHop,
+};
+
+struct PageView {
+  PageId page_id = 0;
+  const char* data = nullptr;
+  std::size_t size = 0;
+};
+
+struct PageIoQueryStats {
+  std::size_t prefetch_submitted_pages = 0;
+  std::size_t prefetch_useful_pages = 0;
+  std::size_t prefetch_wasted_pages = 0;
+  std::size_t demand_read_waits = 0;
+  double demand_read_wait_us = 0.0;
+  std::size_t page_dedup_requests = 0;
+  std::size_t page_dedup_hits = 0;
+};
+
+class PageIoEngine {
+ public:
+  virtual ~PageIoEngine() = default;
+  virtual bool get_cached(PageId page_id, PageView* view) = 0;
+  virtual bool prefetch(PageId page_id, PrefetchTag tag) = 0;
+  virtual void flush_submissions() = 0;
+  virtual std::size_t poll_completions(std::size_t max_events) = 0;
+  virtual PageView get_blocking(PageId page_id) = 0;
+  virtual void reset_query_state() = 0;
+  virtual const PageIoQueryStats& stats() const = 0;
+};
+
 }  // namespace
 
 namespace {
@@ -1395,11 +1514,11 @@ class RawIoUring {
 }  // namespace
 
 // 屏蔽平台差异：Linux 可选 pread/O_DIRECT/io_uring，其他平台回退到 ifstream。
-class DiskPageReader {
+class DiskPageReader : public PageIoEngine {
  public:
   DiskPageReader(std::string path, std::size_t page_size)
       : path_(std::move(path)), page_size_(page_size) {
-    configure("pread", 1);
+    configure("pread", 1, 1);
   }
 
   ~DiskPageReader() {
@@ -1409,18 +1528,23 @@ class DiskPageReader {
   DiskPageReader(const DiskPageReader&) = delete;
   DiskPageReader& operator=(const DiskPageReader&) = delete;
 
-  void configure(const std::string& mode, std::size_t batch_size) {
+  void configure(const std::string& mode, std::size_t batch_size,
+                 std::size_t io_depth) {
     if (mode != "pread" && mode != "odirect" && mode != "io_uring") {
       throw std::runtime_error("Unsupported disk I/O mode: " + mode);
     }
     if (batch_size == 0) {
       throw std::runtime_error("Disk I/O batch size must be positive");
     }
+    if (io_depth == 0) {
+      throw std::runtime_error("Disk I/O depth must be positive");
+    }
 
     close_native();
     status_ = DiskGraphIoStatus{};
     status_.requested_mode = mode;  // requested 与 effective 分开，便于实验识别回退。
     status_.batch_size = batch_size;
+    status_.depth = io_depth;
 
 #ifdef __linux__
     if (mode == "pread") {
@@ -1439,6 +1563,8 @@ class DiskPageReader {
       }
       status_.effective_mode = "odirect";
       status_.direct_enabled = true;
+      sync_buffer_pool_ = std::make_unique<AlignedBufferPool>(
+          1, page_size_, kDirectIoAlignment);
       return;
     }
 
@@ -1448,23 +1574,25 @@ class DiskPageReader {
     if (direct_io_layout_supported()) {
       direct_opened = try_open_linux_fd(O_RDONLY | O_CLOEXEC | O_DIRECT);
     }
-    if (!direct_opened && !try_open_linux_fd(O_RDONLY | O_CLOEXEC)) {
-      throw std::runtime_error(
-          "Cannot open graph index for io_uring: " + path_);
+    if (!direct_opened) {
+      fallback_to_pread(direct_io_layout_supported()
+                            ? errno_reason("io_uring_odirect_open_failed_errno")
+                            : "io_uring_requires_4096_aligned_pages");
+      return;
     }
 
     std::string reason;
-    if (!ring_.open(batch_size, reason)) {
+    if (!ring_.open(io_depth, reason)) {
       fallback_to_pread(reason);
       return;
     }
+    async_buffer_pool_ = std::make_unique<AlignedBufferPool>(
+        io_depth, page_size_, kDirectIoAlignment);
+    sync_buffer_pool_ = std::make_unique<AlignedBufferPool>(
+        1, page_size_, kDirectIoAlignment);
     status_.effective_mode = "io_uring";
     status_.direct_enabled = direct_opened;
     status_.io_uring_enabled = true;
-    if (!direct_opened) {
-      status_.fallback_reason =
-          "io_uring_active_with_buffered_fd_odirect_unavailable";
-    }
 #else
     fallback_to_pread("io_uring_headers_or_syscalls_unavailable");
 #endif
@@ -1495,7 +1623,7 @@ class DiskPageReader {
   }
 
   std::size_t max_pending_reads() const {
-    return async_enabled() ? std::max<std::size_t>(1, status_.batch_size) : 0;
+    return async_enabled() ? std::max<std::size_t>(1, status_.depth) : 0;
   }
 
   std::size_t pending_async_reads() const {
@@ -1516,19 +1644,23 @@ class DiskPageReader {
           "Direct graph I/O requires aligned page offsets and lengths");
     }
 
+    if (async_buffer_pool_ == nullptr || async_buffer_pool_->capacity() == 0) {
+      throw std::runtime_error("Graph async I/O buffer pool is not initialized");
+    }
+    std::size_t buffer_index = 0;
     void* aligned = nullptr;
-    if (posix_memalign(&aligned, kDirectIoAlignment, bytes) != 0) {
-      throw std::runtime_error("Failed to allocate aligned graph I/O buffer");
+    if (!async_buffer_pool_->acquire(buffer_index, aligned)) {
+      throw std::runtime_error("Graph async I/O buffer pool is exhausted");
     }
 
     const std::uint64_t token = next_async_token_++;
     std::string reason;
     if (!ring_.queue_read(fd_, offset, aligned, bytes, token, reason)) {
-      std::free(aligned);
+      async_buffer_pool_->release(buffer_index);
       throw std::runtime_error("Graph page async read failed: " + reason);
     }
 
-    async_buffers_.emplace(token, AsyncBuffer{aligned, bytes});
+    async_buffers_.emplace(token, AsyncBuffer{aligned, bytes, buffer_index});
     ++stats.io_submits;
     return token;
 #else
@@ -1593,7 +1725,9 @@ class DiskPageReader {
               ? "io_uring_read_failed_errno_" +
                     std::to_string(-completion.result)
               : "io_uring_short_read_" + std::to_string(completion.result);
-      std::free(buffer.aligned);
+      if (async_buffer_pool_ != nullptr) {
+        async_buffer_pool_->release(buffer.index);
+      }
       throw std::runtime_error("Graph page async read failed: " + failure);
     }
 
@@ -1601,7 +1735,9 @@ class DiskPageReader {
     completed.data.assign(static_cast<const char*>(buffer.aligned),
                           static_cast<const char*>(buffer.aligned) +
                               buffer.bytes);
-    std::free(buffer.aligned);
+    if (async_buffer_pool_ != nullptr) {
+      async_buffer_pool_->release(buffer.index);
+    }
     return true;
 #else
     (void)wait;
@@ -1678,11 +1814,253 @@ class DiskPageReader {
     return output;
   }
 
+  void set_page_base_offset(std::uint64_t offset) {
+    page_base_offset_ = offset;
+  }
+
+  void set_page_dedup(bool enabled) {
+    page_dedup_enabled_ = enabled;
+  }
+
+  bool get_cached(PageId page_id, PageView* view) override {
+    auto found = query_cache_.find(page_id);
+    if (found == query_cache_.end()) {
+      return false;
+    }
+    count_prefetch_use(page_id);
+    if (view != nullptr) {
+      view->page_id = page_id;
+      view->data = found->second.data();
+      view->size = found->second.size();
+    }
+    return true;
+  }
+
+  bool prefetch(PageId page_id, PrefetchTag tag) override {
+    if (!async_enabled()) {
+      return false;
+    }
+    if (should_dedup_page(page_id)) {
+      return false;
+    }
+    DiskGraphSearchStats stats;
+    const std::uint64_t token =
+        start_async_read(page_offset(page_id), page_size_, stats);
+    merge_disk_stats(stats);
+    async_token_to_page_[token] = page_id;
+    pending_page_tags_[page_id] = tag;
+    ++page_io_stats_.prefetch_submitted_pages;
+    update_query_pending_peak();
+    return true;
+  }
+
+  void flush_submissions() override {
+    if (!async_enabled()) {
+      return;
+    }
+    DiskGraphSearchStats stats;
+    submit_async_reads(stats);
+    merge_disk_stats(stats);
+  }
+
+  std::size_t poll_completions(std::size_t max_events) override {
+    if (!async_enabled() || max_events == 0) {
+      return 0;
+    }
+    std::size_t completed_count = 0;
+    while (completed_count < max_events) {
+      if (!reap_one_completion(false)) {
+        break;
+      }
+      ++completed_count;
+    }
+    return completed_count;
+  }
+
+  PageView get_blocking(PageId page_id) override {
+    PageView view;
+    if (get_cached(page_id, &view)) {
+      return view;
+    }
+
+    const auto wait_start = std::chrono::steady_clock::now();
+    bool waited = false;
+    if (async_enabled()) {
+      if (pending_page_tags_.find(page_id) == pending_page_tags_.end()) {
+        (void)queue_demand_page(page_id);
+      }
+      flush_submissions();
+      while (!get_cached(page_id, &view)) {
+        waited = true;
+        if (!reap_one_completion(true)) {
+          throw std::runtime_error("Failed to wait for graph page completion");
+        }
+      }
+    } else {
+      DiskGraphSearchStats stats;
+      std::vector<char> page = read(page_offset(page_id), page_size_, stats);
+      merge_disk_stats(stats);
+      query_cache_[page_id] = std::move(page);
+      view.page_id = page_id;
+      view.data = query_cache_[page_id].data();
+      view.size = query_cache_[page_id].size();
+    }
+
+    if (waited) {
+      const auto wait_end = std::chrono::steady_clock::now();
+      ++page_io_stats_.demand_read_waits;
+      page_io_stats_.demand_read_wait_us +=
+          std::chrono::duration<double, std::micro>(wait_end - wait_start)
+              .count();
+    }
+    return view;
+  }
+
+  void reset_query_state() override {
+    while (!pending_page_tags_.empty()) {
+      flush_submissions();
+      (void)reap_one_completion(true);
+    }
+    query_cache_.clear();
+    query_cache_tags_.clear();
+    counted_prefetch_hits_.clear();
+    query_seen_pages_.clear();
+    async_token_to_page_.clear();
+    pending_page_tags_.clear();
+    page_io_stats_ = PageIoQueryStats{};
+    page_io_disk_stats_ = DiskGraphSearchStats{};
+  }
+
+  const PageIoQueryStats& stats() const override {
+    return page_io_stats_;
+  }
+
+  void finish_query_state() {
+    while (!pending_page_tags_.empty()) {
+      flush_submissions();
+      (void)reap_one_completion(true);
+    }
+    page_io_stats_.prefetch_wasted_pages =
+        page_io_stats_.prefetch_submitted_pages >
+                page_io_stats_.prefetch_useful_pages
+            ? page_io_stats_.prefetch_submitted_pages -
+                  page_io_stats_.prefetch_useful_pages
+            : 0;
+  }
+
+  void append_query_stats(DiskGraphSearchStats& stats) const {
+    stats.io_submits += page_io_disk_stats_.io_submits;
+    stats.io_completions += page_io_disk_stats_.io_completions;
+    stats.io_submit_syscalls += page_io_disk_stats_.io_submit_syscalls;
+    stats.io_pending_pages_peak =
+        std::max(stats.io_pending_pages_peak,
+                 page_io_disk_stats_.io_pending_pages_peak);
+    stats.node_reads += page_io_disk_stats_.io_submits;
+    stats.io_prefetches += page_io_stats_.prefetch_submitted_pages;
+    stats.io_prefetch_hits += page_io_stats_.prefetch_useful_pages;
+    stats.io_prefetch_waits += page_io_stats_.demand_read_waits;
+    stats.prefetch_submitted_pages +=
+        page_io_stats_.prefetch_submitted_pages;
+    stats.prefetch_useful_pages += page_io_stats_.prefetch_useful_pages;
+    stats.prefetch_wasted_pages += page_io_stats_.prefetch_wasted_pages;
+    stats.demand_read_waits += page_io_stats_.demand_read_waits;
+    stats.demand_read_wait_us += page_io_stats_.demand_read_wait_us;
+    stats.page_dedup_requests += page_io_stats_.page_dedup_requests;
+    stats.page_dedup_hits += page_io_stats_.page_dedup_hits;
+  }
+
  private:
   struct AsyncBuffer {
     void* aligned = nullptr;
     std::size_t bytes = 0;
+    std::size_t index = 0;
   };
+
+  std::uint64_t page_offset(PageId page_id) const {
+    return page_base_offset_ +
+           static_cast<std::uint64_t>(page_id) * page_size_;
+  }
+
+  void merge_disk_stats(const DiskGraphSearchStats& stats) {
+    page_io_disk_stats_.io_submits += stats.io_submits;
+    page_io_disk_stats_.io_completions += stats.io_completions;
+    page_io_disk_stats_.io_submit_syscalls += stats.io_submit_syscalls;
+    page_io_disk_stats_.io_pending_pages_peak =
+        std::max(page_io_disk_stats_.io_pending_pages_peak,
+                 stats.io_pending_pages_peak);
+  }
+
+  void update_query_pending_peak() {
+    page_io_disk_stats_.io_pending_pages_peak =
+        std::max(page_io_disk_stats_.io_pending_pages_peak,
+                 pending_page_tags_.size());
+  }
+
+  bool should_dedup_page(PageId page_id) {
+    if (!page_dedup_enabled_) {
+      return query_cache_.find(page_id) != query_cache_.end() ||
+             pending_page_tags_.find(page_id) != pending_page_tags_.end();
+    }
+    ++page_io_stats_.page_dedup_requests;
+    const bool seen_before = !query_seen_pages_.insert(page_id).second;
+    const bool unavailable =
+        query_cache_.find(page_id) != query_cache_.end() ||
+        pending_page_tags_.find(page_id) != pending_page_tags_.end();
+    if (seen_before || unavailable) {
+      ++page_io_stats_.page_dedup_hits;
+      return true;
+    }
+    return false;
+  }
+
+  bool queue_demand_page(PageId page_id) {
+    if (should_dedup_page(page_id)) {
+      return false;
+    }
+    DiskGraphSearchStats stats;
+    const std::uint64_t token =
+        start_async_read(page_offset(page_id), page_size_, stats);
+    merge_disk_stats(stats);
+    async_token_to_page_[token] = page_id;
+    pending_page_tags_[page_id] = PrefetchTag::Demand;
+    update_query_pending_peak();
+    return true;
+  }
+
+  void count_prefetch_use(PageId page_id) {
+    const auto tag = query_cache_tags_.find(page_id);
+    if (tag == query_cache_tags_.end() || tag->second == PrefetchTag::Demand) {
+      return;
+    }
+    if (counted_prefetch_hits_.insert(page_id).second) {
+      ++page_io_stats_.prefetch_useful_pages;
+    }
+  }
+
+  bool reap_one_completion(bool wait) {
+    CompletedRead completed;
+    DiskGraphSearchStats stats;
+    if (!reap_async_read(wait, completed, stats)) {
+      return false;
+    }
+    merge_disk_stats(stats);
+    auto page = async_token_to_page_.find(completed.token);
+    if (page == async_token_to_page_.end()) {
+      throw std::runtime_error("Graph page completion token has no page id");
+    }
+    const PageId page_id = page->second;
+    async_token_to_page_.erase(page);
+    auto tag = pending_page_tags_.find(page_id);
+    PrefetchTag completed_tag = PrefetchTag::Demand;
+    if (tag != pending_page_tags_.end()) {
+      completed_tag = tag->second;
+      pending_page_tags_.erase(tag);
+    }
+    query_cache_tags_[page_id] = completed_tag;
+    query_cache_[page_id] = std::move(completed.data);
+    update_query_pending_peak();
+    return true;
+  }
 
 #ifdef __linux__
   bool direct_io_layout_supported() const {
@@ -1718,6 +2096,7 @@ class DiskPageReader {
     const ssize_t result =
         ::pread(fd_, buffer, bytes, static_cast<off_t>(offset));
     ++stats.io_submits;
+    ++stats.io_submit_syscalls;
     if (result < 0) {
       reason = errno_reason("pread_failed_errno");
       return false;
@@ -1745,10 +2124,9 @@ class DiskPageReader {
 #endif
 
   void close_native() {
-    for (auto& entry : async_buffers_) {
-      std::free(entry.second.aligned);
-    }
     async_buffers_.clear();
+    async_buffer_pool_.reset();
+    sync_buffer_pool_.reset();
 #ifdef __linux__
 #if AGENTMEM_HAS_IO_URING && defined(__NR_io_uring_setup) && \
     defined(__NR_io_uring_enter)
@@ -1767,9 +2145,21 @@ class DiskPageReader {
 
   std::string path_;
   std::size_t page_size_ = 0;
+  std::uint64_t page_base_offset_ = 0;
   DiskGraphIoStatus status_;
   std::unordered_map<std::uint64_t, AsyncBuffer> async_buffers_;
+  std::unique_ptr<AlignedBufferPool> async_buffer_pool_;
+  std::unique_ptr<AlignedBufferPool> sync_buffer_pool_;
   std::uint64_t next_async_token_ = 1;
+  bool page_dedup_enabled_ = true;
+  std::unordered_map<PageId, std::vector<char>> query_cache_;
+  std::unordered_map<PageId, PrefetchTag> query_cache_tags_;
+  std::unordered_set<PageId> counted_prefetch_hits_;
+  std::unordered_set<PageId> query_seen_pages_;
+  std::unordered_map<std::uint64_t, PageId> async_token_to_page_;
+  std::unordered_map<PageId, PrefetchTag> pending_page_tags_;
+  PageIoQueryStats page_io_stats_;
+  DiskGraphSearchStats page_io_disk_stats_;
 #ifdef __linux__
   int fd_ = -1;
 #if AGENTMEM_HAS_IO_URING && defined(__NR_io_uring_setup) && \
@@ -2033,8 +2423,9 @@ NaiveDiskGraphIndex::NaiveDiskGraphIndex(const std::string& path)
 NaiveDiskGraphIndex::~NaiveDiskGraphIndex() = default;
 
 void NaiveDiskGraphIndex::configure_io(const std::string& mode,
-                                       std::size_t batch_size) {
-  page_reader_->configure(mode, batch_size);
+                                       std::size_t batch_size,
+                                       std::size_t io_depth) {
+  page_reader_->configure(mode, batch_size, io_depth);
 }
 
 const DiskGraphIoStatus& NaiveDiskGraphIndex::io_status() const {
@@ -2420,6 +2811,7 @@ PackedDiskGraphIndex::PackedDiskGraphIndex(const std::string& path)
     throw std::runtime_error("Failed to read packed graph directory");
   }
   page_reader_ = std::make_unique<DiskPageReader>(path_, metadata_.page_size);
+  page_reader_->set_page_base_offset(metadata_.records_offset);
 }
 
 PackedDiskGraphIndex::~PackedDiskGraphIndex() = default;
@@ -2438,8 +2830,10 @@ void PackedDiskGraphIndex::configure_cache(const std::string& policy,
 }
 
 void PackedDiskGraphIndex::configure_io(const std::string& mode,
-                                        std::size_t batch_size) {
-  page_reader_->configure(mode, batch_size);
+                                        std::size_t batch_size,
+                                        std::size_t io_depth) {
+  page_reader_->configure(mode, batch_size, io_depth);
+  page_reader_->set_page_base_offset(metadata_.records_offset);
 }
 
 const DiskGraphIoStatus& PackedDiskGraphIndex::io_status() const {
@@ -2649,14 +3043,26 @@ DiskGraphSearchResult PackedDiskGraphIndex::search_one(
   std::priority_queue<SearchResult, std::vector<SearchResult>, WorseResultFirst>
       best;
 
+  const bool policy_frontier =
+      config.prefetch_policy == "frontier" ||
+      config.prefetch_policy == "frontier-next-hop";
+  const bool policy_next_hop =
+      config.prefetch_policy == "next-hop" ||
+      config.prefetch_policy == "frontier-next-hop";
   const bool async_prefetch = page_reader_->async_enabled() &&
-                              page_reader_->max_pending_reads() > 0;
+                              page_reader_->max_pending_reads() > 0 &&
+                              config.prefetch_policy != "none";
   const std::size_t prefetch_budget_pages =
       async_prefetch ? page_reader_->max_pending_reads() : 0;
+  const std::size_t prefetch_width =
+      config.prefetch_width == 0
+          ? prefetch_budget_pages
+          : std::max<std::size_t>(1, config.prefetch_width);
   std::unordered_map<std::uint32_t, DecodedPage> ready_prefetch_pages;
   std::unordered_map<std::uint64_t, std::uint32_t> token_to_page;
   std::unordered_set<std::uint32_t> pending_pages;
   std::unordered_set<std::uint32_t> completed_prefetch_pages;
+  std::unordered_set<std::uint32_t> query_seen_pages;
 
   auto async_page_footprint = [&]() {
     return pending_pages.size() + ready_prefetch_pages.size();
@@ -2711,19 +3117,43 @@ DiskGraphSearchResult PackedDiskGraphIndex::search_one(
   };
 
   auto wait_for_prefetch_page = [&](std::uint32_t page_id) {
+    bool waited = false;
+    const auto wait_start = std::chrono::steady_clock::now();
     while (pending_pages.find(page_id) != pending_pages.end()) {
+      waited = true;
       ++output.stats.io_prefetch_waits;
       if (!harvest_prefetch(true)) {
         throw std::runtime_error("Failed to wait for packed graph prefetch");
       }
     }
+    if (waited) {
+      const auto wait_end = std::chrono::steady_clock::now();
+      ++output.stats.demand_read_waits;
+      output.stats.demand_read_wait_us +=
+          std::chrono::duration<double, std::micro>(wait_end - wait_start)
+              .count();
+    }
   };
 
   auto prefetch_page = [&](std::uint32_t page_id) {
-    if (!async_prefetch || page_id >= metadata_.page_count ||
-        page_in_cache(page_id) ||
-        ready_prefetch_pages.find(page_id) != ready_prefetch_pages.end() ||
-        pending_pages.find(page_id) != pending_pages.end()) {
+    if (!async_prefetch || page_id >= metadata_.page_count) {
+      return;
+    }
+    if (config.page_dedup) {
+      ++output.stats.page_dedup_requests;
+      const bool seen_before = !query_seen_pages.insert(page_id).second;
+      const bool already_available =
+          page_in_cache(page_id) ||
+          ready_prefetch_pages.find(page_id) != ready_prefetch_pages.end() ||
+          pending_pages.find(page_id) != pending_pages.end();
+      if (seen_before || already_available) {
+        ++output.stats.page_dedup_hits;
+        return;
+      }
+    } else if (page_in_cache(page_id) ||
+               ready_prefetch_pages.find(page_id) !=
+                   ready_prefetch_pages.end() ||
+               pending_pages.find(page_id) != pending_pages.end()) {
       return;
     }
 
@@ -2740,6 +3170,7 @@ DiskGraphSearchResult PackedDiskGraphIndex::search_one(
     pending_pages.insert(page_id);
     ++output.stats.node_reads;
     ++output.stats.io_prefetches;
+    ++output.stats.prefetch_submitted_pages;
     update_pending_peak();
   };
 
@@ -2751,7 +3182,7 @@ DiskGraphSearchResult PackedDiskGraphIndex::search_one(
   };
 
   auto prefetch_ids = [&](const std::vector<std::uint32_t>& ids) {
-    if (!async_prefetch) {
+    if (!async_prefetch || !policy_next_hop) {
       return;
     }
     for (const auto id : ids) {
@@ -2765,18 +3196,28 @@ DiskGraphSearchResult PackedDiskGraphIndex::search_one(
   };
 
   auto prefetch_frontier = [&]() {
-    if (!async_prefetch || candidates.empty()) {
+    if (!async_prefetch || !policy_frontier || candidates.empty()) {
       return;
     }
 
     auto frontier = candidates;
-    while (!frontier.empty() &&
-           async_page_footprint() < prefetch_budget_pages) {
+    std::vector<std::uint32_t> page_ids;
+    page_ids.reserve(prefetch_width);
+    while (!frontier.empty() && page_ids.size() < prefetch_width) {
       const auto next = frontier.top();
       frontier.pop();
       if (local_nodes.find(next.id) == local_nodes.end()) {
-        prefetch_page(node_to_page_[next.id]);
+        page_ids.push_back(node_to_page_[next.id]);
       }
+    }
+    std::sort(page_ids.begin(), page_ids.end());
+    page_ids.erase(std::unique(page_ids.begin(), page_ids.end()),
+                   page_ids.end());
+    for (const auto page_id : page_ids) {
+      if (async_page_footprint() >= prefetch_budget_pages) {
+        break;
+      }
+      prefetch_page(page_id);
     }
     submit_prefetches();
   };
@@ -2784,6 +3225,9 @@ DiskGraphSearchResult PackedDiskGraphIndex::search_one(
   auto load_node = [&](std::uint32_t id) -> DiskNode& {
     auto node_found = local_nodes.find(id);
     if (node_found != local_nodes.end()) {
+      if (config.same_page_reuse) {
+        ++output.stats.same_page_node_reuse;
+      }
       return node_found->second;
     }
 
@@ -2795,6 +3239,7 @@ DiskGraphSearchResult PackedDiskGraphIndex::search_one(
               lookup_cached_page(page_id, output.stats)) {
         if (completed_prefetch_pages.erase(page_id) > 0) {
           ++output.stats.io_prefetch_hits;
+          ++output.stats.prefetch_useful_pages;
         }
         materialize_page(*cached);
       } else {
@@ -2802,6 +3247,7 @@ DiskGraphSearchResult PackedDiskGraphIndex::search_one(
         if (ready != ready_prefetch_pages.end()) {
           ++output.stats.page_cache_hits;
           ++output.stats.io_prefetch_hits;
+          ++output.stats.prefetch_useful_pages;
           materialize_page(ready->second);
           ready_prefetch_pages.erase(ready);
         } else {
@@ -2823,6 +3269,7 @@ DiskGraphSearchResult PackedDiskGraphIndex::search_one(
                   lookup_cached_page(page_id, output.stats)) {
             if (completed_prefetch_pages.erase(page_id) > 0) {
               ++output.stats.io_prefetch_hits;
+              ++output.stats.prefetch_useful_pages;
             }
             materialize_page(*prefetched);
           } else {
@@ -2830,6 +3277,7 @@ DiskGraphSearchResult PackedDiskGraphIndex::search_one(
             if (ready != ready_prefetch_pages.end()) {
               ++output.stats.page_cache_hits;
               ++output.stats.io_prefetch_hits;
+              ++output.stats.prefetch_useful_pages;
               materialize_page(ready->second);
               ready_prefetch_pages.erase(ready);
             } else {
@@ -2950,6 +3398,9 @@ DiskGraphSearchResult PackedDiskGraphIndex::search_one(
   }
 
   while (!candidates.empty() && output.stats.expanded < config.search_width) {
+    if (async_prefetch) {
+      (void)harvest_prefetch(false);
+    }
     prefetch_frontier();
     if (config.adaptive_early_stop &&
         output.stats.expanded >= config.min_expansions &&
@@ -2982,6 +3433,11 @@ DiskGraphSearchResult PackedDiskGraphIndex::search_one(
   while (async_prefetch && !pending_pages.empty()) {
     (void)harvest_prefetch(true);
   }
+  output.stats.prefetch_wasted_pages =
+      output.stats.prefetch_submitted_pages > output.stats.prefetch_useful_pages
+          ? output.stats.prefetch_submitted_pages -
+                output.stats.prefetch_useful_pages
+          : 0;
 
   output.stats.visited = visited.size();
   output.topk = sorted_results(best);
