@@ -69,6 +69,11 @@ struct RunOutput {  // 保留逐 query 原始样本，最终统一计算分位�
   std::vector<double> cache_misses;
   std::vector<double> cache_evictions;
   std::vector<double> cache_promotions;
+  std::vector<double> cache_hub_requests;
+  std::vector<double> cache_hub_hits;
+  std::vector<double> cache_pins;
+  std::vector<double> cache_pinned_eviction_skips;
+  std::vector<double> distance_direct_calls;
   std::vector<double> path_cache_requests;
   std::vector<double> path_cache_hits;
   std::vector<double> expanded;
@@ -1091,6 +1096,11 @@ RunOutput execute_graph_queries(Index& index, const Args& args,
     output.cache_misses.reserve(queries.size());
     output.cache_evictions.reserve(queries.size());
     output.cache_promotions.reserve(queries.size());
+    output.cache_hub_requests.reserve(queries.size());
+    output.cache_hub_hits.reserve(queries.size());
+    output.cache_pins.reserve(queries.size());
+    output.cache_pinned_eviction_skips.reserve(queries.size());
+    output.distance_direct_calls.reserve(queries.size());
     output.path_cache_requests.reserve(queries.size());
     output.path_cache_hits.reserve(queries.size());
     output.expanded.reserve(queries.size());
@@ -1141,6 +1151,16 @@ RunOutput execute_graph_queries(Index& index, const Args& args,
           static_cast<double>(result.stats.page_cache_evictions));
       output.cache_promotions.push_back(
           static_cast<double>(result.stats.page_cache_promotions));
+      output.cache_hub_requests.push_back(
+          static_cast<double>(result.stats.page_cache_hub_requests));
+      output.cache_hub_hits.push_back(
+          static_cast<double>(result.stats.page_cache_hub_hits));
+      output.cache_pins.push_back(
+          static_cast<double>(result.stats.page_cache_pins));
+      output.cache_pinned_eviction_skips.push_back(
+          static_cast<double>(result.stats.page_cache_pinned_eviction_skips));
+      output.distance_direct_calls.push_back(
+          static_cast<double>(result.stats.distance_direct_calls));
       output.path_cache_requests.push_back(path_cache.enabled() ? 1.0 : 0.0);
       output.path_cache_hits.push_back(path_hit ? 1.0 : 0.0);
       output.expanded.push_back(static_cast<double>(result.stats.expanded));
@@ -1727,6 +1747,17 @@ RunOutput run_mixed_graph_with_index(Index& index, const Args& args,
         static_cast<double>(main_result.stats.page_cache_evictions));
     output.cache_promotions.push_back(
         static_cast<double>(main_result.stats.page_cache_promotions));
+    output.cache_hub_requests.push_back(
+        static_cast<double>(main_result.stats.page_cache_hub_requests));
+    output.cache_hub_hits.push_back(
+        static_cast<double>(main_result.stats.page_cache_hub_hits));
+    output.cache_pins.push_back(
+        static_cast<double>(main_result.stats.page_cache_pins));
+    output.cache_pinned_eviction_skips.push_back(
+        static_cast<double>(
+            main_result.stats.page_cache_pinned_eviction_skips));
+    output.distance_direct_calls.push_back(
+        static_cast<double>(main_result.stats.distance_direct_calls));
     output.path_cache_requests.push_back(path_cache.enabled() ? 1.0 : 0.0);
     output.path_cache_hits.push_back(path_hit ? 1.0 : 0.0);
     output.expanded.push_back(static_cast<double>(main_result.stats.expanded));
@@ -2310,6 +2341,15 @@ int agentmem::benchmark::run_cli(int argc, char** argv) {
                          output.cache_evictions);
     print_optional_stats("page_cache_promotions_per_query",
                          output.cache_promotions);
+    print_optional_stats("page_cache_hub_requests_per_query",
+                         output.cache_hub_requests);
+    print_optional_stats("page_cache_hub_hits_per_query",
+                         output.cache_hub_hits);
+    print_optional_stats("page_cache_pins_per_query", output.cache_pins);
+    print_optional_stats("page_cache_pinned_eviction_skips_per_query",
+                         output.cache_pinned_eviction_skips);
+    print_optional_stats("distance_direct_calls_per_query",
+                         output.distance_direct_calls);
     print_optional_stats("path_cache_requests_per_query",
                          output.path_cache_requests);
     print_optional_stats("path_cache_hits_per_query", output.path_cache_hits);
@@ -2373,6 +2413,11 @@ int agentmem::benchmark::run_cli(int argc, char** argv) {
               << sum_values(output.cache_evictions) << "\n";
     std::cout << "page_cache_promotions="
               << sum_values(output.cache_promotions) << "\n";
+    std::cout << "page_cache_pins=" << sum_values(output.cache_pins) << "\n";
+    std::cout << "page_cache_pinned_eviction_skips="
+              << sum_values(output.cache_pinned_eviction_skips) << "\n";
+    std::cout << "distance_direct_calls="
+              << sum_values(output.distance_direct_calls) << "\n";
     print_optional_stats("insert_latency_ms", output.insert_latencies_ms);
     print_optional_stats("query_compaction_ms", output.query_compaction_ms);
     print_optional_stats("delta_search_ms", output.delta_search_ms);
@@ -2396,6 +2441,14 @@ int agentmem::benchmark::run_cli(int argc, char** argv) {
     std::cout << "page_cache_hit_rate="
               << (total_cache_requests > 0.0
                       ? sum_values(output.cache_hits) / total_cache_requests
+                      : 0.0)
+              << "\n";
+    const double total_hub_cache_requests =
+        sum_values(output.cache_hub_requests);
+    std::cout << "page_cache_hub_hit_rate="
+              << (total_hub_cache_requests > 0.0
+                      ? sum_values(output.cache_hub_hits) /
+                            total_hub_cache_requests
                       : 0.0)
               << "\n";
     const double total_path_requests = sum_values(output.path_cache_requests);

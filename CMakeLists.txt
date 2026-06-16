@@ -13,13 +13,25 @@ add_library(agentmem_core
   src/engine/storage_engine.cpp
   src/graph/disk_graph_index.cpp
   src/graph/vamana_builder.cpp
+  src/storage/disk_index_reader.cpp
+  src/storage/disk_index_writer.cpp
+  src/storage/disk_record.cpp
   src/storage/lsm_tree.cpp
 )
 
 target_include_directories(agentmem_core PUBLIC include)
 
+option(ENABLE_DIRECT_IO
+  "Enable Linux O_DIRECT support" ON)
+
 option(AGENTMEM_REQUIRE_LIBURING
   "Fail configuration when liburing is unavailable" OFF)
+
+if (ENABLE_DIRECT_IO)
+  target_compile_definitions(agentmem_core PUBLIC AGENTMEM_ENABLE_DIRECT_IO=1)
+else()
+  target_compile_definitions(agentmem_core PUBLIC AGENTMEM_ENABLE_DIRECT_IO=0)
+endif()
 
 find_path(LIBURING_INCLUDE_DIR liburing.h)
 find_library(LIBURING_LIBRARY uring)
@@ -53,12 +65,33 @@ add_executable(agent_mem_io_tests
 )
 target_link_libraries(agent_mem_io_tests PRIVATE agentmem_core)
 
+add_executable(test_disk_record
+  tests/test_disk_record.cpp
+)
+target_link_libraries(test_disk_record PRIVATE agentmem_core)
+
+add_executable(test_disk_index_rw
+  tests/test_disk_index_rw.cpp
+)
+target_link_libraries(test_disk_index_rw PRIVATE agentmem_core)
+
+add_executable(bench_sync_disk_read
+  bench/bench_sync_disk_read.cpp
+)
+target_link_libraries(bench_sync_disk_read PRIVATE agentmem_core)
+
 if (MSVC)
   target_compile_options(agentmem_core PRIVATE /W4)
   target_compile_options(agent_mem_io_benchmark PRIVATE /W4)
   target_compile_options(agent_mem_io_tests PRIVATE /W4)
+  target_compile_options(test_disk_record PRIVATE /W4)
+  target_compile_options(test_disk_index_rw PRIVATE /W4)
+  target_compile_options(bench_sync_disk_read PRIVATE /W4)
 else()
   target_compile_options(agentmem_core PRIVATE -Wall -Wextra -pedantic -O3)
   target_compile_options(agent_mem_io_benchmark PRIVATE -Wall -Wextra -pedantic -O3)
   target_compile_options(agent_mem_io_tests PRIVATE -Wall -Wextra -pedantic -O3)
+  target_compile_options(test_disk_record PRIVATE -Wall -Wextra -pedantic -O3)
+  target_compile_options(test_disk_index_rw PRIVATE -Wall -Wextra -pedantic -O3)
+  target_compile_options(bench_sync_disk_read PRIVATE -Wall -Wextra -pedantic -O3)
 endif()

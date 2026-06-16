@@ -9,6 +9,7 @@
 #include <cstring>
 #include <deque>
 #include <limits>
+#include <mutex>
 #include <numeric>
 #include <queue>
 #include <random>
@@ -2756,6 +2757,11 @@ void PackedDiskGraphIndex::configure_cache(const std::string& policy,
     throw std::runtime_error(
         "Cache policy must be none, lru, 2q, or graph-aware-2q");
   }
+  if (policy == "graph-aware-2q" || policy == "agent" ||
+      protect_hot_pages) {
+    ensure_node_in_degrees();
+  }
+  std::lock_guard<std::mutex> lock(cache_mutex_);
   if (policy != cache_policy_ || capacity_pages != cache_capacity_pages_ ||
       protect_hot_pages != cache_protect_hot_pages_ ||
       hot_degree_threshold != cache_hot_degree_threshold_) {
@@ -2766,6 +2772,81 @@ void PackedDiskGraphIndex::configure_cache(const std::string& policy,
   cache_capacity_pages_ = capacity_pages;
   cache_protect_hot_pages_ = protect_hot_pages;
   cache_hot_degree_threshold_ = hot_degree_threshold;
+}
+
+void PackedDiskGraphIndex::pin(std::uint32_t page_id) {
+  (void)pin_if_cached(page_id);
+}
+
+void PackedDiskGraphIndex::unpin(std::uint32_t page_id) {
+  unpin_if_cached(page_id);
+}
+
+bool PackedDiskGraphIndex::is_pinned(std::uint32_t page_id) const {
+  std::lock_guard<std::mutex> lock(cache_mutex_);
+  const auto found = page_cache_.find(page_id);
+  return found != page_cache_.end() && found->second.pin_count > 0;
+}
+
+PackedDiskGraphIndex::PagePinGuard::PagePinGuard(
+    PackedDiskGraphIndex& index, std::uint32_t page_id)
+    : index_(&index), page_id_(page_id), owns_pin_(index.pin_if_cached(page_id)) {
+}
+
+PackedDiskGraphIndex::PagePinGuard::PagePinGuard(
+    PagePinGuard&& other) noexcept
+    : index_(other.index_),
+      page_id_(other.page_id_),
+      owns_pin_(other.owns_pin_) {
+  other.index_ = nullptr;
+  other.owns_pin_ = false;
+}
+
+PackedDiskGraphIndex::PagePinGuard&
+PackedDiskGraphIndex::PagePinGuard::operator=(PagePinGuard&& other) noexcept {
+  if (this != &other) {
+    release();
+    index_ = other.index_;
+    page_id_ = other.page_id_;
+    owns_pin_ = other.owns_pin_;
+    other.index_ = nullptr;
+    other.owns_pin_ = false;
+  }
+  return *this;
+}
+
+PackedDiskGraphIndex::PagePinGuard::~PagePinGuard() {
+  release();
+}
+
+void PackedDiskGraphIndex::PagePinGuard::release() {
+  if (index_ != nullptr && owns_pin_) {
+    index_->unpin_if_cached(page_id_);
+  }
+  index_ = nullptr;
+  owns_pin_ = false;
+}
+
+bool PackedDiskGraphIndex::pin_if_cached(std::uint32_t page_id) {
+  std::lock_guard<std::mutex> lock(cache_mutex_);
+  auto found = page_cache_.find(page_id);
+  if (found == page_cache_.end()) {
+    return false;
+  }
+  ++found->second.pin_count;
+  return true;
+}
+
+void PackedDiskGraphIndex::unpin_if_cached(std::uint32_t page_id) {
+  std::lock_guard<std::mutex> lock(cache_mutex_);
+  auto found = page_cache_.find(page_id);
+  if (found == page_cache_.end()) {
+    return;
+  }
+  if (found->second.pin_count == 0) {
+    throw std::runtime_error("Packed graph page pin underflow");
+  }
+  --found->second.pin_count;
 }
 
 void PackedDiskGraphIndex::configure_io(const std::string& mode,
@@ -2791,15 +2872,16 @@ PackedDiskGraphIndex::DecodedPage PackedDiskGraphIndex::read_page(
       static_cast<std::uint64_t>(page_id) * metadata_.page_size;
   std::vector<char> page = page_reader_->read(offset, metadata_.page_size,
                                                stats);
-  return decode_page(page_id, page);
+  return decode_page(page_id, std::move(page));
 }
 
 PackedDiskGraphIndex::DecodedPage PackedDiskGraphIndex::decode_page(
-    std::uint32_t page_id, const std::vector<char>& page) const {
+    std::uint32_t page_id, std::vector<char> page) const {
   std::size_t cursor = 0;
   DecodedPage decoded;
-  decoded.page_id = get_bytes<std::uint32_t>(page, cursor);
-  const auto node_count = get_bytes<std::uint32_t>(page, cursor);
+  decoded.bytes = std::move(page);
+  decoded.page_id = get_bytes<std::uint32_t>(decoded.bytes, cursor);
+  const auto node_count = get_bytes<std::uint32_t>(decoded.bytes, cursor);
   if (decoded.page_id != page_id || node_count > metadata_.nodes_per_page) {
     throw std::runtime_error("Corrupted packed graph page header");
   }
@@ -2807,23 +2889,21 @@ PackedDiskGraphIndex::DecodedPage PackedDiskGraphIndex::decode_page(
   std::vector<std::uint32_t> ids(metadata_.nodes_per_page);
   std::vector<std::uint32_t> degrees(metadata_.nodes_per_page);
   for (std::uint32_t i = 0; i < metadata_.nodes_per_page; ++i) {
-    ids[i] = get_bytes<std::uint32_t>(page, cursor);
+    ids[i] = get_bytes<std::uint32_t>(decoded.bytes, cursor);
   }
   for (std::uint32_t i = 0; i < metadata_.nodes_per_page; ++i) {
-    degrees[i] = get_bytes<std::uint32_t>(page, cursor);
+    degrees[i] = get_bytes<std::uint32_t>(decoded.bytes, cursor);
   }
 
   decoded.nodes.reserve(node_count);
   for (std::uint32_t slot = 0; slot < metadata_.nodes_per_page; ++slot) {
-    if (cursor + metadata_.dim * sizeof(float) > page.size()) {
+    if (cursor + metadata_.dim * sizeof(float) > decoded.bytes.size()) {
       throw std::runtime_error("Packed vector block is truncated");
     }
     if (slot < node_count) {
       DiskNode node;
       node.id = ids[slot];
-      node.vector.resize(metadata_.dim);
-      std::memcpy(node.vector.data(), page.data() + cursor,
-                  metadata_.dim * sizeof(float));
+      node.vector_offset = cursor;
       decoded.nodes.push_back(std::move(node));
     }
     cursor += metadata_.dim * sizeof(float);
@@ -2835,7 +2915,7 @@ PackedDiskGraphIndex::DecodedPage PackedDiskGraphIndex::decode_page(
       neighbors.reserve(degrees[slot]);
     }
     for (std::uint32_t n = 0; n < metadata_.degree; ++n) {
-      const auto neighbor = get_bytes<std::uint32_t>(page, cursor);
+      const auto neighbor = get_bytes<std::uint32_t>(decoded.bytes, cursor);
       if (slot < node_count && n < degrees[slot] &&
           neighbor != std::numeric_limits<std::uint32_t>::max()) {
         neighbors.push_back(neighbor);
@@ -2853,6 +2933,70 @@ bool PackedDiskGraphIndex::cache_enabled() const {
   return cache_policy_ != "none" && cache_capacity_pages_ > 0;
 }
 
+void PackedDiskGraphIndex::ensure_node_in_degrees() {
+  if (node_in_degrees_ready_) {
+    return;
+  }
+
+  node_in_degrees_.assign(static_cast<std::size_t>(metadata_.vector_count), 0);
+  DiskGraphSearchStats ignored;
+  for (std::uint32_t page_id = 0; page_id < metadata_.page_count; ++page_id) {
+    DecodedPage page = read_page(page_id, ignored);
+    for (const auto& node : page.nodes) {
+      for (const auto neighbor : node.neighbors) {
+        if (neighbor < node_in_degrees_.size()) {
+          ++node_in_degrees_[neighbor];
+        }
+      }
+    }
+  }
+  node_in_degrees_ready_ = true;
+}
+
+bool PackedDiskGraphIndex::page_is_hub(const DecodedPage& page) const {
+  return page_hot_score(page) > 0;
+}
+
+bool PackedDiskGraphIndex::cache_entry_is_hub(const CacheEntry& entry) const {
+  return entry.hot_score > 0;
+}
+
+void PackedDiskGraphIndex::record_hub_cache_access(
+    bool hub_page, bool hit, DiskGraphSearchStats& stats) const {
+  if (!hub_page) {
+    return;
+  }
+  ++stats.page_cache_hub_requests;
+  if (hit) {
+    ++stats.page_cache_hub_hits;
+  }
+}
+
+const PackedDiskGraphIndex::DiskNode& PackedDiskGraphIndex::find_node_in_page(
+    const DecodedPage& page, std::uint32_t node_id) const {
+  for (const auto& node : page.nodes) {
+    if (node.id == node_id) {
+      return node;
+    }
+  }
+  throw std::runtime_error("Node is missing from packed page");
+}
+
+const float* PackedDiskGraphIndex::vector_data(const DecodedPage& page,
+                                               const DiskNode& node) const {
+  const std::size_t bytes =
+      static_cast<std::size_t>(metadata_.dim) * sizeof(float);
+  if (node.vector_offset + bytes > page.bytes.size()) {
+    throw std::runtime_error("Packed node vector points outside page");
+  }
+  return reinterpret_cast<const float*>(page.bytes.data() + node.vector_offset);
+}
+
+float PackedDiskGraphIndex::compute_distance_direct(
+    const float* query, const DecodedPage& page, const DiskNode& node) const {
+  return squared_l2(query, vector_data(page, node), metadata_.dim);
+}
+
 const PackedDiskGraphIndex::DecodedPage*
 PackedDiskGraphIndex::lookup_cached_page(std::uint32_t page_id,
                                          DiskGraphSearchStats& stats) {
@@ -2860,12 +3004,14 @@ PackedDiskGraphIndex::lookup_cached_page(std::uint32_t page_id,
     return nullptr;
   }
 
+  std::lock_guard<std::mutex> lock(cache_mutex_);
   auto found = page_cache_.find(page_id);
   if (found == page_cache_.end()) {
     return nullptr;
   }
 
   ++stats.page_cache_hits;
+  record_hub_cache_access(cache_entry_is_hub(found->second), true, stats);
   found->second.last_access = ++cache_clock_;
   ++found->second.frequency;
   if (is_two_queue_policy() && !found->second.protected_queue) {
@@ -2884,6 +3030,7 @@ PackedDiskGraphIndex::store_cached_page(DecodedPage page,
   }
 
   const std::uint32_t page_id = page.page_id;
+  std::lock_guard<std::mutex> lock(cache_mutex_);
   auto found = page_cache_.find(page_id);
   if (found != page_cache_.end()) {
     found->second.page = std::move(page);
@@ -2898,7 +3045,10 @@ PackedDiskGraphIndex::store_cached_page(DecodedPage page,
   }
 
   if (page_cache_.size() >= cache_capacity_pages_) {
-    evict_one_page(&stats);
+    if (!evict_one_page_locked(&stats)) {
+      scratch_page_ = std::move(page);
+      return scratch_page_;
+    }
   }
 
   CacheEntry entry;
@@ -2922,12 +3072,18 @@ bool PackedDiskGraphIndex::is_graph_aware_cache_policy() const {
 
 std::uint64_t PackedDiskGraphIndex::page_hot_score(
     const DecodedPage& page) const {
-  if (!cache_protect_hot_pages_ || cache_hot_degree_threshold_ == 0) {
+  if (!cache_protect_hot_pages_ && !is_graph_aware_cache_policy()) {
     return 0;
   }
   std::uint64_t score = 0;
   for (const auto& node : page.nodes) {
-    if (node.neighbors.size() >= cache_hot_degree_threshold_) {
+    const std::uint64_t importance =
+        node.id < node_in_degrees_.size()
+            ? static_cast<std::uint64_t>(node_in_degrees_[node.id])
+            : static_cast<std::uint64_t>(node.neighbors.size());
+    if (cache_hot_degree_threshold_ == 0) {
+      score += importance;
+    } else if (importance >= cache_hot_degree_threshold_) {
       ++score;
     }
   }
@@ -2946,12 +3102,12 @@ double PackedDiskGraphIndex::cache_score(const CacheEntry& entry) const {
 
   if (is_graph_aware_cache_policy()) {
     const double queue_bonus = entry.protected_queue ? 1000000000.0 : 0.0;
-    const double hot_bonus = static_cast<double>(entry.hot_score) * 100000.0;
-    const double frequency = static_cast<double>(entry.frequency);
+    const double hot_bonus = std::log1p(static_cast<double>(entry.hot_score)) *
+                             64.0;
+    const double frequency =
+        static_cast<double>(std::min<std::uint64_t>(entry.frequency, 16));
     const double recency = static_cast<double>(entry.last_access);
-    const double density = static_cast<double>(entry.page.nodes.size());
-    return queue_bonus + hot_bonus + frequency * 1000.0 + recency +
-           density * 0.01;
+    return queue_bonus + recency + hot_bonus + frequency * 4.0;
   }
 
   const double frequency = static_cast<double>(entry.frequency);
@@ -2960,14 +3116,27 @@ double PackedDiskGraphIndex::cache_score(const CacheEntry& entry) const {
   return frequency * 1000.0 + recency + density * 0.01;  // Agent 策略优先长期热点。
 }
 
-void PackedDiskGraphIndex::evict_one_page(DiskGraphSearchStats* stats) {
+bool PackedDiskGraphIndex::evict_one_page(DiskGraphSearchStats* stats) {
+  std::lock_guard<std::mutex> lock(cache_mutex_);
+  return evict_one_page_locked(stats);
+}
+
+bool PackedDiskGraphIndex::evict_one_page_locked(DiskGraphSearchStats* stats) {
   if (page_cache_.empty()) {
-    return;
+    return false;
   }
 
-  auto victim = page_cache_.begin();
-  double victim_score = cache_score(victim->second);
+  auto victim = page_cache_.end();
+  double victim_score = 0.0;
   for (auto it = page_cache_.begin(); it != page_cache_.end(); ++it) {
+    if (it->second.pin_count > 0) {
+      continue;
+    }
+    if (victim == page_cache_.end()) {
+      victim = it;
+      victim_score = cache_score(it->second);
+      continue;
+    }
     if (is_two_queue_policy() &&
         victim->second.protected_queue != it->second.protected_queue) {
       if (!it->second.protected_queue) {
@@ -2983,10 +3152,17 @@ void PackedDiskGraphIndex::evict_one_page(DiskGraphSearchStats* stats) {
       victim_score = score;
     }
   }
+  if (victim == page_cache_.end()) {
+    if (stats != nullptr) {
+      ++stats->page_cache_pinned_eviction_skips;
+    }
+    return false;
+  }
   page_cache_.erase(victim);
   if (stats != nullptr) {
     ++stats->page_cache_evictions;
   }
+  return true;
 }
 
 const PackedDiskGraphIndex::DecodedPage& PackedDiskGraphIndex::load_page(
@@ -2998,6 +3174,7 @@ const PackedDiskGraphIndex::DecodedPage& PackedDiskGraphIndex::load_page(
     return *cached;
   }
 
+  std::lock_guard<std::mutex> cache_lock(cache_mutex_);
   if (cache_policy_ != "none" && cache_capacity_pages_ > 0) {
     auto found = page_cache_.find(page_id);
     if (found != page_cache_.end()) {
@@ -3012,6 +3189,7 @@ const PackedDiskGraphIndex::DecodedPage& PackedDiskGraphIndex::load_page(
   ++stats.node_reads;
   ++stats.page_requests_after_dedup;
   DecodedPage page = read_page(page_id, stats);
+  record_hub_cache_access(page_is_hub(page), false, stats);
 
   if (cache_policy_ == "none" || cache_capacity_pages_ == 0) {
     scratch_page_ = std::move(page);
@@ -3019,7 +3197,10 @@ const PackedDiskGraphIndex::DecodedPage& PackedDiskGraphIndex::load_page(
   }
 
   if (page_cache_.size() >= cache_capacity_pages_) {
-    evict_one_page(&stats);
+    if (!evict_one_page_locked(&stats)) {
+      scratch_page_ = std::move(page);
+      return scratch_page_;
+    }
   }
 
   CacheEntry entry;
@@ -3034,6 +3215,7 @@ const PackedDiskGraphIndex::DecodedPage& PackedDiskGraphIndex::load_page(
 
 DiskGraphSearchResult PackedDiskGraphIndex::search_one(
     const float* query, const DiskGraphSearchConfig& config) {
+  std::lock_guard<std::mutex> search_lock(search_mutex_);
   if (config.top_k == 0 || config.search_width == 0 ||
       config.entry_count == 0) {
     throw std::runtime_error("Packed graph search top_k, search_width, and entry_count must be positive");
@@ -3076,7 +3258,11 @@ DiskGraphSearchResult PackedDiskGraphIndex::search_one(
         output.stats.io_pending_pages_peak, async_page_footprint());
   };
   auto page_in_cache = [&](std::uint32_t page_id) {
-    return cache_enabled() && page_cache_.find(page_id) != page_cache_.end();
+    if (!cache_enabled()) {
+      return false;
+    }
+    std::lock_guard<std::mutex> lock(cache_mutex_);
+    return page_cache_.find(page_id) != page_cache_.end();
   };
   auto page_offset = [&](std::uint32_t page_id) {
     return metadata_.records_offset +
@@ -3107,7 +3293,7 @@ DiskGraphSearchResult PackedDiskGraphIndex::search_one(
       token_to_page.erase(token_found);
       pending_pages.erase(page_id);
 
-      DecodedPage decoded = decode_page(page_id, completed.data);
+      DecodedPage decoded = decode_page(page_id, std::move(completed.data));
       completed_prefetch_pages.insert(page_id);
       if (cache_enabled()) {
         (void)store_cached_page(std::move(decoded), output.stats);
@@ -3344,8 +3530,11 @@ DiskGraphSearchResult PackedDiskGraphIndex::search_one(
       ++output.stats.pq_filter_accept_count;
       return config.pq_model->adc_distance(id, adc_table);
     }
-    const DiskNode& node = load_node(id);
-    return squared_l2(query, node.vector.data(), metadata_.dim);
+    const DecodedPage& page = load_page(node_to_page_[id], output.stats);
+    const DiskNode& node = find_node_in_page(page, id);
+    ++output.stats.distance_direct_calls;
+    materialize_page(page);
+    return compute_distance_direct(query, page, node);
   };
 
   const std::size_t effective_k =
@@ -3432,6 +3621,10 @@ DiskGraphSearchResult PackedDiskGraphIndex::search_one(
     }
     candidates.pop();
     const DiskNode& node = load_node(current.id);
+    PagePinGuard current_pin(*this, node_to_page_[current.id]);
+    if (current_pin.owns_pin()) {
+      ++output.stats.page_cache_pins;
+    }
     ++output.stats.expanded;
 
     prefetch_ids(node.neighbors);
@@ -3462,8 +3655,11 @@ DiskGraphSearchResult PackedDiskGraphIndex::search_one(
   if (!adc_table.empty() && config.rerank_topk > 0) {  // 用原始向量恢复候选排序精度。
     const std::size_t reads_before_rerank = output.stats.node_reads;
     for (auto& result : output.topk) {
-      const DiskNode& node = load_node(result.id);
-      result.distance = squared_l2(query, node.vector.data(), metadata_.dim);
+      const DecodedPage& page = load_page(node_to_page_[result.id],
+                                          output.stats);
+      const DiskNode& node = find_node_in_page(page, result.id);
+      ++output.stats.distance_direct_calls;
+      result.distance = compute_distance_direct(query, page, node);
     }
     output.stats.rerank_reads += output.stats.node_reads - reads_before_rerank;
     std::sort(output.topk.begin(), output.topk.end(),

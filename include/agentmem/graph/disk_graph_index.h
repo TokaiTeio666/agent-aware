@@ -4,6 +4,7 @@
 #include <cstdint>
 #include <fstream>
 #include <memory>
+#include <mutex>
 #include <string>
 #include <unordered_map>
 #include <vector>
@@ -88,6 +89,11 @@ struct DiskGraphSearchStats {
   std::size_t page_cache_misses = 0;
   std::size_t page_cache_evictions = 0;
   std::size_t page_cache_promotions = 0;
+  std::size_t page_cache_hub_requests = 0;
+  std::size_t page_cache_hub_hits = 0;
+  std::size_t page_cache_pins = 0;
+  std::size_t page_cache_pinned_eviction_skips = 0;
+  std::size_t distance_direct_calls = 0;
   std::size_t io_submits = 0;
   std::size_t io_completions = 0;
   std::size_t io_submit_syscalls = 0;
@@ -193,6 +199,31 @@ class PackedDiskGraphIndex {
   void configure_cache(const std::string& policy, std::size_t capacity_pages,
                        bool protect_hot_pages = false,
                        std::size_t hot_degree_threshold = 0);
+  void pin(std::uint32_t page_id);
+  void unpin(std::uint32_t page_id);
+  bool is_pinned(std::uint32_t page_id) const;
+
+  class PagePinGuard {
+   public:
+    PagePinGuard(PackedDiskGraphIndex& index, std::uint32_t page_id);
+    PagePinGuard(const PagePinGuard&) = delete;
+    PagePinGuard& operator=(const PagePinGuard&) = delete;
+    PagePinGuard(PagePinGuard&& other) noexcept;
+    PagePinGuard& operator=(PagePinGuard&& other) noexcept;
+    ~PagePinGuard();
+
+    bool owns_pin() const {
+      return owns_pin_;
+    }
+
+    void release();
+
+   private:
+    PackedDiskGraphIndex* index_ = nullptr;
+    std::uint32_t page_id_ = 0;
+    bool owns_pin_ = false;
+  };
+
   void configure_io(const std::string& mode, std::size_t batch_size,
                     std::size_t io_depth = 1);
 
@@ -204,12 +235,13 @@ class PackedDiskGraphIndex {
  private:
   struct DiskNode {
     std::uint32_t id = 0;
-    std::vector<float> vector;
     std::vector<std::uint32_t> neighbors;
+    std::size_t vector_offset = 0;
   };
 
   struct DecodedPage {
     std::uint32_t page_id = 0;
+    std::vector<char> bytes;
     std::vector<DiskNode> nodes;
   };
 
@@ -219,11 +251,12 @@ class PackedDiskGraphIndex {
     std::uint64_t frequency = 0;
     bool protected_queue = false;
     std::uint64_t hot_score = 0;
+    std::uint64_t pin_count = 0;
   };
 
   DecodedPage read_page(std::uint32_t page_id, DiskGraphSearchStats& stats);
   DecodedPage decode_page(std::uint32_t page_id,
-                          const std::vector<char>& page) const;
+                          std::vector<char> page) const;
   const DecodedPage& load_page(std::uint32_t page_id,
                                DiskGraphSearchStats& stats);
   const DecodedPage* lookup_cached_page(std::uint32_t page_id,
@@ -231,9 +264,23 @@ class PackedDiskGraphIndex {
   const DecodedPage& store_cached_page(DecodedPage page,
                                        DiskGraphSearchStats& stats);
   bool cache_enabled() const;
-  void evict_one_page(DiskGraphSearchStats* stats);
+  bool evict_one_page(DiskGraphSearchStats* stats);
+  bool evict_one_page_locked(DiskGraphSearchStats* stats);
   double cache_score(const CacheEntry& entry) const;
   std::uint64_t page_hot_score(const DecodedPage& page) const;
+  bool page_is_hub(const DecodedPage& page) const;
+  bool cache_entry_is_hub(const CacheEntry& entry) const;
+  void record_hub_cache_access(bool hub_page, bool hit,
+                               DiskGraphSearchStats& stats) const;
+  bool pin_if_cached(std::uint32_t page_id);
+  void unpin_if_cached(std::uint32_t page_id);
+  void ensure_node_in_degrees();
+  const DiskNode& find_node_in_page(const DecodedPage& page,
+                                    std::uint32_t node_id) const;
+  const float* vector_data(const DecodedPage& page,
+                           const DiskNode& node) const;
+  float compute_distance_direct(const float* query, const DecodedPage& page,
+                                const DiskNode& node) const;
   bool is_two_queue_policy() const;
   bool is_graph_aware_cache_policy() const;
 
@@ -249,6 +296,10 @@ class PackedDiskGraphIndex {
   std::uint64_t cache_clock_ = 0;
   std::unordered_map<std::uint32_t, CacheEntry> page_cache_;
   DecodedPage scratch_page_;
+  std::vector<std::uint32_t> node_in_degrees_;
+  bool node_in_degrees_ready_ = false;
+  mutable std::mutex cache_mutex_;
+  mutable std::mutex search_mutex_;
 };
 
 }  // namespace agentmem

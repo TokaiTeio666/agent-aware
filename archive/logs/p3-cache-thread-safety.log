@@ -1,0 +1,4 @@
+﻿P3 cache/thread-safety validation log
+build: cmake --build build --target agent_mem_io_tests agent_mem_io_benchmark -j2 PASS
+smoke: ./build/agent_mem_io_tests PASS
+threading note: PackedDiskGraphIndex::search_one is guarded by search_mutex_; no ThreadSanitizer run was performed in this environment.
