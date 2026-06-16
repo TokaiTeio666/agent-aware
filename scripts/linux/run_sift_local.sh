@@ -22,6 +22,7 @@ RUN_CACHE_MODE="${RUN_CACHE_MODE:-${RUN_TYPE:-smoke}}"
 IO_MODE="${IO_MODE:-pread}"
 RUN_TYPE_EFFECTIVE="${RUN_TYPE:-$RUN_CACHE_MODE}"
 MEMORY_BUDGET_RATIO="${MEMORY_BUDGET_RATIO:-0.20}"
+INDEX_PATH="${INDEX_PATH:-${INDEX:-}}"
 
 mkdir -p "$RUN_DIR" "$RESULT_DIR" "$LOG_DIR"
 
@@ -50,6 +51,7 @@ COMMON=(
   --base-limit "$BASE_LIMIT"
   --query-limit "$QUERY_LIMIT"
   --k "$K"
+  --agent-workload "${AGENT_WORKLOAD:-random}"
 )
 
 MEMORY_FLAG=(--memory-budget-ratio "$MEMORY_BUDGET_RATIO")
@@ -63,12 +65,31 @@ if [[ "${ALLOW_OVER_BUDGET_FOR_DEBUG:-0}" == "1" ]]; then
   MEMORY_FLAG+=(--allow-over-budget-for-debug)
 fi
 
+emit_archive_metadata() {
+  echo "git_commit=$(git -C "$ROOT" rev-parse --short HEAD 2>/dev/null || echo no_commit_yet)"
+  echo "git_status_count=$(git -C "$ROOT" status --short 2>/dev/null | wc -l | tr -d ' ')"
+  echo "git_status=$(git -C "$ROOT" status --short 2>/dev/null | tr '\n' ';' || true)"
+  echo "build_type=${BUILD_TYPE:-script}"
+  echo "compiler_version=$(${CXX:-g++} --version 2>/dev/null | head -1 || echo unknown)"
+  echo "os_kernel=$(uname -srmo 2>/dev/null || echo unknown)"
+  echo "cpu_model=$(LC_ALL=C lscpu 2>/dev/null | awk -F: '/Model name/ {gsub(/^[ \t]+/, \"\", $2); print $2; exit}' || echo unknown)"
+  echo "memory_total_kb=$(awk '/MemTotal/ {print $2; exit}' /proc/meminfo 2>/dev/null || echo unknown)"
+  echo "disk_info=$(lsblk -ndo NAME,TYPE,SIZE,MODEL 2>/dev/null | tr '\n' ';' || echo unknown)"
+  echo "dataset_path=${SIFT_DIR}"
+  echo "base_path=${SIFT_BASE}"
+  echo "query_path=${SIFT_QUERY}"
+  echo "truth_path=${SIFT_TRUTH}"
+  echo "cold_warm=${COLD_WARM:-$RUN_CACHE_MODE}"
+  echo "io_mode_requested=$IO_MODE"
+}
+
 RESULT="$RESULT_DIR/sift-local-$ENGINE-$DATE_TAG.txt"
 LOG="$LOG_DIR/sift-local-$ENGINE-$DATE_TAG.log"
 
 case "$ENGINE" in
   exact)
     {
+      emit_archive_metadata
       echo "system_name=agent-aware"
       echo "dataset=${DATASET_NAME:-sift_subset}"
       echo "run_cache_mode=$RUN_CACHE_MODE"
@@ -82,14 +103,17 @@ case "$ENGINE" in
     ;;
   graph)
     BUILD_FLAG=()
+    if [[ "${REUSE_INDEX:-0}" == "1" ]]; then
+      BUILD_INDEX=0
+    fi
     if [[ "${BUILD_INDEX:-1}" == "1" ]]; then
       BUILD_FLAG=(--build-index)
     fi
     SEARCH_EARLY_STOP_FLAG=()
-    if [[ "${SEARCH_EARLY_STOP:-1}" == "1" ]]; then
+    if [[ "${EARLY_STOP:-${SEARCH_EARLY_STOP:-1}}" == "1" ]]; then
       SEARCH_EARLY_STOP_FLAG=(
         --search-early-stop
-        --search-early-stop-min "${SEARCH_EARLY_STOP_MIN:-192}"
+        --search-early-stop-min "${EARLY_STOP_MIN:-${SEARCH_EARLY_STOP_MIN:-192}}"
       )
     fi
     ADAPTIVE_EARLY_STOP_FLAG=()
@@ -120,8 +144,9 @@ case "$ENGINE" in
     if [[ "${ALLOW_IO_FALLBACK:-0}" == "1" ]]; then
       IO_FALLBACK_FLAG=(--allow-io-fallback)
     fi
-    INDEX="${INDEX:-$RUN_DIR/sift_graph.idx}"
+    INDEX="${INDEX_PATH:-$RUN_DIR/sift_graph.idx}"
     {
+      emit_archive_metadata
       echo "system_name=agent-aware"
       echo "dataset=${DATASET_NAME:-sift_subset}"
       echo "run_cache_mode=$RUN_CACHE_MODE"
@@ -136,12 +161,14 @@ case "$ENGINE" in
       --approx-projections "${APPROX_PROJECTIONS:-10}" \
       --approx-window "${APPROX_WINDOW:-32}" \
       --approx-random-samples "${APPROX_RANDOM_SAMPLES:-32}" \
-      --approx-candidate-limit "${APPROX_CANDIDATE_LIMIT:-192}" \
+      --candidate-limit "${CANDIDATE_LIMIT:-${APPROX_CANDIDATE_LIMIT:-256}}" \
       --lsh-tables "${LSH_TABLES:-8}" \
       --lsh-bits "${LSH_BITS:-14}" \
       --lsh-probe-radius "${LSH_PROBE_RADIUS:-0}" \
       --lsh-bucket-limit "${LSH_BUCKET_LIMIT:-64}" \
       --robust-prune-alpha "${ROBUST_PRUNE_ALPHA:-1.2}" \
+      --reverse-edge-patch "${REVERSE_EDGE_PATCH:-1}" \
+      --prune-passes "${PRUNE_PASSES:-1}" \
       --search-width "${SEARCH_WIDTH:-1024}" \
       "${SEARCH_EARLY_STOP_FLAG[@]}" \
       "${ADAPTIVE_EARLY_STOP_FLAG[@]}" \
@@ -151,6 +178,9 @@ case "$ENGINE" in
       --coaccess-trace-length "${COACCESS_TRACE_LENGTH:-48}" \
       --cache-policy "${CACHE_POLICY:-none}" \
       --cache-pages "${CACHE_PAGES:-256}" \
+      --cache-budget-bytes "${CACHE_BUDGET_BYTES:-0}" \
+      --cache-protect-hot-pages "${CACHE_PROTECT_HOT_PAGES:-0}" \
+      --cache-hot-degree-threshold "${CACHE_HOT_DEGREE_THRESHOLD:-0}" \
       --path-cache-policy "${PATH_CACHE_POLICY:-none}" \
       --path-cache-capacity "${PATH_CACHE_CAPACITY:-1024}" \
       --path-cache-hit-search-width "${PATH_CACHE_HIT_SEARCH_WIDTH:-1024}" \
@@ -168,7 +198,9 @@ case "$ENGINE" in
       --prefetch-policy "${PREFETCH_POLICY:-frontier-next-hop}" \
       --page-dedup "${PAGE_DEDUP:-1}" \
       --same-page-reuse "${SAME_PAGE_REUSE:-1}" \
+      --page-coalesce "${PAGE_COALESCE:-1}" \
       "${IO_FALLBACK_FLAG[@]}" \
+      --agent-workload "${AGENT_WORKLOAD:-random}" \
       --workload-mode "${WORKLOAD_MODE:-read-only}" \
       --operation-count "${OPERATION_COUNT:-0}" \
       --write-ratio "${WRITE_RATIO:-0}" \

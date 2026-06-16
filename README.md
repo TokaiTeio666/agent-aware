@@ -125,6 +125,14 @@ Delta IVF-flat tuning knobs:
   `--search-early-stop-min`.
 - SIFT helper defaults now target SIFT1M construction with `lsh-rp`.
 
+## Vamana builder
+
+- Standalone Vamana graph construction is available through
+  `agentmem::VamanaBuilder`.
+- The benchmark can build disk indexes with `--graph-build-policy vamana`,
+  using medoid routing, `search_for_construction`, RobustPrune, and reverse-edge
+  re-pruning before writing one-node or packed graph pages.
+
 ## Memory budget controls
 
 `--memory-budget-ratio` defaults to `0.20` and reports whether estimated
@@ -178,45 +186,52 @@ the ignored `results/` directory, but final evidence used for reports should be
 copied into `archive/`.
 
 The formal validation method is maintained in `docs/VALIDATION_METHOD.md`.
-The project baseline and roadmap are maintained in `docs/PROJECT_PLAN.md`.
-WSL/Linux strict cold-start instructions are maintained in
-`docs/WSL_COLD_START.md`.
+The project baseline and roadmap are maintained in `PROJECT_PLAN.md`.
+WSL/Linux validation entry points live under `scripts/linux/`.
+
+## Source layout
+
+The implementation is split to match the project plan:
+
+- `include/agentmem/core` and `src/core`: vector types, distance, exact search.
+- `include/agentmem/data` and `src/data`: SIFT and synthetic data loading.
+- `include/agentmem/graph` and `src/graph`: DiskANN/Vamana-style graph build,
+  packed pages, PQ ADC filtering, cache-aware search, and disk I/O hooks.
+- `include/agentmem/storage` and `src/storage`: WAL, Delta indexes, and
+  LSM-style write-path components.
+- `include/agentmem/engine` and `src/engine`: public StorageEngine facade for
+  Agent or benchmark integration.
+- `include/agentmem/benchmark` and `src/benchmark`: metrics and reporting
+  helpers.
+- `src/app`: benchmark CLI. The executable output name remains
+  `agentmem_flow` for compatibility with existing scripts.
 
 ## Build
 
-On this workspace, CMake is optional. The provided PowerShell script builds with
-`g++`:
+On WSL/Linux, the direct build script uses `g++` and produces both the
+benchmark CLI and smoke test binary:
 
-```powershell
-.\scripts\build.ps1
+```bash
+bash scripts/linux/build.sh
 ```
 
 If CMake is available:
 
-```powershell
+```bash
 cmake -S . -B build
-cmake --build build --config Release
+cmake --build build
 ```
 
 ## Run smoke tests
 
-```powershell
-.\scripts\run_v0_smoke.ps1
-.\scripts\run_v1_smoke.ps1
-.\scripts\run_v2_compare.ps1
-.\scripts\run_v3_cache_compare.ps1
-.\scripts\run_v4_path_compare.ps1
-.\scripts\run_v5_mixed_compare.ps1
-.\scripts\run_v5_1_wal_replay.ps1
-.\scripts\run_v5_2_delta_ann_compare.ps1
-.\scripts\run_v6_fileio_compare.ps1
-.\scripts\run_v7_signature_compare.ps1
+```bash
+./build/agent_mem_io_tests
 ```
 
-Equivalent direct V0 command:
+Equivalent direct V0 memory command:
 
 ```powershell
-.\build\agentmem_flow.exe --engine exact --synthetic --base-count 1000 --query-count 100 --dim 32 --clusters 16 --k 10
+.\build\agentmem_flow.exe --engine memory --synthetic --base-count 1000 --query-count 100 --dim 32 --clusters 16 --k 10
 ```
 
 Equivalent direct V1 command:
@@ -282,7 +297,7 @@ bash scripts/linux/run_sift_local.sh
 Useful WSL overrides:
 
 ```bash
-SIFT_DIR=/path/to/sift BASE_LIMIT=100000 QUERY_LIMIT=1000 ENGINE=exact \
+SIFT_DIR=/path/to/sift BASE_LIMIT=100000 QUERY_LIMIT=1000 ENGINE=memory \
   bash scripts/linux/run_sift_local.sh
 ```
 
@@ -312,7 +327,7 @@ Recall@K.
 
 ```powershell
 .\build\agentmem_flow.exe `
-  --engine exact `
+  --engine memory `
   --base data\sift\sift_base.fvecs `
   --query data\sift\sift_query.fvecs `
   --truth data\sift\sift_groundtruth.ivecs `
@@ -325,12 +340,15 @@ Equivalent Linux command using the official directory layout:
 
 ```bash
 ./build/agentmem_flow \
-  --engine exact \
+  --engine memory \
   --sift-dir data/sift \
   --base-limit 100000 \
   --query-limit 1000 \
   --k 10
 ```
+
+`--engine exact` remains accepted as a compatibility alias for the same
+`search_memory_fast` full-precision in-memory path.
 
 Equivalent Linux graph command without the helper:
 

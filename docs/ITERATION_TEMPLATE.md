@@ -15,7 +15,7 @@
 
 ## 对应计划书问题
 
-参考 `docs/PROJECT_PLAN.md` 中的问题编号，说明本版本解决、部分解决或暴露了哪些问题。
+说明本版本解决、部分解决或暴露了哪些问题。
 
 | 计划书问题 | 状态 | 本版本说明 |
 |---|---|---|
@@ -24,9 +24,8 @@
 ## 验证定义
 
 - Recall@10：对每个 query，计算返回 Top-10 与 ground truth Top-10 的交集比例，再对所有 query 取平均。
-- 1-Recall@10：定义为 `1 - Recall@10`。
 - Ground Truth 来源：当前正式验证优先使用 `data/sift/` 下的真实 SIFT 文件；若 `sift_groundtruth.ivecs` 对子集越界，必须记录回退到 subset exact brute force truth。
-- 数据集：正式验证只使用 `SIFT10K` 或 `SIFT100K`。
+- 数据集：正式验证使用 `SIFT10K` , `SIFT100K`,`SIFT1M`。
 
 ## 实现范围
 
@@ -38,7 +37,7 @@
 
 - 构建命令：
 - 运行命令：
-- 数据集：`SIFT10K` / `SIFT100K`
+- 数据集：
 - Ground Truth 来源：
 - I/O mode requested：
 - I/O mode effective：
@@ -61,7 +60,6 @@
 | 指标 | 数值 |
 |---|---:|
 | Recall@10 | |
-| 1-Recall@10 | |
 | QPS | |
 | Avg Latency ms | |
 | P95 Latency ms | |
