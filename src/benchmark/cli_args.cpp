@@ -123,11 +123,16 @@ void print_usage(const char* program) {
       << "  --adc-enable [0|1]   Use ADC lookup tables during graph search\n"
       << "  --rerank-topk N      Raw-vector rerank candidates, default 0\n"
       << "  --io-mode NAME       pread, odirect, or io_uring, default pread\n"
+      << "  --async_io 0|1       Compatibility alias: 1 selects io_uring\n"
+      << "  --io_backend NAME    Compatibility alias: uring, pread, or odirect\n"
       << "  --io-batch-size N    Requested async I/O batch size, default 1\n"
       << "  --io-depth N         Max async page reads in flight, default 1\n"
       << "  --prefetch-width N   Frontier pages to prefetch, 0 uses io-depth\n"
+      << "  --prefetch-depth N   Topology prefetch depth, currently supports 1\n"
+      << "  --prefetch NAME      Compatibility alias: topology maps to frontier-next-hop\n"
       << "  --prefetch-policy NAME  none, frontier, next-hop, or frontier-next-hop\n"
       << "  --page-dedup 0|1     Deduplicate cached/pending/seen pages, default 1\n"
+      << "  --dedup_pages 0|1    Compatibility alias for --page-dedup\n"
       << "  --same-page-reuse 0|1 Count same-page decoded node reuse, default 1\n"
       << "  --page-coalesce 0|1  Sort/dedup frontier page prefetch batches, default 1\n"
       << "  --allow-io-fallback  Permit odirect/io_uring to fall back to pread\n"
@@ -177,6 +182,30 @@ std::string join_path(const std::string& dir, const std::string& name) {
   return dir + "/" + name;
 }
 
+std::string normalize_io_backend(const std::string& value) {
+  if (value == "uring" || value == "io_uring") {
+    return "io_uring";
+  }
+  if (value == "direct" || value == "odirect") {
+    return "odirect";
+  }
+  if (value == "sync" || value == "pread") {
+    return "pread";
+  }
+  throw std::runtime_error(
+      "--io-backend must be uring, io_uring, odirect, direct, pread, or sync");
+}
+
+std::string normalize_prefetch_policy(const std::string& value) {
+  if (value == "topology") {
+    return "frontier-next-hop";
+  }
+  if (value == "off" || value == "0") {
+    return "none";
+  }
+  return value;
+}
+
 }  // namespace
 
 bool is_memory_engine(const std::string& engine) {
@@ -188,8 +217,21 @@ Args parse_args(int argc, char** argv) {
   Args args;
 
   for (int i = 1; i < argc; ++i) {
-    const std::string opt = argv[i];
+    const std::string raw_opt = argv[i];
+    const auto equals = raw_opt.find('=');
+    const bool has_inline_value =
+        raw_opt.rfind("--", 0) == 0 && equals != std::string::npos;
+    const std::string opt =
+        has_inline_value ? raw_opt.substr(0, equals) : raw_opt;
+    const std::string inline_value =
+        has_inline_value ? raw_opt.substr(equals + 1) : std::string{};
     auto require_value = [&](const std::string& name) -> std::string {
+      if (has_inline_value) {
+        if (inline_value.empty()) {
+          throw std::runtime_error("Missing value for " + name);
+        }
+        return inline_value;
+      }
       if (i + 1 >= argc) {
         throw std::runtime_error("Missing value for " + name);
       }
@@ -379,7 +421,9 @@ Args parse_args(int argc, char** argv) {
     } else if (opt == "--coaccess-trace-length") {
       args.coaccess_trace_length = parse_size(require_value(opt), opt);
     } else if (opt == "--pq-enable") {
-      if (i + 1 < argc && argv[i + 1][0] != '-') {
+      if (has_inline_value) {
+        args.pq_enable = parse_bool01(inline_value, opt);
+      } else if (i + 1 < argc && argv[i + 1][0] != '-') {
         args.pq_enable = parse_bool01(argv[++i], opt);
       } else {
         args.pq_enable = true;
@@ -395,7 +439,9 @@ Args parse_args(int argc, char** argv) {
     } else if (opt == "--pq-code-path") {
       args.pq_code_path = require_value(opt);
     } else if (opt == "--adc-enable") {
-      if (i + 1 < argc && argv[i + 1][0] != '-') {
+      if (has_inline_value) {
+        args.adc_enable = parse_bool01(inline_value, opt);
+      } else if (i + 1 < argc && argv[i + 1][0] != '-') {
         args.adc_enable = parse_bool01(argv[++i], opt);
       } else {
         args.adc_enable = true;
@@ -403,16 +449,26 @@ Args parse_args(int argc, char** argv) {
     } else if (opt == "--rerank-topk") {
       args.rerank_topk = parse_size(require_value(opt), opt);
     } else if (opt == "--io-mode") {
-      args.io_mode = require_value(opt);
-    } else if (opt == "--io-batch-size") {
+      args.io_mode = normalize_io_backend(require_value(opt));
+    } else if (opt == "--io-backend" || opt == "--io_backend") {
+      args.io_mode = normalize_io_backend(require_value(opt));
+    } else if (opt == "--async-io" || opt == "--async_io") {
+      args.io_mode = parse_bool01(require_value(opt), opt) ? "io_uring" : "pread";
+    } else if (opt == "--io-batch-size" || opt == "--io_batch_size") {
       args.io_batch_size = parse_size(require_value(opt), opt);
-    } else if (opt == "--io-depth") {
+    } else if (opt == "--io-depth" || opt == "--io_depth") {
       args.io_depth = parse_size(require_value(opt), opt);
-    } else if (opt == "--prefetch-width") {
+    } else if (opt == "--prefetch-width" || opt == "--prefetch_width") {
       args.prefetch_width = parse_size(require_value(opt), opt);
-    } else if (opt == "--prefetch-policy") {
-      args.prefetch_policy = require_value(opt);
-    } else if (opt == "--page-dedup") {
+    } else if (opt == "--prefetch-depth" || opt == "--prefetch_depth") {
+      args.prefetch_depth = parse_size(require_value(opt), opt);
+    } else if (opt == "--prefetch-policy" ||
+               opt == "--prefetch_policy" ||
+               opt == "--prefetch") {
+      args.prefetch_policy = normalize_prefetch_policy(require_value(opt));
+    } else if (opt == "--page-dedup" ||
+               opt == "--dedup-pages" ||
+               opt == "--dedup_pages") {
       args.page_dedup = parse_bool01(require_value(opt), opt);
     } else if (opt == "--same-page-reuse") {
       args.same_page_reuse = parse_bool01(require_value(opt), opt);
@@ -630,6 +686,12 @@ Args parse_args(int argc, char** argv) {
       args.prefetch_policy != "frontier-next-hop") {
     throw std::runtime_error(
         "--prefetch-policy must be none, frontier, next-hop, or frontier-next-hop");
+  }
+  if (args.prefetch_depth == 0) {
+    throw std::runtime_error("--prefetch-depth must be positive");
+  }
+  if (args.prefetch_depth != 1) {
+    throw std::runtime_error("--prefetch-depth currently supports only 1");
   }
   if (args.memory_budget_ratio <= 0.0 || args.memory_budget_ratio > 1.0) {
     throw std::runtime_error("--memory-budget-ratio must be in (0, 1]");

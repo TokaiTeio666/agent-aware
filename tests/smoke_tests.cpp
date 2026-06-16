@@ -36,6 +36,18 @@ agentmem::VectorSet tiny_vectors() {
   return vectors;
 }
 
+agentmem::VectorSet patterned_vectors(std::size_t count, std::size_t dim) {
+  agentmem::VectorSet vectors(count, dim);
+  for (std::size_t row = 0; row < count; ++row) {
+    float* values = vectors.mutable_row(row);
+    for (std::size_t d = 0; d < dim; ++d) {
+      const int bucket = static_cast<int>((row * 37 + d * 17) % 101);
+      values[d] = static_cast<float>(bucket - 50) / 25.0f;
+    }
+  }
+  return vectors;
+}
+
 void test_brute_force() {
   const auto base = tiny_vectors();
   const agentmem::BruteForceIndex exact(base);
@@ -251,6 +263,64 @@ void test_packed_graph_search() {
   require(result.stats.expanded > 0, "packed graph expanded nodes");
 }
 
+void test_packed_graph_async_prefetch() {
+  std::filesystem::create_directories("build");
+  const std::string index_path = "build/p4_async_prefetch_smoke.idx";
+  std::filesystem::remove(index_path);
+
+  const auto base = patterned_vectors(64, 64);
+  agentmem::DiskGraphBuildConfig build;
+  build.degree = 8;
+  build.page_size = 4096;
+  build.build_policy = "exact";
+  build.packing_strategy = "bfs";
+  agentmem::PackedDiskGraphBuilder::build(base, index_path, build);
+
+  agentmem::PackedDiskGraphIndex sync_index(index_path);
+  sync_index.configure_io("pread", 1, 1);
+  agentmem::DiskGraphSearchConfig search;
+  search.top_k = 5;
+  search.search_width = 24;
+  search.entry_count = 4;
+  search.seed_ids = {0, 16, 32, 48};
+  search.prefetch_policy = "none";
+
+  const float* query = base.row(7);
+  const auto sync_result = sync_index.search_one(query, search);
+  require(sync_result.topk.size() == search.top_k,
+          "sync packed graph result count");
+
+  agentmem::PackedDiskGraphIndex async_index(index_path);
+  async_index.configure_io("io_uring", 4, 4);
+  if (!async_index.io_status().io_uring_enabled) {
+    std::filesystem::remove(index_path);
+    return;
+  }
+
+  search.prefetch_policy = "frontier-next-hop";
+  search.prefetch_width = 2;
+  search.page_dedup = true;
+  const auto async_result = async_index.search_one(query, search);
+  require(async_result.topk.size() == sync_result.topk.size(),
+          "async packed graph result count");
+  for (std::size_t i = 0; i < sync_result.topk.size(); ++i) {
+    require(async_result.topk[i].id == sync_result.topk[i].id,
+            "async prefetch preserves search result ids");
+  }
+  require(async_result.stats.io_prefetches > 0,
+          "async prefetch submits reads");
+  require(async_result.stats.io_submits == async_result.stats.io_completions,
+          "async submits complete");
+  require(async_result.stats.io_pending_pages_peak <=
+              async_index.io_status().depth,
+          "async pending depth is bounded");
+  require(async_result.stats.prefetch_submitted_pages >=
+              async_result.stats.prefetch_useful_pages,
+          "prefetch useful pages do not exceed submitted pages");
+
+  std::filesystem::remove(index_path);
+}
+
 }  // namespace
 
 int main() {
@@ -261,5 +331,6 @@ int main() {
   test_pq_adc();
   test_vamana_builder();
   test_packed_graph_search();
+  test_packed_graph_async_prefetch();
   return 0;
 }

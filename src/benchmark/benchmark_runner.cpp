@@ -1047,6 +1047,7 @@ agentmem::DiskGraphSearchResult search_graph_one_with_routing(
   per_query_config.adc_enable = args.adc_enable;
   per_query_config.rerank_topk = args.rerank_topk;
   per_query_config.prefetch_width = args.prefetch_width;
+  per_query_config.prefetch_depth = args.prefetch_depth;
   per_query_config.prefetch_policy = args.prefetch_policy;
   per_query_config.page_dedup = args.page_dedup;
   per_query_config.same_page_reuse = args.same_page_reuse;
@@ -1960,6 +1961,7 @@ RunOutput run_graph_with_index(Index& index, const Args& args,
   std::cout << "io_batch_size=" << io_status.batch_size << "\n";
   std::cout << "io_depth=" << io_status.depth << "\n";
   std::cout << "prefetch_width=" << args.prefetch_width << "\n";
+  std::cout << "prefetch_depth=" << args.prefetch_depth << "\n";
   std::cout << "prefetch_policy=" << args.prefetch_policy << "\n";
   std::cout << "page_dedup=" << (args.page_dedup ? 1 : 0) << "\n";
   std::cout << "same_page_reuse=" << (args.same_page_reuse ? 1 : 0)

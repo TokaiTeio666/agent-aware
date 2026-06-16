@@ -7,11 +7,17 @@ set(CMAKE_CXX_EXTENSIONS OFF)
 
 add_library(agentmem_core
   src/benchmark/metrics.cpp
+  src/core/async_page_reader.cpp
   src/core/brute_force.cpp
+  src/core/prefetch_planner.cpp
   src/core/pq_encoder.cpp
+  src/core/query_page_session.cpp
   src/data/dataset.cpp
   src/engine/storage_engine.cpp
+  src/graph/disk_graph_builder.cpp
   src/graph/disk_graph_index.cpp
+  src/graph/disk_page_codec.cpp
+  src/graph/naive_disk_graph_index.cpp
   src/graph/vamana_builder.cpp
   src/storage/disk_index_reader.cpp
   src/storage/disk_index_writer.cpp
@@ -75,6 +81,12 @@ add_executable(test_disk_index_rw
 )
 target_link_libraries(test_disk_index_rw PRIVATE agentmem_core)
 
+add_executable(test_cli_args
+  tests/test_cli_args.cpp
+  src/benchmark/cli_args.cpp
+)
+target_link_libraries(test_cli_args PRIVATE agentmem_core)
+
 add_executable(bench_sync_disk_read
   bench/bench_sync_disk_read.cpp
 )
@@ -86,6 +98,7 @@ if (MSVC)
   target_compile_options(agent_mem_io_tests PRIVATE /W4)
   target_compile_options(test_disk_record PRIVATE /W4)
   target_compile_options(test_disk_index_rw PRIVATE /W4)
+  target_compile_options(test_cli_args PRIVATE /W4)
   target_compile_options(bench_sync_disk_read PRIVATE /W4)
 else()
   target_compile_options(agentmem_core PRIVATE -Wall -Wextra -pedantic -O3)
@@ -93,5 +106,6 @@ else()
   target_compile_options(agent_mem_io_tests PRIVATE -Wall -Wextra -pedantic -O3)
   target_compile_options(test_disk_record PRIVATE -Wall -Wextra -pedantic -O3)
   target_compile_options(test_disk_index_rw PRIVATE -Wall -Wextra -pedantic -O3)
+  target_compile_options(test_cli_args PRIVATE -Wall -Wextra -pedantic -O3)
   target_compile_options(bench_sync_disk_read PRIVATE -Wall -Wextra -pedantic -O3)
 endif()

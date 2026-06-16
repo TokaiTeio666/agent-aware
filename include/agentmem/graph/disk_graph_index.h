@@ -9,6 +9,7 @@
 #include <unordered_map>
 #include <vector>
 
+#include "agentmem/core/io_stats.h"
 #include "agentmem/core/pq_encoder.h"
 #include "agentmem/core/types.h"
 
@@ -72,6 +73,7 @@ struct DiskGraphSearchConfig {
   bool adc_enable = false;
   std::size_t rerank_topk = 0;
   std::size_t prefetch_width = 0;
+  std::size_t prefetch_depth = 1;
   std::string prefetch_policy = "frontier-next-hop";
   bool page_dedup = true;
   bool same_page_reuse = true;
@@ -79,6 +81,7 @@ struct DiskGraphSearchConfig {
 };
 
 struct DiskGraphSearchStats {
+  P4IoStats p4_io;
   std::size_t node_reads = 0;
   std::size_t expanded = 0;
   std::size_t visited = 0;
@@ -120,16 +123,6 @@ struct DiskGraphSearchResult {
   DiskGraphSearchStats stats;
 };
 
-struct DiskGraphIoStatus {
-  std::string requested_mode = "pread";
-  std::string effective_mode = "pread";
-  std::string fallback_reason;
-  bool direct_enabled = false;
-  bool io_uring_enabled = false;
-  std::size_t batch_size = 1;
-  std::size_t depth = 1;
-};
-
 struct DiskGraphMetadata {
   std::uint64_t vector_count = 0;
   std::uint32_t dim = 0;
@@ -141,7 +134,9 @@ struct DiskGraphMetadata {
   std::uint32_t nodes_per_page = 1;
 };
 
-class DiskPageReader;
+class AsyncPageReader;
+class DiskPageCodec;
+class QueryPageSession;
 
 class NaiveDiskGraphBuilder {
  public:
@@ -177,7 +172,7 @@ class NaiveDiskGraphIndex {
 
   std::string path_;
   std::ifstream input_;
-  std::unique_ptr<DiskPageReader> page_reader_;
+  std::unique_ptr<AsyncPageReader> page_reader_;
   DiskGraphMetadata metadata_;
 };
 
@@ -233,9 +228,14 @@ class PackedDiskGraphIndex {
                                    const DiskGraphSearchConfig& config);
 
  private:
+  friend class DiskPageCodec;
+  friend class QueryPageSession;
+  struct SearchState;
+
   struct DiskNode {
     std::uint32_t id = 0;
     std::vector<std::uint32_t> neighbors;
+    std::vector<float> vector;
     std::size_t vector_offset = 0;
   };
 
@@ -283,10 +283,17 @@ class PackedDiskGraphIndex {
                                 const DiskNode& node) const;
   bool is_two_queue_policy() const;
   bool is_graph_aware_cache_policy() const;
+  std::unique_ptr<SearchState> initialize_search_state(
+      const float* query, const DiskGraphSearchConfig& config,
+      DiskGraphSearchResult& output);
+  void maybe_issue_prefetch(SearchState& state) const;
+  bool update_frontier(SearchState& state) const;
+  void expand_candidate(SearchState& state, const SearchResult& current);
+  void finalize_topk(SearchState& state);
 
   std::string path_;
   std::ifstream input_;
-  std::unique_ptr<DiskPageReader> page_reader_;
+  std::unique_ptr<AsyncPageReader> page_reader_;
   DiskGraphMetadata metadata_;
   std::vector<std::uint32_t> node_to_page_;
   std::string cache_policy_ = "none";

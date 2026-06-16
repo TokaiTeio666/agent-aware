@@ -88,6 +88,7 @@ struct Args {  // 汇总 CLI 参数，后续实验路径只传递这一份配置
   std::size_t io_batch_size = 1;
   std::size_t io_depth = 1;
   std::size_t prefetch_width = 0;
+  std::size_t prefetch_depth = 1;
   std::size_t memory_budget_bytes = 0;
   double memory_budget_ratio = 0.20;
   std::string pq_code_path;
