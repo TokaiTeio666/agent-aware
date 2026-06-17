@@ -360,19 +360,15 @@ make -j$(nproc)
 # 单元测试
 ./agent_mem_io_tests
 
-# SSD 模式基准测试
-./agent_mem_io_benchmark -n 10000 -q 100
-./agent_mem_io_benchmark -n 100000 -q 100
+# P5 混合读写 benchmark
+./bench_mixed_rw --num_operations 10000 --topk 10
+./bench_mixed_rw --num_operations 100000 --topk 10
 
-# 内存对照模式
-./agent_mem_io_benchmark -n 10000 -q 100 --no-disk
+# 自定义读写比例
+./bench_mixed_rw --num_operations 10000 --read_ratio 0.95 --write_ratio 0.05
 
-# 混合读写负载
-./agent_mem_io_benchmark -n 10000 -q 100 --mixed
-
-# SIFT1M 真实数据测试
-./scripts/download_sift1m.sh
-./agent_mem_io_benchmark --sift1m
+# 脚本入口
+../scripts/run_mixed_rw_bench.sh --num_operations 10000
 ```
 
 ### 10.5 最终验收标准

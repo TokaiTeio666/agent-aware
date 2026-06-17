@@ -1,8 +1,8 @@
 # Agent-Mem-IO Architecture
 
 This repository is organized around the layering described in `PROJECT_PLAN.md`.
-The first refactor pass keeps the existing benchmark behavior intact while
-making module ownership explicit.
+The current P5 pass keeps the core search modules intact while replacing the
+older benchmark executable with the dynamic mixed read/write benchmark.
 
 ## Layers
 
@@ -13,8 +13,8 @@ making module ownership explicit.
 | Graph | `include/agentmem/graph` | `src/graph` | DiskANN/Vamana-style build, packed node pages, PQ ADC, graph search |
 | Storage | `include/agentmem/storage` | `src/storage` | WAL replay, Delta indexes, LSM-style write-path primitives |
 | Engine | `include/agentmem/engine` | `src/engine` | Stable API facade for Agent and benchmark integration |
-| Benchmark | `include/agentmem/benchmark` | `src/benchmark` | Recall, latency, QPS, and reporting helpers |
-| App | none | `src/app` | CLI benchmark executable |
+| Dynamic | `include/agentmem/dynamic` | `src/dynamic` | P5 WAL, MemTable, SSTable, Compaction, Manifest, dynamic write manager |
+| Benchmark | none | `bench` | Standalone benchmark executables |
 
 Compatibility shim headers remain in `include/agentmem/*.h`, so older includes
 such as `agentmem/graph_index.h` still compile. New code should include the
@@ -22,25 +22,20 @@ layered paths directly.
 
 ## Current Execution Path
 
-1. `src/app/agent_mem_io_cli.cpp` parses benchmark options and loads data.
-2. Memory mode uses `agentmem::search_memory_fast` as the full-precision
-   correctness and performance upper-bound baseline. `exact` is retained as a
-   compatibility alias.
-3. Graph mode builds or opens the disk graph index through
+1. Static graph tests build or open the disk graph index through
    `agentmem::PackedDiskGraphIndex` or `agentmem::NaiveDiskGraphIndex`.
-4. Query routing, path cache, PQ ADC filtering, page cache, and disk I/O stats
+2. Query routing, path cache, PQ ADC filtering, page cache, and disk I/O stats
    are collected in the graph search result.
-5. Mixed workload mode appends writes to `agentmem::WalWriter`, searches Delta
-   indexes, merges Main+Delta Top-K results, and optionally runs StreamMerge.
-6. Memory-budget reporting estimates resident engine memory against the
-   `--memory-budget-ratio` or `--memory-budget-bytes` constraint.
+3. P5 dynamic writes flow through WAL, MemTable, SSTable, Manifest, optional
+   Compaction, and dynamic result merge.
+4. `bench_mixed_rw` runs the P5 mixed read/write validation path.
 
 ## Refactor Boundaries
 
-- `agentmem_core` is the library target used by both the benchmark executable
-  and tests.
-- `agent_mem_io_benchmark` emits the historical binary name `agentmem_flow` so
-  scripts do not need to change.
+- `agentmem_core` is the library target used by the benchmark executable and
+  tests.
+- The historical `agentmem_flow` benchmark target has been removed in favor of
+  `bench_mixed_rw`.
 - `agent_mem_io_tests` covers the lowest-risk correctness smoke checks:
   synthetic data, brute-force search, WAL replay, Delta search, PQ ADC, packed
   graph build/search, and the new StorageEngine facade.

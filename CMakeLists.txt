@@ -6,13 +6,18 @@ set(CMAKE_CXX_STANDARD_REQUIRED ON)
 set(CMAKE_CXX_EXTENSIONS OFF)
 
 add_library(agentmem_core
-  src/benchmark/metrics.cpp
   src/core/async_page_reader.cpp
   src/core/brute_force.cpp
   src/core/prefetch_planner.cpp
   src/core/pq_encoder.cpp
   src/core/query_page_session.cpp
   src/data/dataset.cpp
+  src/dynamic/compaction.cpp
+  src/dynamic/dynamic_write_manager.cpp
+  src/dynamic/manifest.cpp
+  src/dynamic/memtable.cpp
+  src/dynamic/sstable.cpp
+  src/dynamic/wal.cpp
   src/engine/storage_engine.cpp
   src/graph/disk_graph_builder.cpp
   src/graph/disk_graph_index.cpp
@@ -57,15 +62,6 @@ else()
   message(STATUS "liburing not found: io_uring backend will report fallback")
 endif()
 
-add_executable(agent_mem_io_benchmark
-  src/app/agent_mem_io_cli.cpp
-  src/benchmark/cli_args.cpp
-  src/benchmark/benchmark_runner.cpp
-)
-target_link_libraries(agent_mem_io_benchmark PRIVATE agentmem_core)
-set_target_properties(agent_mem_io_benchmark PROPERTIES
-  OUTPUT_NAME agentmem_flow)
-
 add_executable(agent_mem_io_tests
   tests/smoke_tests.cpp
 )
@@ -81,31 +77,56 @@ add_executable(test_disk_index_rw
 )
 target_link_libraries(test_disk_index_rw PRIVATE agentmem_core)
 
-add_executable(test_cli_args
-  tests/test_cli_args.cpp
-  src/benchmark/cli_args.cpp
+add_executable(test_memtable
+  tests/dynamic/test_memtable.cpp
 )
-target_link_libraries(test_cli_args PRIVATE agentmem_core)
+target_link_libraries(test_memtable PRIVATE agentmem_core)
 
-add_executable(bench_sync_disk_read
-  bench/bench_sync_disk_read.cpp
+add_executable(test_dynamic_wal
+  tests/dynamic/test_wal.cpp
 )
-target_link_libraries(bench_sync_disk_read PRIVATE agentmem_core)
+target_link_libraries(test_dynamic_wal PRIVATE agentmem_core)
+
+add_executable(test_sstable
+  tests/dynamic/test_sstable.cpp
+)
+target_link_libraries(test_sstable PRIVATE agentmem_core)
+
+add_executable(test_compaction
+  tests/dynamic/test_compaction.cpp
+)
+target_link_libraries(test_compaction PRIVATE agentmem_core)
+
+add_executable(test_dynamic_insert
+  tests/dynamic/test_dynamic_insert.cpp
+)
+target_link_libraries(test_dynamic_insert PRIVATE agentmem_core)
+
+add_executable(bench_mixed_rw
+  bench/bench_mixed_rw.cpp
+)
+target_link_libraries(bench_mixed_rw PRIVATE agentmem_core)
 
 if (MSVC)
   target_compile_options(agentmem_core PRIVATE /W4)
-  target_compile_options(agent_mem_io_benchmark PRIVATE /W4)
   target_compile_options(agent_mem_io_tests PRIVATE /W4)
   target_compile_options(test_disk_record PRIVATE /W4)
   target_compile_options(test_disk_index_rw PRIVATE /W4)
-  target_compile_options(test_cli_args PRIVATE /W4)
-  target_compile_options(bench_sync_disk_read PRIVATE /W4)
+  target_compile_options(test_memtable PRIVATE /W4)
+  target_compile_options(test_dynamic_wal PRIVATE /W4)
+  target_compile_options(test_sstable PRIVATE /W4)
+  target_compile_options(test_compaction PRIVATE /W4)
+  target_compile_options(test_dynamic_insert PRIVATE /W4)
+  target_compile_options(bench_mixed_rw PRIVATE /W4)
 else()
   target_compile_options(agentmem_core PRIVATE -Wall -Wextra -pedantic -O3)
-  target_compile_options(agent_mem_io_benchmark PRIVATE -Wall -Wextra -pedantic -O3)
   target_compile_options(agent_mem_io_tests PRIVATE -Wall -Wextra -pedantic -O3)
   target_compile_options(test_disk_record PRIVATE -Wall -Wextra -pedantic -O3)
   target_compile_options(test_disk_index_rw PRIVATE -Wall -Wextra -pedantic -O3)
-  target_compile_options(test_cli_args PRIVATE -Wall -Wextra -pedantic -O3)
-  target_compile_options(bench_sync_disk_read PRIVATE -Wall -Wextra -pedantic -O3)
+  target_compile_options(test_memtable PRIVATE -Wall -Wextra -pedantic -O3)
+  target_compile_options(test_dynamic_wal PRIVATE -Wall -Wextra -pedantic -O3)
+  target_compile_options(test_sstable PRIVATE -Wall -Wextra -pedantic -O3)
+  target_compile_options(test_compaction PRIVATE -Wall -Wextra -pedantic -O3)
+  target_compile_options(test_dynamic_insert PRIVATE -Wall -Wextra -pedantic -O3)
+  target_compile_options(bench_mixed_rw PRIVATE -Wall -Wextra -pedantic -O3)
 endif()

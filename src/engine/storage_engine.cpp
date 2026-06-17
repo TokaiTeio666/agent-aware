@@ -38,7 +38,14 @@ EngineSearchResult PackedGraphEngine::search_one(const float* query,
 
   const auto graph_result = index_.search_one(query, search);
   EngineSearchResult output;
-  output.topk = graph_result.topk;
+  if (config_.dynamic_manager) {
+    const auto delta_records = config_.dynamic_manager->search_delta_l2(
+        query, metadata().dim, top_k);
+    output.topk = dynamic::merge_base_and_delta_l2(
+        graph_result.topk, delta_records, query, metadata().dim, top_k);
+  } else {
+    output.topk = graph_result.topk;
+  }
   output.stats.used_graph_path = true;
   output.stats.graph = graph_result.stats;
   return output;

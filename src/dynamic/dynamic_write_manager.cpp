@@ -1,0 +1,372 @@
+#include "agentmem/dynamic/dynamic_write_manager.h"
+
+#include <algorithm>
+#include <cstring>
+#include <iomanip>
+#include <queue>
+#include <sstream>
+#include <unordered_map>
+#include <utility>
+
+#include "agentmem/core/brute_force.h"
+
+namespace agentmem::dynamic {
+namespace {
+
+std::string sstable_name(std::uint64_t sstable_id) {
+  std::ostringstream name;
+  name << "sst_" << std::setw(6) << std::setfill('0') << sstable_id;
+  return name.str();
+}
+
+std::vector<DynamicRecord> deduplicate_newest(
+    const std::vector<DynamicRecord>& records) {
+  std::unordered_map<NodeId, DynamicRecord> latest;
+  latest.reserve(records.size());
+  for (const auto& record : records) {
+    const auto found = latest.find(record.node_id);
+    if (found == latest.end() ||
+        record.sequence_id > found->second.sequence_id) {
+      latest[record.node_id] = record;
+    }
+  }
+
+  std::vector<DynamicRecord> output;
+  output.reserve(latest.size());
+  for (const auto& item : latest) {
+    output.push_back(item.second);
+  }
+  std::sort(output.begin(), output.end(),
+            [](const DynamicRecord& lhs, const DynamicRecord& rhs) {
+              return lhs.node_id < rhs.node_id;
+            });
+  return output;
+}
+
+struct ScoredRecord {
+  DynamicRecord record;
+  float distance = 0.0f;
+};
+
+bool scored_less(const ScoredRecord& lhs, const ScoredRecord& rhs) {
+  if (lhs.distance == rhs.distance) {
+    return lhs.record.node_id < rhs.record.node_id;
+  }
+  return lhs.distance < rhs.distance;
+}
+
+bool search_result_less(const SearchResult& lhs, const SearchResult& rhs) {
+  if (lhs.distance == rhs.distance) {
+    return lhs.id < rhs.id;
+  }
+  return lhs.distance < rhs.distance;
+}
+
+}  // namespace
+
+DynamicWriteManager::DynamicWriteManager(DynamicWriteOptions options)
+    : options_(std::move(options)),
+      memtable_(std::make_unique<MemTable>(options_.memtable_flush_bytes)) {}
+
+bool DynamicWriteManager::open() {
+  std::lock_guard<std::mutex> lock(mutex_);
+  if (opened_) {
+    return true;
+  }
+
+  std::error_code error;
+  std::filesystem::create_directories(options_.dynamic_dir, error);
+  if (error) {
+    return false;
+  }
+  std::filesystem::create_directories(wal_dir(), error);
+  if (error) {
+    return false;
+  }
+  std::filesystem::create_directories(sstable_dir(), error);
+  if (error) {
+    return false;
+  }
+
+  Manifest manifest(manifest_path());
+  if (!manifest.load(manifest_)) {
+    return false;
+  }
+
+  sstables_.clear();
+  std::uint64_t max_loaded_sequence = 0;
+  for (const auto& entry : manifest_.sstables) {
+    const auto base_path =
+        entry.base_path.is_absolute()
+            ? entry.base_path
+            : options_.dynamic_dir / entry.base_path;
+    auto reader = std::make_shared<SSTableReader>(base_path);
+    if (!reader->open()) {
+      return false;
+    }
+    max_loaded_sequence =
+        std::max(max_loaded_sequence, reader->max_sequence_id());
+    sstables_.push_back(std::move(reader));
+  }
+
+  memtable_ = std::make_unique<MemTable>(options_.memtable_flush_bytes);
+  if (options_.enable_wal) {
+    std::uint64_t max_wal_sequence = 0;
+    for (const auto& record : WalReader(wal_path()).replay()) {
+      memtable_->insert(record);
+      max_wal_sequence = std::max(max_wal_sequence, record.sequence_id);
+    }
+    max_loaded_sequence = std::max(max_loaded_sequence, max_wal_sequence);
+    manifest_.next_sequence_id =
+        std::max(manifest_.next_sequence_id, max_loaded_sequence + 1);
+    wal_writer_ = std::make_unique<WalWriter>(wal_path());
+    if (!wal_writer_->sync()) {
+      return false;
+    }
+  } else {
+    manifest_.next_sequence_id =
+        std::max(manifest_.next_sequence_id, max_loaded_sequence + 1);
+  }
+
+  opened_ = true;
+  return true;
+}
+
+bool DynamicWriteManager::insert(NodeId node_id, const float* vector,
+                                 std::uint32_t dim) {
+  if (vector == nullptr || dim == 0) {
+    return false;
+  }
+
+  std::lock_guard<std::mutex> lock(mutex_);
+  if (!opened_) {
+    return false;
+  }
+
+  DynamicRecord record;
+  record.sequence_id = manifest_.next_sequence_id;
+  record.node_id = node_id;
+  record.dim = dim;
+  record.vector.resize(dim);
+  std::memcpy(record.vector.data(), vector, dim * sizeof(float));
+
+  if (options_.enable_wal) {
+    if (!wal_writer_ || !wal_writer_->append(record)) {
+      return false;
+    }
+  }
+
+  if (!memtable_->insert(record)) {
+    return false;
+  }
+  ++manifest_.next_sequence_id;
+
+  if (options_.enable_auto_flush && memtable_->should_flush()) {
+    return flush_locked();
+  }
+  return true;
+}
+
+bool DynamicWriteManager::flush() {
+  std::lock_guard<std::mutex> lock(mutex_);
+  if (!opened_) {
+    return false;
+  }
+  return flush_locked();
+}
+
+bool DynamicWriteManager::flush_locked() {
+  const auto snapshot = memtable_->snapshot();
+  if (snapshot.empty()) {
+    return true;
+  }
+
+  const auto sstable_id = manifest_.next_sstable_id;
+  SSTableWriter writer(sstable_dir(), sstable_id, 0);
+  if (!writer.write(snapshot)) {
+    return false;
+  }
+
+  const auto relative_base =
+      std::filesystem::path("sstable") / sstable_name(sstable_id);
+  ManifestData next_manifest = manifest_;
+  next_manifest.sstables.push_back(
+      ManifestSSTableEntry{sstable_id, 0, relative_base});
+  ++next_manifest.next_sstable_id;
+  next_manifest.wal_checkpoint = 0;
+
+  Manifest manifest(manifest_path());
+  if (!manifest.save(next_manifest)) {
+    return false;
+  }
+
+  auto reader = std::make_shared<SSTableReader>(sstable_dir() /
+                                                sstable_name(sstable_id));
+  if (!reader->open()) {
+    return false;
+  }
+
+  manifest_ = std::move(next_manifest);
+  sstables_.push_back(std::move(reader));
+  memtable_->clear();
+  return rotate_wal_locked();
+}
+
+bool DynamicWriteManager::get(NodeId node_id, DynamicRecord& out) const {
+  std::lock_guard<std::mutex> lock(mutex_);
+  if (!opened_) {
+    return false;
+  }
+
+  DynamicRecord best;
+  bool found = false;
+  if (memtable_->get(node_id, best)) {
+    found = true;
+  }
+  for (const auto& table : sstables_) {
+    DynamicRecord candidate;
+    if (table->get(node_id, candidate) &&
+        (!found || candidate.sequence_id > best.sequence_id)) {
+      best = std::move(candidate);
+      found = true;
+    }
+  }
+  if (!found || best.deleted) {
+    return false;
+  }
+  out = std::move(best);
+  return true;
+}
+
+std::vector<DynamicRecord> DynamicWriteManager::collect_all_delta_records()
+    const {
+  std::lock_guard<std::mutex> lock(mutex_);
+  std::vector<DynamicRecord> records;
+  if (!opened_) {
+    return records;
+  }
+
+  auto mem_records = memtable_->snapshot();
+  records.insert(records.end(), mem_records.begin(), mem_records.end());
+  for (const auto& table : sstables_) {
+    auto table_records = table->scan_all();
+    records.insert(records.end(), table_records.begin(), table_records.end());
+  }
+  return deduplicate_newest(records);
+}
+
+std::vector<DynamicRecord> DynamicWriteManager::search_delta_l2(
+    const float* query, std::uint32_t dim, std::size_t topk) const {
+  if (query == nullptr || dim == 0 || topk == 0) {
+    return {};
+  }
+
+  const auto records = collect_all_delta_records();
+  std::vector<ScoredRecord> scored;
+  scored.reserve(records.size());
+  for (const auto& record : records) {
+    if (record.deleted || record.dim != dim || record.vector.size() != dim) {
+      continue;
+    }
+    scored.push_back(
+        ScoredRecord{record, squared_l2(query, record.vector.data(), dim)});
+  }
+
+  std::sort(scored.begin(), scored.end(), scored_less);
+  if (scored.size() > topk) {
+    scored.resize(topk);
+  }
+
+  std::vector<DynamicRecord> output;
+  output.reserve(scored.size());
+  for (auto& item : scored) {
+    output.push_back(std::move(item.record));
+  }
+  return output;
+}
+
+bool DynamicWriteManager::close() {
+  std::lock_guard<std::mutex> lock(mutex_);
+  bool ok = true;
+  if (opened_) {
+    Manifest manifest(manifest_path());
+    ok = manifest.save(manifest_) && ok;
+  }
+  if (wal_writer_) {
+    ok = wal_writer_->close() && ok;
+    wal_writer_.reset();
+  }
+  opened_ = false;
+  return ok;
+}
+
+bool DynamicWriteManager::rotate_wal_locked() {
+  if (!options_.enable_wal) {
+    return true;
+  }
+  if (wal_writer_ && !wal_writer_->close()) {
+    return false;
+  }
+  wal_writer_.reset();
+
+  std::error_code error;
+  std::filesystem::remove(wal_path(), error);
+  wal_writer_ = std::make_unique<WalWriter>(wal_path());
+  return wal_writer_->sync();
+}
+
+std::filesystem::path DynamicWriteManager::manifest_path() const {
+  return options_.dynamic_dir / "manifest.json";
+}
+
+std::filesystem::path DynamicWriteManager::wal_dir() const {
+  return options_.dynamic_dir / "wal";
+}
+
+std::filesystem::path DynamicWriteManager::wal_path() const {
+  return wal_dir() / "wal.log";
+}
+
+std::filesystem::path DynamicWriteManager::sstable_dir() const {
+  return options_.dynamic_dir / "sstable";
+}
+
+std::vector<SearchResult> merge_base_and_delta_l2(
+    const std::vector<SearchResult>& base_results,
+    const std::vector<DynamicRecord>& delta_records, const float* query,
+    std::uint32_t dim, std::size_t topk) {
+  if (query == nullptr || dim == 0 || topk == 0) {
+    return {};
+  }
+
+  std::unordered_map<NodeId, SearchResult> by_id;
+  by_id.reserve(base_results.size() + delta_records.size());
+  for (const auto& result : base_results) {
+    by_id[result.id] = result;
+  }
+
+  for (const auto& record : delta_records) {
+    if (record.deleted) {
+      by_id.erase(record.node_id);
+      continue;
+    }
+    if (record.dim != dim || record.vector.size() != dim) {
+      continue;
+    }
+    by_id[record.node_id] =
+        SearchResult{record.node_id, squared_l2(query, record.vector.data(), dim)};
+  }
+
+  std::vector<SearchResult> merged;
+  merged.reserve(by_id.size());
+  for (const auto& item : by_id) {
+    merged.push_back(item.second);
+  }
+  std::sort(merged.begin(), merged.end(), search_result_less);
+  if (merged.size() > topk) {
+    merged.resize(topk);
+  }
+  return merged;
+}
+
+}  // namespace agentmem::dynamic

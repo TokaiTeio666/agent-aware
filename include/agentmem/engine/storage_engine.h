@@ -2,11 +2,13 @@
 
 #include <cstddef>
 #include <cstdint>
+#include <memory>
 #include <string>
 #include <vector>
 
 #include "agentmem/core/brute_force.h"
 #include "agentmem/core/types.h"
+#include "agentmem/dynamic/dynamic_write_manager.h"
 #include "agentmem/graph/disk_graph_index.h"
 
 namespace agentmem {
@@ -52,6 +54,7 @@ struct PackedGraphEngineConfig {
   bool protect_hot_pages = false;
   std::size_t hot_degree_threshold = 0;
   DiskGraphSearchConfig search;
+  std::shared_ptr<dynamic::DynamicWriteManager> dynamic_manager;
 };
 
 class PackedGraphEngine final : public StorageEngine {

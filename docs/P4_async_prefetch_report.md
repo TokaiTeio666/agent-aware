@@ -1,5 +1,9 @@
 # P4 Async Prefetch Report
 
+> Historical note: this report references the older `agentmem_flow` benchmark
+> executable, which was removed during P5 cleanup. Use the remaining smoke tests
+> and `bench_mixed_rw` for current validation.
+
 ## Scope
 
 This report closes the P4 async-prefetch implementation pass for the SSD packed
@@ -41,7 +45,6 @@ Commands run in WSL ext4:
 cmake -S . -B build
 cmake --build build -j2
 ./build/agent_mem_io_tests
-./build/test_cli_args
 ./build/test_disk_index_rw
 ./build/test_disk_record
 ```
@@ -50,19 +53,8 @@ All tests passed. `agent_mem_io_tests` includes an `io_uring` packed-graph smoke
 that compares `pread` vs. `io_uring + frontier-next-hop` result ids when the
 runtime reports `io_uring_enabled=1`.
 
-The plan-style CLI also ran successfully:
-
-```bash
-./build/agentmem_flow \
-  --engine=graph --synthetic --base-count=200 --query-count=20 \
-  --dim=32 --clusters=8 --build-index --index=build/p4_plan_smoke.idx \
-  --layout=packed --graph-degree=8 --search-width=24 --entry-count=4 \
-  --async_io=1 --io_backend=uring --io_depth=4 --io_batch_size=4 \
-  --prefetch=topology --prefetch_width=2 --prefetch_depth=1 \
-  --dedup_pages=1 --allow-io-fallback --run-type=dev
-```
-
-Key smoke output:
+At the time of P4, the removed legacy CLI produced this representative smoke
+output:
 
 | Metric | Value |
 |---|---:|
