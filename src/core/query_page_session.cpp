@@ -175,6 +175,162 @@ const QueryPageSession::Node& QueryPageSession::get_node(
   return found->second;
 }
 
+std::vector<std::uint32_t> QueryPageSession::collect_missing_pages(
+    const std::vector<std::uint32_t>& page_ids) const {
+  std::vector<std::uint32_t> missing;
+  missing.reserve(page_ids.size());
+  std::unordered_set<std::uint32_t> seen;
+  seen.reserve(page_ids.size());
+
+  for (const auto page_id : page_ids) {
+    if (page_id >= index_.metadata_.page_count) {
+      throw std::runtime_error("Packed page id out of range");
+    }
+    if (!seen.insert(page_id).second) {
+      continue;
+    }
+    if (page_ready_in_session(page_id) || page_in_cache(page_id) ||
+        pending_pages_.find(page_id) != pending_pages_.end()) {
+      continue;
+    }
+    missing.push_back(page_id);
+  }
+  return missing;
+}
+
+void QueryPageSession::ensure_pages_loaded_batch(
+    const std::vector<std::uint32_t>& page_ids) {
+  if (page_ids.empty()) {
+    return;
+  }
+
+  if (finished_) {
+    for (const auto page_id : page_ids) {
+      (void)get_or_load_page(page_id);
+    }
+    return;
+  }
+
+  for (const auto page_id : page_ids) {
+    if (page_id >= index_.metadata_.page_count) {
+      throw std::runtime_error("Packed page id out of range");
+    }
+  }
+
+  stats_.page_requests += page_ids.size();
+  stats_.page_requests_before_dedup += page_ids.size();
+  stats_.page_dedup_requests += page_ids.size();
+
+  std::vector<std::uint32_t> unique_pages;
+  unique_pages.reserve(page_ids.size());
+  std::unordered_set<std::uint32_t> seen;
+  seen.reserve(page_ids.size());
+  for (const auto page_id : page_ids) {
+    visited_pages_.insert(page_id);
+    if (seen.insert(page_id).second) {
+      unique_pages.push_back(page_id);
+    }
+  }
+
+  const std::size_t duplicate_count = page_ids.size() - unique_pages.size();
+  if (duplicate_count > 0) {
+    stats_.page_dedup_hits += duplicate_count;
+    stats_.duplicate_pages_eliminated += duplicate_count;
+    stats_.p4_io.dedup_hits += duplicate_count;
+  }
+
+  std::vector<std::uint32_t> missing_pages;
+  missing_pages.reserve(unique_pages.size());
+  for (const auto page_id : unique_pages) {
+    if (materialize_available_page(page_id)) {
+      continue;
+    }
+    if (pending_pages_.find(page_id) != pending_pages_.end()) {
+      wait_for_prefetch_page(page_id);
+      if (materialize_available_page(page_id)) {
+        continue;
+      }
+    }
+    missing_pages.push_back(page_id);
+  }
+
+  if (async_prefetch_) {
+    while (!pending_pages_.empty()) {
+      (void)harvest_prefetch(true);
+    }
+
+    std::vector<std::uint32_t> still_missing;
+    still_missing.reserve(missing_pages.size());
+    for (const auto page_id : missing_pages) {
+      if (!materialize_available_page(page_id)) {
+        still_missing.push_back(page_id);
+      }
+    }
+    missing_pages.swap(still_missing);
+  }
+
+  if (missing_pages.empty()) {
+    return;
+  }
+
+  const std::size_t chunk_limit =
+      index_.page_reader_->async_enabled()
+          ? std::max<std::size_t>(1, index_.page_reader_->max_pending_reads())
+          : missing_pages.size();
+
+  for (std::size_t begin = 0; begin < missing_pages.size();
+       begin += chunk_limit) {
+    const std::size_t end =
+        std::min(begin + chunk_limit, missing_pages.size());
+    std::vector<AsyncPageReader::ReadRequest> requests;
+    requests.reserve(end - begin);
+    for (std::size_t i = begin; i < end; ++i) {
+      const std::uint32_t page_id = missing_pages[i];
+      ++stats_.page_cache_misses;
+      ++stats_.node_reads;
+      ++stats_.page_requests_after_dedup;
+      requests.push_back(AsyncPageReader::ReadRequest{
+          page_id, page_offset(page_id), index_.metadata_.page_size});
+    }
+
+    const auto submitted = index_.page_reader_->batch_submit(requests, stats_);
+    std::unordered_map<std::uint64_t, std::uint32_t> submitted_pages;
+    submitted_pages.reserve(submitted.size());
+    for (const auto& read : submitted) {
+      submitted_pages.emplace(read.token, read.page_id);
+    }
+
+    std::size_t remaining = submitted_pages.size();
+    while (remaining > 0) {
+      AsyncPageReader::CompletedRead completed;
+      if (!index_.page_reader_->reap_async_read(true, completed, stats_)) {
+        throw std::runtime_error("Failed to wait for packed graph page batch");
+      }
+
+      const auto token = submitted_pages.find(completed.token);
+      if (token == submitted_pages.end()) {
+        throw std::runtime_error("Packed graph batch page token is unknown");
+      }
+      const std::uint32_t page_id = token->second;
+      submitted_pages.erase(token);
+
+      Page decoded = index_.decode_page(page_id, std::move(completed.data));
+      index_.record_hub_cache_access(index_.page_is_hub(decoded), false,
+                                     stats_);
+      if (index_.cache_enabled()) {
+        const Page& cached_page =
+            index_.store_cached_page(std::move(decoded), stats_);
+        materialize_page(cached_page);
+      } else {
+        auto inserted = owned_pages_.insert_or_assign(page_id,
+                                                      std::move(decoded));
+        materialize_page(inserted.first->second);
+      }
+      --remaining;
+    }
+  }
+}
+
 bool QueryPageSession::is_node_materialized(std::uint32_t node_id) const {
   return local_nodes_.find(node_id) != local_nodes_.end();
 }
@@ -320,6 +476,36 @@ void QueryPageSession::apply_prefetch_plan_stats(
   stats_.page_dedup_requests += stats.dedup_requests;
   stats_.page_dedup_hits += stats.dedup_hits;
   stats_.p4_io.dedup_hits += stats.dedup_hits;
+}
+
+bool QueryPageSession::page_ready_in_session(std::uint32_t page_id) const {
+  return materialized_pages_.find(page_id) != materialized_pages_.end() ||
+         owned_pages_.find(page_id) != owned_pages_.end() ||
+         ready_prefetch_pages_.find(page_id) != ready_prefetch_pages_.end();
+}
+
+bool QueryPageSession::materialize_available_page(std::uint32_t page_id) {
+  const auto owned = owned_pages_.find(page_id);
+  if (owned != owned_pages_.end()) {
+    materialize_page(owned->second);
+    return true;
+  }
+
+  if (materialized_pages_.find(page_id) != materialized_pages_.end()) {
+    return true;
+  }
+
+  if (const Page* cached = try_get_cached_page(page_id)) {
+    materialize_page(*cached);
+    return true;
+  }
+
+  if (const Page* ready = take_ready_prefetch_page(page_id)) {
+    materialize_page(*ready);
+    return true;
+  }
+
+  return false;
 }
 
 void QueryPageSession::materialize_page(const Page& page) {

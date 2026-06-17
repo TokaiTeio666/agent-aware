@@ -236,6 +236,7 @@ class LibUring {
     ++stats.io_submits;
     ++stats.p4_io.async_submits;
     stats.io_submit_syscalls += submit_syscalls;
+    stats.uring_submit_count += submit_syscalls;
 
     Completion completion;
     do {
@@ -246,6 +247,7 @@ class LibUring {
 
     ++stats.io_completions;
     ++stats.p4_io.async_completions;
+    ++stats.uring_cqe_count;
     const int result = completion.result;
     if (result != static_cast<int>(bytes)) {
       reason = result < 0
@@ -443,17 +445,11 @@ struct AsyncPageReader::Impl {
       return submitted;
     }
 
-    std::size_t queued_in_batch = 0;
     for (const auto& request : read_requests) {
       const std::uint64_t token =
           start_async_read(request.offset, request.bytes, stats);
       submitted.push_back(AsyncPageReader::SubmittedRead{request.page_id,
                                                          token});
-      ++queued_in_batch;
-      if (queued_in_batch >= status.batch_size) {
-        submit_async_reads(stats);
-        queued_in_batch = 0;
-      }
     }
     submit_async_reads(stats);
     return submitted;
@@ -471,6 +467,7 @@ struct AsyncPageReader::Impl {
       throw std::runtime_error("Graph page async submit failed: " + reason);
     }
     stats.io_submit_syscalls += submit_syscalls;
+    stats.uring_submit_count += submit_syscalls;
 #else
     (void)stats;
 #endif
@@ -508,6 +505,7 @@ struct AsyncPageReader::Impl {
     async_buffers.erase(found);
     ++stats.io_completions;
     ++stats.p4_io.async_completions;
+    ++stats.uring_cqe_count;
 
     if (completion.result != static_cast<int>(buffer.bytes)) {
       const std::string failure =

@@ -187,6 +187,10 @@ DiskGraphSearchResult NaiveDiskGraphIndex::search_one(
       config.entry_count == 0) {
     throw std::runtime_error("Graph search top_k, search_width, and entry_count must be positive");
   }
+  const std::size_t effective_beam_width =
+      std::clamp(config.beam_width == 0 ? config.search_width
+                                         : config.beam_width,
+                 std::size_t{1}, config.search_width);
 
   DiskGraphSearchResult output;
   std::unordered_set<std::uint32_t> visited;
@@ -292,30 +296,43 @@ DiskGraphSearchResult NaiveDiskGraphIndex::search_one(
   }
 
   while (!candidates.empty() && output.stats.expanded < config.search_width) {
-    if (config.adaptive_early_stop &&
-        output.stats.expanded >= config.min_expansions &&
-        stagnant_expansions >= config.early_stop_patience) {
-      break;
-    }
-    const SearchResult current = candidates.top();
-    if (should_stop(current)) {
-      break;
-    }
-    candidates.pop();
-    const DiskNode& node = load_node(current.id);
-    ++output.stats.expanded;
-
-    for (const auto neighbor_id : node.neighbors) {
-      if (neighbor_id >= metadata_.vector_count ||
-          !visited.insert(neighbor_id).second) {
-        continue;
+    std::size_t expanded_this_round = 0;
+    while (!candidates.empty() && output.stats.expanded < config.search_width &&
+           expanded_this_round < effective_beam_width) {
+      if (config.adaptive_early_stop &&
+          output.stats.expanded >= config.min_expansions &&
+          stagnant_expansions >= config.early_stop_patience) {
+        candidates = {};
+        break;
       }
-      const float distance = candidate_distance(neighbor_id);
-      const SearchResult candidate{neighbor_id, distance};
-      candidates.push(candidate);
-      add_best(candidate);
+      const SearchResult current = candidates.top();
+      if (should_stop(current)) {
+        candidates = {};
+        break;
+      }
+      candidates.pop();
+      const DiskNode& node = load_node(current.id);
+      ++output.stats.expanded;
+
+      for (const auto neighbor_id : node.neighbors) {
+        if (neighbor_id >= metadata_.vector_count ||
+            !visited.insert(neighbor_id).second) {
+          continue;
+        }
+        const float distance = candidate_distance(neighbor_id);
+        const SearchResult candidate{neighbor_id, distance};
+        candidates.push(candidate);
+        add_best(candidate);
+      }
+      update_adaptive_stop();
+      ++expanded_this_round;
     }
-    update_adaptive_stop();
+    if (expanded_this_round > 0) {
+      ++output.stats.batch_count;
+      output.stats.batch_expanded += expanded_this_round;
+      output.stats.max_batch_size =
+          std::max(output.stats.max_batch_size, expanded_this_round);
+    }
   }
 
   output.stats.visited = visited.size();

@@ -31,6 +31,9 @@ class QueryPageSession {
   const Page& get_or_load_page(std::uint32_t page_id);
   const Page* try_get_cached_page(std::uint32_t page_id);
   const Node& get_node(std::uint32_t node_id, bool count_same_page_reuse);
+  std::vector<std::uint32_t> collect_missing_pages(
+      const std::vector<std::uint32_t>& page_ids) const;
+  void ensure_pages_loaded_batch(const std::vector<std::uint32_t>& page_ids);
 
   bool is_node_materialized(std::uint32_t node_id) const;
   std::uint32_t page_for_node(std::uint32_t node_id) const;
@@ -54,6 +57,8 @@ class QueryPageSession {
       std::uint32_t page_id) const;
   void apply_prefetch_plan_stats(const PrefetchPlanner::PlanStats& stats);
 
+  bool page_ready_in_session(std::uint32_t page_id) const;
+  bool materialize_available_page(std::uint32_t page_id);
   void materialize_page(const Page& page);
   bool harvest_prefetch(bool wait);
   void wait_for_prefetch_page(std::uint32_t page_id);

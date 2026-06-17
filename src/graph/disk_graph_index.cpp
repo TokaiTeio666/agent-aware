@@ -657,6 +657,8 @@ PackedDiskGraphIndex::initialize_search_state(
           : config.seed_ids;
 
   state->session.submit_next_hop_prefetch(entries, state->visited);
+  std::vector<std::uint32_t> accepted_entries;
+  accepted_entries.reserve(entries.size());
   for (const auto entry : entries) {
     if (entry >= metadata_.vector_count) {
       continue;
@@ -664,6 +666,19 @@ PackedDiskGraphIndex::initialize_search_state(
     if (!state->visited.insert(entry).second) {
       continue;
     }
+    accepted_entries.push_back(entry);
+  }
+
+  if (state->adc_table.empty()) {
+    std::vector<std::uint32_t> entry_pages;
+    entry_pages.reserve(accepted_entries.size());
+    for (const auto entry : accepted_entries) {
+      entry_pages.push_back(state->session.page_for_node(entry));
+    }
+    state->session.ensure_pages_loaded_batch(entry_pages);
+  }
+
+  for (const auto entry : accepted_entries) {
     const float distance = state->candidate_distance(entry);
     const SearchResult result{entry, distance};
     state->candidates.push(result);
@@ -723,6 +738,49 @@ void PackedDiskGraphIndex::expand_candidate(SearchState& state,
   state.update_adaptive_stop();
 }
 
+void PackedDiskGraphIndex::expand_candidate_batch(
+    SearchState& state, const std::vector<SearchResult>& batch) {
+  std::vector<std::vector<std::uint32_t>> new_neighbors_by_candidate;
+  new_neighbors_by_candidate.reserve(batch.size());
+  std::vector<std::uint32_t> neighbor_pages;
+
+  for (const auto& current : batch) {
+    const DiskNode& node = state.load_node(current.id);
+    (void)state.session.pin_page(state.session.page_for_node(current.id));
+    ++state.output.stats.expanded;
+
+    state.session.submit_next_hop_prefetch(node.neighbors, state.visited);
+
+    std::vector<std::uint32_t> new_neighbors;
+    new_neighbors.reserve(node.neighbors.size());
+    for (const auto neighbor_id : node.neighbors) {
+      if (neighbor_id >= metadata_.vector_count ||
+          !state.visited.insert(neighbor_id).second) {
+        continue;
+      }
+      new_neighbors.push_back(neighbor_id);
+      if (state.adc_table.empty()) {
+        neighbor_pages.push_back(state.session.page_for_node(neighbor_id));
+      }
+    }
+    new_neighbors_by_candidate.push_back(std::move(new_neighbors));
+  }
+
+  if (state.adc_table.empty()) {
+    state.session.ensure_pages_loaded_batch(neighbor_pages);
+  }
+
+  for (const auto& new_neighbors : new_neighbors_by_candidate) {
+    for (const auto neighbor_id : new_neighbors) {
+      const float distance = state.candidate_distance(neighbor_id);
+      const SearchResult candidate{neighbor_id, distance};
+      state.candidates.push(candidate);
+      state.add_best(candidate);
+    }
+    state.update_adaptive_stop();
+  }
+}
+
 void PackedDiskGraphIndex::finalize_topk(SearchState& state) {
   state.session.finish_query();
 
@@ -757,18 +815,45 @@ DiskGraphSearchResult PackedDiskGraphIndex::search_one(
       config.entry_count == 0) {
     throw std::runtime_error("Packed graph search top_k, search_width, and entry_count must be positive");
   }
+  const std::size_t effective_beam_width =
+      std::clamp(config.beam_width == 0 ? config.search_width
+                                         : config.beam_width,
+                 std::size_t{1}, config.search_width);
 
   DiskGraphSearchResult output;
   auto state = initialize_search_state(query, config, output);
   while (!state->candidates.empty() &&
          output.stats.expanded < config.search_width) {
     maybe_issue_prefetch(*state);
-    if (update_frontier(*state)) {
+    std::vector<SearchResult> batch;
+    batch.reserve(effective_beam_width);
+    while (!state->candidates.empty() &&
+           output.stats.expanded + batch.size() < config.search_width &&
+           batch.size() < effective_beam_width) {
+      if (update_frontier(*state)) {
+        break;
+      }
+      const SearchResult current = state->candidates.top();
+      state->candidates.pop();
+      batch.push_back(current);
+    }
+    if (batch.empty()) {
       break;
     }
-    const SearchResult current = state->candidates.top();
-    state->candidates.pop();
-    expand_candidate(*state, current);
+
+    std::vector<std::uint32_t> page_ids;
+    page_ids.reserve(batch.size());
+    for (const auto& candidate : batch) {
+      page_ids.push_back(state->session.page_for_node(candidate.id));
+    }
+    state->session.ensure_pages_loaded_batch(page_ids);
+
+    ++output.stats.batch_count;
+    output.stats.batch_expanded += batch.size();
+    output.stats.max_batch_size =
+        std::max(output.stats.max_batch_size, batch.size());
+
+    expand_candidate_batch(*state, batch);
   }
   finalize_topk(*state);
   return output;

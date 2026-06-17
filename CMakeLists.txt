@@ -107,6 +107,11 @@ add_executable(bench_mixed_rw
 )
 target_link_libraries(bench_mixed_rw PRIVATE agentmem_core)
 
+add_executable(agentmem_flow
+  bench/agentmem_flow.cpp
+)
+target_link_libraries(agentmem_flow PRIVATE agentmem_core)
+
 if (MSVC)
   target_compile_options(agentmem_core PRIVATE /W4)
   target_compile_options(agent_mem_io_tests PRIVATE /W4)
@@ -118,6 +123,7 @@ if (MSVC)
   target_compile_options(test_compaction PRIVATE /W4)
   target_compile_options(test_dynamic_insert PRIVATE /W4)
   target_compile_options(bench_mixed_rw PRIVATE /W4)
+  target_compile_options(agentmem_flow PRIVATE /W4)
 else()
   target_compile_options(agentmem_core PRIVATE -Wall -Wextra -pedantic -O3)
   target_compile_options(agent_mem_io_tests PRIVATE -Wall -Wextra -pedantic -O3)
@@ -129,4 +135,5 @@ else()
   target_compile_options(test_compaction PRIVATE -Wall -Wextra -pedantic -O3)
   target_compile_options(test_dynamic_insert PRIVATE -Wall -Wextra -pedantic -O3)
   target_compile_options(bench_mixed_rw PRIVATE -Wall -Wextra -pedantic -O3)
+  target_compile_options(agentmem_flow PRIVATE -Wall -Wextra -pedantic -O3)
 endif()

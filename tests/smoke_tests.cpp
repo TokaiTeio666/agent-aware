@@ -263,6 +263,101 @@ void test_packed_graph_search() {
   require(result.stats.expanded > 0, "packed graph expanded nodes");
 }
 
+void test_packed_graph_beam_batching() {
+  std::filesystem::create_directories("build");
+  const std::string index_path = "build/beam_batching_smoke.idx";
+  std::filesystem::remove(index_path);
+
+  const auto base = patterned_vectors(32, 8);
+  agentmem::DiskGraphBuildConfig build;
+  build.degree = 4;
+  build.page_size = 4096;
+  build.build_policy = "exact";
+  build.packing_strategy = "bfs";
+  agentmem::PackedDiskGraphBuilder::build(base, index_path, build);
+
+  agentmem::PackedDiskGraphIndex index(index_path);
+  index.configure_io("pread", 1, 1);
+
+  agentmem::DiskGraphSearchConfig search;
+  search.top_k = 3;
+  search.search_width = 8;
+  search.entry_count = 4;
+  search.seed_ids = {0, 1, 2, 3};
+  search.prefetch_policy = "none";
+
+  const float* query = base.row(0);
+
+  search.beam_width = 1;
+  auto result = index.search_one(query, search);
+  require(!result.topk.empty(), "beam_width=1 returns results");
+  require(result.stats.expanded <= search.search_width,
+          "beam_width=1 respects search_width");
+  require(result.stats.max_batch_size <= 1,
+          "beam_width=1 limits batch size");
+  require(result.stats.batch_expanded == result.stats.expanded,
+          "beam_width=1 batch stats match expanded");
+
+  search.beam_width = 3;
+  result = index.search_one(query, search);
+  require(result.stats.expanded <= search.search_width,
+          "beam_width<search_width respects search_width");
+  require(result.stats.max_batch_size <= search.beam_width,
+          "beam_width<search_width limits batch size");
+  require(result.stats.batch_count > 0,
+          "beam_width<search_width records batches");
+  require(result.stats.duplicate_pages_eliminated > 0,
+          "beam batch deduplicates same-page candidates");
+
+  search.search_width = 5;
+  search.beam_width = 32;
+  result = index.search_one(query, search);
+  require(result.stats.expanded <= search.search_width,
+          "beam_width>search_width respects search_width");
+  require(result.stats.max_batch_size <= search.search_width,
+          "beam_width>search_width clamps effective batch size");
+
+  std::filesystem::remove(index_path);
+}
+
+void test_packed_graph_io_uring_fallback_batch() {
+  std::filesystem::create_directories("build");
+  const std::string index_path = "build/uring_fallback_batch_smoke.idx";
+  std::filesystem::remove(index_path);
+
+  const auto base = patterned_vectors(24, 8);
+  agentmem::DiskGraphBuildConfig build;
+  build.degree = 4;
+  build.page_size = 5000;
+  build.build_policy = "exact";
+  build.packing_strategy = "bfs";
+  agentmem::PackedDiskGraphBuilder::build(base, index_path, build);
+
+  agentmem::PackedDiskGraphIndex index(index_path);
+  index.configure_io("io_uring", 8, 8);
+  require(!index.io_status().io_uring_enabled,
+          "unaligned page size falls back from io_uring");
+
+  agentmem::DiskGraphSearchConfig search;
+  search.top_k = 3;
+  search.search_width = 8;
+  search.beam_width = 4;
+  search.entry_count = 4;
+  search.seed_ids = {0, 1, 2, 3};
+  search.prefetch_policy = "none";
+
+  const auto result = index.search_one(base.row(0), search);
+  require(!result.topk.empty(), "io_uring fallback returns results");
+  require(result.stats.expanded <= search.search_width,
+          "io_uring fallback respects search_width");
+  require(result.stats.batch_count > 0,
+          "io_uring fallback still records beam batches");
+  require(result.stats.io_submits == result.stats.io_completions,
+          "io_uring fallback reads complete");
+
+  std::filesystem::remove(index_path);
+}
+
 void test_packed_graph_async_prefetch() {
   std::filesystem::create_directories("build");
   const std::string index_path = "build/p4_async_prefetch_smoke.idx";
@@ -331,6 +426,8 @@ int main() {
   test_pq_adc();
   test_vamana_builder();
   test_packed_graph_search();
+  test_packed_graph_beam_batching();
+  test_packed_graph_io_uring_fallback_batch();
   test_packed_graph_async_prefetch();
   return 0;
 }

@@ -61,6 +61,7 @@ struct DiskGraphBuildConfig {
 struct DiskGraphSearchConfig {
   std::size_t top_k = 10;
   std::size_t search_width = 64;
+  std::size_t beam_width = 0;
   std::size_t entry_count = 32;
   std::vector<std::uint32_t> seed_ids;
   bool early_stop = false;
@@ -100,6 +101,8 @@ struct DiskGraphSearchStats {
   std::size_t io_submits = 0;
   std::size_t io_completions = 0;
   std::size_t io_submit_syscalls = 0;
+  std::size_t uring_submit_count = 0;
+  std::size_t uring_cqe_count = 0;
   std::size_t io_prefetches = 0;
   std::size_t io_prefetch_hits = 0;
   std::size_t io_prefetch_waits = 0;
@@ -111,6 +114,10 @@ struct DiskGraphSearchStats {
   double demand_read_wait_us = 0.0;
   std::size_t page_dedup_requests = 0;
   std::size_t page_dedup_hits = 0;
+  std::size_t duplicate_pages_eliminated = 0;
+  std::size_t batch_count = 0;
+  std::size_t batch_expanded = 0;
+  std::size_t max_batch_size = 0;
   std::size_t same_page_node_reuse = 0;
   double adc_table_build_us = 0.0;
   std::size_t rerank_reads = 0;
@@ -289,6 +296,8 @@ class PackedDiskGraphIndex {
   void maybe_issue_prefetch(SearchState& state) const;
   bool update_frontier(SearchState& state) const;
   void expand_candidate(SearchState& state, const SearchResult& current);
+  void expand_candidate_batch(SearchState& state,
+                              const std::vector<SearchResult>& batch);
   void finalize_topk(SearchState& state);
 
   std::string path_;

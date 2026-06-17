@@ -1,0 +1,35 @@
+{
+  "generated_from": "archive/results",
+  "note": "Historical archived results only; no new benchmark run was performed for this JSON.",
+  "runs": [
+    {
+      "io_mode": "pread",
+      "memory_budget_pass": 1,
+      "p50_latency_ms": 22.7709,
+      "p95_latency_ms": 138.3205,
+      "p99_latency_ms": 457.709,
+      "qps": 25.4279,
+      "query_count": 1000,
+      "recall_at_10": 0.6873,
+      "reads_per_query": 4097.819,
+      "run_id": "sift-local-graph-ext4-sift1m-pread-20260611-133000",
+      "search_width": 1024,
+      "source": "archive/results/sift-local-graph-ext4-sift1m-pread-20260611-133000.txt"
+    },
+    {
+      "io_mode": "io_uring",
+      "memory_budget_pass": 1,
+      "p50_latency_ms": 570.1948,
+      "p95_latency_ms": 760.1644,
+      "p99_latency_ms": 814.7273,
+      "qps": 1.8472,
+      "query_count": 1000,
+      "recall_at_10": 0.6873,
+      "reads_per_query": 4097.819,
+      "run_id": "sift-local-graph-ext4-sift1m-liburing-20260611-133000",
+      "search_width": 1024,
+      "source": "archive/results/sift-local-graph-ext4-sift1m-liburing-20260611-133000.txt"
+    }
+  ],
+  "status": "archived"
+}

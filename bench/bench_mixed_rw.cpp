@@ -65,7 +65,6 @@ struct ScenarioResult {
   double insert_throughput = 0.0;
   Percentiles latency;
   double recall_at_10 = 0.0;
-  double wal_append_avg_us = 0.0;
   double memtable_insert_avg_us = 0.0;
   double flush_duration_ms = 0.0;
   std::size_t sstable_count = 0;
@@ -434,7 +433,6 @@ ScenarioResult run_scenario(const Args& args, const Scenario& scenario,
   result.recall_at_10 =
       recall_samples == 0 ? 1.0 : recall_sum / static_cast<double>(recall_samples);
   const auto write_latency = summarize(write_event_latencies_ms);
-  result.wal_append_avg_us = 0.0;
   result.memtable_insert_avg_us = write_latency.avg * 1000.0;
   result.flush_duration_ms = flush_ms;
   result.sstable_count = count_sstables(scenario_dir);
@@ -475,7 +473,7 @@ void write_csv(const std::filesystem::path& output_path,
   }
   output << "scenario,read_ratio,write_ratio,read_qps,write_qps,"
             "insert_throughput,avg_latency,p50_latency,p95_latency,p99_latency,"
-            "recall_at_10,wal_append_avg_us,memtable_insert_avg_us,"
+            "recall_at_10,memtable_insert_avg_us,"
             "flush_duration_ms,sstable_count,delta_record_count,"
             "memory_usage_mb,disk_usage_mb,recovery_time_ms\n";
   output << std::fixed << std::setprecision(6);
@@ -491,7 +489,6 @@ void write_csv(const std::filesystem::path& output_path,
            << result.latency.p95 << ','
            << result.latency.p99 << ','
            << result.recall_at_10 << ','
-           << result.wal_append_avg_us << ','
            << result.memtable_insert_avg_us << ','
            << result.flush_duration_ms << ','
            << result.sstable_count << ','
