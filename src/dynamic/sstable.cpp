@@ -1,4 +1,4 @@
-#include "agentmem/dynamic/sstable.h"
+#include "agent_aware/dynamic/sstable.h"
 
 #include <algorithm>
 #include <charconv>
@@ -9,7 +9,7 @@
 #include <sstream>
 #include <string>
 
-namespace agentmem::dynamic {
+namespace agent_aware::dynamic {
 namespace {
 
 constexpr std::uint32_t kSSTableDataMagic = 0x44535450;   // "PSTD".
@@ -514,4 +514,4 @@ std::uint64_t SSTableReader::max_sequence_id() const {
   return max_sequence_id_;
 }
 
-}  // namespace agentmem::dynamic
+}  // namespace agent_aware::dynamic

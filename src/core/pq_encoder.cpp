@@ -1,11 +1,11 @@
-#include "agentmem/core/pq_encoder.h"
+#include "agent_aware/core/pq_encoder.h"
 
 #include <algorithm>
 #include <limits>
 #include <random>
 #include <stdexcept>
 
-namespace agentmem {
+namespace agent_aware {
 
 PQTrainingStats PQEncoder::train(const VectorSet& base,
                                  const PQTrainingConfig& config) {
@@ -201,4 +201,4 @@ void PQEncoder::validate_trained() const {
   }
 }
 
-}  // namespace agentmem
+}  // namespace agent_aware

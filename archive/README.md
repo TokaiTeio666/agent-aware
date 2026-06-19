@@ -1,4 +1,4 @@
-# AgentMem-Flow Archive
+# agent-aware Archive
 
 This directory stores evidence that should be preserved across iterations.
 

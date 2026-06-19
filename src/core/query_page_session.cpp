@@ -1,4 +1,4 @@
-#include "agentmem/core/query_page_session.h"
+#include "agent_aware/core/query_page_session.h"
 
 #include <algorithm>
 #include <chrono>
@@ -6,9 +6,9 @@
 #include <stdexcept>
 #include <utility>
 
-#include "agentmem/core/async_page_reader.h"
+#include "agent_aware/core/async_page_reader.h"
 
-namespace agentmem {
+namespace agent_aware {
 namespace {
 
 bool session_async_prefetch_enabled(const PackedDiskGraphIndex& index,
@@ -633,4 +633,4 @@ void QueryPageSession::mark_prefetch_used(std::uint32_t page_id) {
   ++stats_.p4_io.prefetch_used;
 }
 
-}  // namespace agentmem
+}  // namespace agent_aware

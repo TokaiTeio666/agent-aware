@@ -1,9 +1,9 @@
-#include "agentmem/core/prefetch_planner.h"
+#include "agent_aware/core/prefetch_planner.h"
 
 #include <algorithm>
 #include <utility>
 
-namespace agentmem {
+namespace agent_aware {
 
 PrefetchPlanner::PrefetchPlanner(Config config)
     : config_(std::move(config)) {}
@@ -101,4 +101,4 @@ bool PrefetchPlanner::accept_page(std::uint32_t page_id,
   return true;
 }
 
-}  // namespace agentmem
+}  // namespace agent_aware

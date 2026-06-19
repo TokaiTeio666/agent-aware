@@ -1,4 +1,4 @@
-#include "agentmem/storage/lsm_tree.h"
+#include "agent_aware/storage/lsm_tree.h"
 
 #include <algorithm>
 #include <cstring>
@@ -8,9 +8,9 @@
 #include <stdexcept>
 #include <unordered_map>
 
-#include "agentmem/core/brute_force.h"
+#include "agent_aware/core/brute_force.h"
 
-namespace agentmem {
+namespace agent_aware {
 namespace {
 
 constexpr char kWalMagic[8] = {'A', 'M', 'F', 'W', 'A', 'L', 'V', '5'};  // 文件签名。
@@ -553,4 +553,4 @@ std::vector<SearchResult> merge_topk(const std::vector<SearchResult>& lhs,
   return merged;
 }
 
-}  // namespace agentmem
+}  // namespace agent_aware

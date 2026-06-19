@@ -1,8 +1,8 @@
-#include "agentmem/dynamic/memtable.h"
+#include "agent_aware/dynamic/memtable.h"
 
 #include <mutex>
 
-namespace agentmem {
+namespace agent_aware {
 namespace {
 
 std::size_t estimate_record_bytes(const DynamicRecord& record) {
@@ -79,4 +79,4 @@ bool MemTable::should_flush() const {
   return current_bytes_ >= flush_threshold_bytes_;
 }
 
-}  // namespace agentmem
+}  // namespace agent_aware

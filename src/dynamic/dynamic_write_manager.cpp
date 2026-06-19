@@ -1,4 +1,4 @@
-#include "agentmem/dynamic/dynamic_write_manager.h"
+#include "agent_aware/dynamic/dynamic_write_manager.h"
 
 #include <algorithm>
 #include <cstring>
@@ -8,9 +8,9 @@
 #include <unordered_map>
 #include <utility>
 
-#include "agentmem/core/brute_force.h"
+#include "agent_aware/core/brute_force.h"
 
-namespace agentmem::dynamic {
+namespace agent_aware::dynamic {
 namespace {
 
 std::string sstable_name(std::uint64_t sstable_id) {
@@ -149,7 +149,31 @@ bool DynamicWriteManager::insert(NodeId node_id, const float* vector,
   record.dim = dim;
   record.vector.resize(dim);
   std::memcpy(record.vector.data(), vector, dim * sizeof(float));
+  record.neighbors =
+      select_incremental_neighbors_locked(node_id, vector, dim);
 
+  return append_record_locked(std::move(record));
+}
+
+bool DynamicWriteManager::update(NodeId node_id, const float* vector,
+                                 std::uint32_t dim) {
+  return insert(node_id, vector, dim);
+}
+
+bool DynamicWriteManager::erase(NodeId node_id) {
+  std::lock_guard<std::mutex> lock(mutex_);
+  if (!opened_) {
+    return false;
+  }
+
+  DynamicRecord record;
+  record.sequence_id = manifest_.next_sequence_id;
+  record.node_id = node_id;
+  record.deleted = true;
+  return append_record_locked(std::move(record));
+}
+
+bool DynamicWriteManager::append_record_locked(DynamicRecord record) {
   if (options_.enable_wal) {
     if (!wal_writer_ || !wal_writer_->append(record)) {
       return false;
@@ -241,6 +265,11 @@ bool DynamicWriteManager::get(NodeId node_id, DynamicRecord& out) const {
 std::vector<DynamicRecord> DynamicWriteManager::collect_all_delta_records()
     const {
   std::lock_guard<std::mutex> lock(mutex_);
+  return collect_all_delta_records_locked();
+}
+
+std::vector<DynamicRecord> DynamicWriteManager::collect_all_delta_records_locked()
+    const {
   std::vector<DynamicRecord> records;
   if (!opened_) {
     return records;
@@ -253,6 +282,37 @@ std::vector<DynamicRecord> DynamicWriteManager::collect_all_delta_records()
     records.insert(records.end(), table_records.begin(), table_records.end());
   }
   return deduplicate_newest(records);
+}
+
+std::vector<NodeId> DynamicWriteManager::select_incremental_neighbors_locked(
+    NodeId node_id, const float* vector, std::uint32_t dim) const {
+  if (options_.dynamic_graph_degree == 0) {
+    return {};
+  }
+
+  const auto records = collect_all_delta_records_locked();
+  std::vector<ScoredRecord> candidates;
+  candidates.reserve(records.size());
+  for (const auto& record : records) {
+    if (record.deleted || record.node_id == node_id || record.dim != dim ||
+        record.vector.size() != dim) {
+      continue;
+    }
+    candidates.push_back(
+        ScoredRecord{record, squared_l2(vector, record.vector.data(), dim)});
+  }
+
+  std::sort(candidates.begin(), candidates.end(), scored_less);
+  if (candidates.size() > options_.dynamic_graph_degree) {
+    candidates.resize(options_.dynamic_graph_degree);
+  }
+
+  std::vector<NodeId> neighbors;
+  neighbors.reserve(candidates.size());
+  for (const auto& candidate : candidates) {
+    neighbors.push_back(candidate.record.node_id);
+  }
+  return neighbors;
 }
 
 std::vector<DynamicRecord> DynamicWriteManager::search_delta_l2(
@@ -369,4 +429,4 @@ std::vector<SearchResult> merge_base_and_delta_l2(
   return merged;
 }
 
-}  // namespace agentmem::dynamic
+}  // namespace agent_aware::dynamic

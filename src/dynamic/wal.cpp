@@ -1,10 +1,10 @@
-#include "agentmem/dynamic/wal.h"
+#include "agent_aware/dynamic/wal.h"
 
 #include <cstddef>
 #include <cstdint>
 #include <limits>
 
-namespace agentmem::dynamic {
+namespace agent_aware::dynamic {
 namespace {
 
 constexpr std::uint32_t kWalRecordMagic = 0x41574c50;  // "PLWA", little endian.
@@ -231,4 +231,4 @@ std::vector<DynamicRecord> WalReader::replay() {
   return records;
 }
 
-}  // namespace agentmem::dynamic
+}  // namespace agent_aware::dynamic

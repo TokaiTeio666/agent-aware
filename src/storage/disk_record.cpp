@@ -1,4 +1,4 @@
-#include "agentmem/storage/disk_record.h"
+#include "agent_aware/storage/disk_record.h"
 
 #include <algorithm>
 #include <cstring>
@@ -11,7 +11,7 @@
 #include <cstdlib>
 #endif
 
-namespace agentmem {
+namespace agent_aware {
 namespace {
 
 std::uint32_t fnv1a_bytes(const void* data, std::size_t bytes,
@@ -27,7 +27,9 @@ std::uint32_t fnv1a_bytes(const void* data, std::size_t bytes,
 
 std::uint32_t payload_checksum(const float* vector, std::uint32_t dim,
                                const std::uint32_t* neighbors,
-                               std::uint32_t degree) {
+                               std::uint32_t degree,
+                               const std::uint8_t* neighbor_pq_codes,
+                               std::uint32_t neighbor_pq_code_bytes) {
   std::uint32_t hash = 2166136261u;
   if (dim > 0) {
     hash = fnv1a_bytes(vector, static_cast<std::size_t>(dim) * sizeof(float),
@@ -37,6 +39,11 @@ std::uint32_t payload_checksum(const float* vector, std::uint32_t dim,
     hash = fnv1a_bytes(
         neighbors, static_cast<std::size_t>(degree) * sizeof(std::uint32_t),
         hash);
+  }
+  const std::size_t pq_bytes =
+      static_cast<std::size_t>(degree) * neighbor_pq_code_bytes;
+  if (pq_bytes > 0) {
+    hash = fnv1a_bytes(neighbor_pq_codes, pq_bytes, hash);
   }
   return hash;
 }
@@ -77,20 +84,25 @@ AlignedBuffer allocate_aligned_buffer(std::size_t bytes) {
   return AlignedBuffer(static_cast<std::uint8_t*>(raw));
 }
 
-std::size_t disk_record_bytes(std::uint32_t dim, std::uint32_t degree) {
+std::size_t disk_record_bytes(std::uint32_t dim, std::uint32_t degree,
+                              std::uint16_t neighbor_pq_code_bytes) {
   const std::uint64_t vector_bytes =
       static_cast<std::uint64_t>(dim) * sizeof(float);
   const std::uint64_t neighbor_bytes =
       static_cast<std::uint64_t>(degree) * sizeof(std::uint32_t);
+  const std::uint64_t neighbor_pq_bytes =
+      static_cast<std::uint64_t>(degree) * neighbor_pq_code_bytes;
   const std::uint64_t total =
-      sizeof(DiskNodeRecordHeader) + vector_bytes + neighbor_bytes;
+      sizeof(DiskNodeRecordHeader) + vector_bytes + neighbor_bytes +
+      neighbor_pq_bytes;
   if (total > std::numeric_limits<std::size_t>::max()) {
     throw std::runtime_error("Disk record size overflows size_t");
   }
   return static_cast<std::size_t>(total);
 }
 
-void validate_disk_record_shape(std::uint32_t dim, std::uint32_t degree) {
+void validate_disk_record_shape(std::uint32_t dim, std::uint32_t degree,
+                                std::uint16_t neighbor_pq_code_bytes) {
   if (dim == 0) {
     throw std::runtime_error("Disk record dimension must be positive");
   }
@@ -100,7 +112,8 @@ void validate_disk_record_shape(std::uint32_t dim, std::uint32_t degree) {
   if (degree > std::numeric_limits<std::uint16_t>::max()) {
     throw std::runtime_error("Disk record degree exceeds header limit");
   }
-  if (disk_record_bytes(dim, degree) > kDiskIndexPageSize) {
+  if (disk_record_bytes(dim, degree, neighbor_pq_code_bytes) >
+      kDiskIndexPageSize) {
     throw std::runtime_error("Disk record payload exceeds 4096 bytes");
   }
 }
@@ -162,7 +175,9 @@ std::uint64_t disk_record_offset(std::uint32_t node_id,
 void encode_node_record(std::uint32_t node_id, const float* vector,
                         std::uint32_t dim,
                         const std::vector<std::uint32_t>& neighbors,
-                        void* buffer, std::size_t buffer_bytes) {
+                        void* buffer, std::size_t buffer_bytes,
+                        const std::vector<std::uint8_t>& neighbor_pq_codes,
+                        std::uint16_t neighbor_pq_code_bytes) {
   require_exact_page(buffer_bytes);
   if (buffer == nullptr) {
     throw std::runtime_error("Disk record buffer is null");
@@ -170,7 +185,13 @@ void encode_node_record(std::uint32_t node_id, const float* vector,
   if (vector == nullptr) {
     throw std::runtime_error("Disk record vector is null");
   }
-  validate_disk_record_shape(dim, static_cast<std::uint32_t>(neighbors.size()));
+  const auto degree = static_cast<std::uint32_t>(neighbors.size());
+  validate_disk_record_shape(dim, degree, neighbor_pq_code_bytes);
+  const std::size_t expected_pq_bytes =
+      static_cast<std::size_t>(degree) * neighbor_pq_code_bytes;
+  if (neighbor_pq_codes.size() != expected_pq_bytes) {
+    throw std::runtime_error("Disk record neighbor PQ code payload has wrong size");
+  }
 
   auto* bytes = static_cast<std::uint8_t*>(buffer);
   std::memset(bytes, 0, buffer_bytes);
@@ -180,14 +201,20 @@ void encode_node_record(std::uint32_t node_id, const float* vector,
   header.node_id = node_id;
   header.degree = static_cast<std::uint16_t>(neighbors.size());
   header.dim = static_cast<std::uint16_t>(dim);
+  header.neighbor_pq_code_bytes = neighbor_pq_code_bytes;
   header.flags = 0;
   header.vector_offset = sizeof(DiskNodeRecordHeader);
   header.neighbors_offset =
       header.vector_offset + static_cast<std::uint32_t>(dim * sizeof(float));
+  const std::uint32_t neighbor_pq_codes_offset =
+      header.neighbors_offset +
+      static_cast<std::uint32_t>(neighbors.size() * sizeof(std::uint32_t));
   header.payload_bytes =
-      static_cast<std::uint32_t>(disk_record_bytes(dim, header.degree));
-  header.checksum =
-      payload_checksum(vector, dim, neighbors.data(), header.degree);
+      static_cast<std::uint32_t>(disk_record_bytes(
+          dim, header.degree, header.neighbor_pq_code_bytes));
+  header.checksum = payload_checksum(
+      vector, dim, neighbors.data(), header.degree, neighbor_pq_codes.data(),
+      header.neighbor_pq_code_bytes);
 
   std::memcpy(bytes, &header, sizeof(header));
   std::memcpy(bytes + header.vector_offset, vector,
@@ -195,6 +222,10 @@ void encode_node_record(std::uint32_t node_id, const float* vector,
   if (!neighbors.empty()) {
     std::memcpy(bytes + header.neighbors_offset, neighbors.data(),
                 neighbors.size() * sizeof(std::uint32_t));
+  }
+  if (!neighbor_pq_codes.empty()) {
+    std::memcpy(bytes + neighbor_pq_codes_offset, neighbor_pq_codes.data(),
+                neighbor_pq_codes.size());
   }
 }
 
@@ -211,14 +242,19 @@ NodeRecord decode_node_record(const void* buffer, std::size_t buffer_bytes) {
   if (header.magic != kDiskNodeRecordMagic) {
     throw std::runtime_error("Invalid disk node record magic");
   }
-  validate_disk_record_shape(header.dim, header.degree);
+  validate_disk_record_shape(header.dim, header.degree,
+                             header.neighbor_pq_code_bytes);
 
   const std::uint32_t expected_vector_offset = sizeof(DiskNodeRecordHeader);
   const std::uint32_t expected_neighbors_offset =
       expected_vector_offset +
       static_cast<std::uint32_t>(header.dim * sizeof(float));
+  const std::uint32_t expected_neighbor_pq_codes_offset =
+      expected_neighbors_offset +
+      static_cast<std::uint32_t>(header.degree * sizeof(std::uint32_t));
   const std::uint32_t expected_payload_bytes =
-      static_cast<std::uint32_t>(disk_record_bytes(header.dim, header.degree));
+      static_cast<std::uint32_t>(disk_record_bytes(
+          header.dim, header.degree, header.neighbor_pq_code_bytes));
   if (header.vector_offset != expected_vector_offset ||
       header.neighbors_offset != expected_neighbors_offset ||
       header.payload_bytes != expected_payload_bytes) {
@@ -229,8 +265,10 @@ NodeRecord decode_node_record(const void* buffer, std::size_t buffer_bytes) {
       reinterpret_cast<const float*>(bytes + header.vector_offset);
   const auto* neighbor_ptr =
       reinterpret_cast<const std::uint32_t*>(bytes + header.neighbors_offset);
-  const std::uint32_t checksum =
-      payload_checksum(vector_ptr, header.dim, neighbor_ptr, header.degree);
+  const auto* neighbor_pq_ptr = bytes + expected_neighbor_pq_codes_offset;
+  const std::uint32_t checksum = payload_checksum(
+      vector_ptr, header.dim, neighbor_ptr, header.degree, neighbor_pq_ptr,
+      header.neighbor_pq_code_bytes);
   if (checksum != header.checksum) {
     throw std::runtime_error("Disk node record checksum mismatch");
   }
@@ -239,15 +277,23 @@ NodeRecord decode_node_record(const void* buffer, std::size_t buffer_bytes) {
   record.node_id = header.node_id;
   record.degree = header.degree;
   record.dim = header.dim;
+  record.neighbor_pq_code_bytes = header.neighbor_pq_code_bytes;
   record.vector.resize(record.dim);
   record.neighbors.resize(record.degree);
+  record.neighbor_pq_codes.resize(static_cast<std::size_t>(record.degree) *
+                                  record.neighbor_pq_code_bytes);
   std::memcpy(record.vector.data(), bytes + header.vector_offset,
               record.vector.size() * sizeof(float));
   if (!record.neighbors.empty()) {
     std::memcpy(record.neighbors.data(), bytes + header.neighbors_offset,
                 record.neighbors.size() * sizeof(std::uint32_t));
   }
+  if (!record.neighbor_pq_codes.empty()) {
+    std::memcpy(record.neighbor_pq_codes.data(),
+                bytes + expected_neighbor_pq_codes_offset,
+                record.neighbor_pq_codes.size());
+  }
   return record;
 }
 
-}  // namespace agentmem
+}  // namespace agent_aware

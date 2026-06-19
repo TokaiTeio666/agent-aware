@@ -1,4 +1,4 @@
-#include "agentmem/graph/disk_graph_builder.h"
+#include "agent_aware/graph/disk_graph_builder.h"
 
 #include <algorithm>
 #include <atomic>
@@ -15,11 +15,11 @@
 #include <unordered_set>
 #include <utility>
 
-#include "agentmem/core/brute_force.h"
-#include "agentmem/graph/disk_page_codec.h"
-#include "agentmem/graph/vamana_builder.h"
+#include "agent_aware/core/brute_force.h"
+#include "agent_aware/graph/disk_page_codec.h"
+#include "agent_aware/graph/vamana_builder.h"
 
-namespace agentmem {
+namespace agent_aware {
 namespace {
 
 constexpr char kMagic[8] = {'A', 'M', 'F', 'G', 'V', '1', '\0', '\0'};  // 单节点页格式。
@@ -92,9 +92,10 @@ struct WorseResultFirst {
   }
 };
 
-std::size_t record_bytes(std::size_t dim, std::size_t degree) {
-  return sizeof(std::uint32_t) * 2 + dim * sizeof(float) +  // id、degree、向量、邻居。
-         degree * sizeof(std::uint32_t);
+std::size_t record_bytes(std::size_t dim, std::size_t degree,
+                         std::size_t neighbor_pq_code_bytes = 0) {
+  return sizeof(std::uint32_t) * 2 + dim * sizeof(float) +
+         degree * sizeof(std::uint32_t) + degree * neighbor_pq_code_bytes;
 }
 
 std::uint64_t pair_key(std::uint32_t lhs, std::uint32_t rhs) {
@@ -1250,7 +1251,15 @@ void NaiveDiskGraphBuilder::build(const VectorSet& base,
   if (config.page_size < kRecordsOffset) {
     throw std::runtime_error("Page size must be at least 4096 bytes in V1");
   }
-  if (record_bytes(base.dim, config.degree) > config.page_size) {
+  const std::size_t pq_code_bytes =
+      config.pq_model != nullptr && config.pq_model->enabled()
+          ? config.pq_model->subspaces()
+          : 0;
+  if (pq_code_bytes > 0 && config.pq_model->vector_count() < base.size()) {
+    throw std::runtime_error("PQ model does not cover graph base vectors");
+  }
+  if (record_bytes(base.dim, config.degree, pq_code_bytes) >
+      config.page_size) {
     throw std::runtime_error("Node record does not fit in configured page size");
   }
   const auto graph = build_graph(base, config);
@@ -1267,6 +1276,7 @@ void NaiveDiskGraphBuilder::build(const VectorSet& base,
   write_value(output, static_cast<std::uint32_t>(config.degree));
   write_value(output, static_cast<std::uint32_t>(config.page_size));
   write_value(output, kRecordsOffset);
+  write_value(output, static_cast<std::uint32_t>(pq_code_bytes));
 
   const auto header_pos = static_cast<std::uint64_t>(output.tellp());
   if (header_pos > kRecordsOffset) {
@@ -1292,6 +1302,23 @@ void NaiveDiskGraphBuilder::build(const VectorSet& base,
       const std::uint32_t neighbor =
           n < neighbors.size() ? neighbors[n] : std::numeric_limits<std::uint32_t>::max();
       put_bytes(page, offset, neighbor);
+    }
+    if (pq_code_bytes > 0) {
+      const auto& codes = config.pq_model->codes();
+      for (std::size_t n = 0; n < config.degree; ++n) {
+        const bool has_neighbor =
+            n < neighbors.size() &&
+            neighbors[n] != std::numeric_limits<std::uint32_t>::max();
+        const std::uint32_t neighbor =
+            has_neighbor ? neighbors[n] : std::numeric_limits<std::uint32_t>::max();
+        for (std::size_t b = 0; b < pq_code_bytes; ++b) {
+          std::uint8_t code = 0;
+          if (has_neighbor) {
+            code = codes[static_cast<std::size_t>(neighbor) * pq_code_bytes + b];
+          }
+          put_bytes(page, offset, code);
+        }
+      }
     }
 
     output.write(page.data(), static_cast<std::streamsize>(page.size()));
@@ -1319,8 +1346,15 @@ void PackedDiskGraphBuilder::build(const VectorSet& base,
     throw std::runtime_error("Page size must be at least 4096 bytes in V2");
   }
 
-  const std::size_t nodes_per_page =
-      packed_nodes_per_page(base.dim, config.degree, config.page_size);
+  const std::size_t pq_code_bytes =
+      config.pq_model != nullptr && config.pq_model->enabled()
+          ? config.pq_model->subspaces()
+          : 0;
+  if (pq_code_bytes > 0 && config.pq_model->vector_count() < base.size()) {
+    throw std::runtime_error("PQ model does not cover packed graph base vectors");
+  }
+  const std::size_t nodes_per_page = packed_nodes_per_page(
+      base.dim, config.degree, config.page_size, pq_code_bytes);
   if (nodes_per_page == 0) {
     throw std::runtime_error("Packed page cannot hold even one node");
   }
@@ -1366,6 +1400,7 @@ void PackedDiskGraphBuilder::build(const VectorSet& base,
   write_value(output, directory_offset);
   write_value(output, page_count);
   write_value(output, static_cast<std::uint32_t>(nodes_per_page));
+  write_value(output, static_cast<std::uint32_t>(pq_code_bytes));
 
   const auto header_pos = static_cast<std::uint64_t>(output.tellp());
   if (header_pos > kRecordsOffset) {
@@ -1390,7 +1425,7 @@ void PackedDiskGraphBuilder::build(const VectorSet& base,
   for (std::uint64_t page_id = 0; page_id < page_count; ++page_id) {
     std::vector<char> page = DiskPageCodec::encode_packed_page(
         static_cast<std::uint32_t>(page_id), base, graph, order,
-        nodes_per_page, config.page_size, config.degree);
+        nodes_per_page, config.page_size, config.degree, config.pq_model);
 
     output.write(page.data(), static_cast<std::streamsize>(page.size()));
     if (!output) {
@@ -1400,4 +1435,4 @@ void PackedDiskGraphBuilder::build(const VectorSet& base,
 }
 
 
-}  // namespace agentmem
+}  // namespace agent_aware

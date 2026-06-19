@@ -5,7 +5,7 @@
 #include <string>
 #include <vector>
 
-#include "agentmem/dynamic/wal.h"
+#include "agent_aware/dynamic/wal.h"
 
 namespace {
 
@@ -22,12 +22,12 @@ std::filesystem::path test_path(const std::string& name) {
   return path;
 }
 
-agentmem::DynamicRecord make_record(agentmem::NodeId node_id,
+agent_aware::DynamicRecord make_record(agent_aware::NodeId node_id,
                                     std::uint64_t sequence_id,
                                     std::vector<float> vector,
-                                    std::vector<agentmem::NodeId> neighbors =
+                                    std::vector<agent_aware::NodeId> neighbors =
                                         {}) {
-  agentmem::DynamicRecord record;
+  agent_aware::DynamicRecord record;
   record.sequence_id = sequence_id;
   record.node_id = node_id;
   record.dim = static_cast<std::uint32_t>(vector.size());
@@ -61,31 +61,31 @@ void test_append_one_replay_one() {
   const auto path = test_path("one.wal");
   const auto record = make_record(5, 10, {1.0f, 2.0f}, {7, 8});
 
-  agentmem::dynamic::WalWriter writer(path);
+  agent_aware::dynamic::WalWriter writer(path);
   require(writer.append(record), "append one record");
   require(writer.close(), "close one record wal");
 
-  const auto records = agentmem::dynamic::WalReader(path).replay();
+  const auto records = agent_aware::dynamic::WalReader(path).replay();
   require(records.size() == 1, "replay one record count");
   require(records[0].node_id == 5, "replay node id");
   require(records[0].sequence_id == 10, "replay sequence id");
   require(records[0].dim == 2, "replay dim");
   require(records[0].vector == std::vector<float>({1.0f, 2.0f}),
           "replay vector");
-  require(records[0].neighbors == std::vector<agentmem::NodeId>({7, 8}),
+  require(records[0].neighbors == std::vector<agent_aware::NodeId>({7, 8}),
           "replay neighbors");
 }
 
 void test_append_multiple_replay_order() {
   const auto path = test_path("multiple.wal");
 
-  agentmem::dynamic::WalWriter writer(path);
+  agent_aware::dynamic::WalWriter writer(path);
   require(writer.append(make_record(1, 1, {1.0f})), "append first");
   require(writer.append(make_record(2, 2, {2.0f, 3.0f})), "append second");
   require(writer.append(make_record(3, 3, {4.0f})), "append third");
   require(writer.close(), "close multiple wal");
 
-  const auto records = agentmem::dynamic::WalReader(path).replay();
+  const auto records = agent_aware::dynamic::WalReader(path).replay();
   require(records.size() == 3, "replay multiple count");
   require(records[0].node_id == 1, "first replay id");
   require(records[1].node_id == 2, "second replay id");
@@ -99,7 +99,7 @@ void test_empty_wal() {
     require(static_cast<bool>(output), "create empty wal");
   }
 
-  const auto records = agentmem::dynamic::WalReader(path).replay();
+  const auto records = agent_aware::dynamic::WalReader(path).replay();
   require(records.empty(), "empty wal replay is empty");
 }
 
@@ -107,19 +107,19 @@ void test_missing_wal() {
   const auto path = test_path("missing.wal");
   std::filesystem::remove(path);
 
-  const auto records = agentmem::dynamic::WalReader(path).replay();
+  const auto records = agent_aware::dynamic::WalReader(path).replay();
   require(records.empty(), "missing wal replay is empty");
 }
 
 void test_broken_tail_stops_after_complete_records() {
   const auto path = test_path("broken_tail.wal");
 
-  agentmem::dynamic::WalWriter writer(path);
+  agent_aware::dynamic::WalWriter writer(path);
   require(writer.append(make_record(1, 1, {1.0f})), "append before tail");
   require(writer.close(), "close before tail corruption");
   append_bytes(path, {0x50, 0x4c});
 
-  const auto records = agentmem::dynamic::WalReader(path).replay();
+  const auto records = agent_aware::dynamic::WalReader(path).replay();
   require(records.size() == 1, "broken tail keeps complete records");
   require(records[0].node_id == 1, "broken tail first id");
 }
@@ -127,13 +127,13 @@ void test_broken_tail_stops_after_complete_records() {
 void test_checksum_error_stops_without_crash() {
   const auto path = test_path("checksum.wal");
 
-  agentmem::dynamic::WalWriter writer(path);
+  agent_aware::dynamic::WalWriter writer(path);
   require(writer.append(make_record(1, 1, {1.0f})), "append valid record");
   require(writer.append(make_record(2, 2, {2.0f})), "append corrupt target");
   require(writer.close(), "close checksum wal");
   overwrite_last_byte(path);
 
-  const auto records = agentmem::dynamic::WalReader(path).replay();
+  const auto records = agent_aware::dynamic::WalReader(path).replay();
   require(records.size() == 1, "checksum error keeps previous valid records");
   require(records[0].node_id == 1, "checksum error previous id");
 }
@@ -141,17 +141,17 @@ void test_checksum_error_stops_without_crash() {
 void test_append_is_non_destructive() {
   const auto path = test_path("append_mode.wal");
   {
-    agentmem::dynamic::WalWriter writer(path);
+    agent_aware::dynamic::WalWriter writer(path);
     require(writer.append(make_record(1, 1, {1.0f})), "append initial");
     require(writer.close(), "close initial");
   }
   {
-    agentmem::dynamic::WalWriter writer(path);
+    agent_aware::dynamic::WalWriter writer(path);
     require(writer.append(make_record(2, 2, {2.0f})), "append later");
     require(writer.close(), "close later");
   }
 
-  const auto records = agentmem::dynamic::WalReader(path).replay();
+  const auto records = agent_aware::dynamic::WalReader(path).replay();
   require(records.size() == 2, "append writer does not truncate");
   require(records[0].node_id == 1, "append mode first id");
   require(records[1].node_id == 2, "append mode second id");

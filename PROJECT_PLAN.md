@@ -1,14 +1,15 @@
-# Agent-Mem-IO 项目计划书
+# agent-aware 项目计划书
 
-> 项目名称：面向 Agent 记忆的向量检索系统 I/O 优化  
-> 英文名称：I/O Optimization of Vector Retrieval Systems for Agent Memory  
+> 项目名称：agent-aware  
+> 项目说明：面向 Agent 记忆的向量检索系统 I/O 优化  
+> 英文说明：I/O Optimization of Vector Retrieval Systems for Agent Memory  
 > 适用赛题：2026 年全国大学生计算机系统能力大赛操作系统设计赛 OS 功能挑战赛道  
 > 文档版本：v1.0  
 > 编写日期：2026-06-16
 
 ## 1. 项目概述
 
-Agent-Mem-IO 面向大模型 Agent 的长期记忆场景，设计一套在内存受限环境下运行的动态向量检索底层 I/O 存储引擎。项目目标不是单纯把所有向量加载到内存获得高 QPS，而是在数据规模远大于物理内存、读写请求持续并发的条件下，通过用户态缓存、图拓扑感知预取、异步 I/O 和日志结构写入路径，降低随机 SSD 访问带来的性能损耗。
+agent-aware 面向大模型 Agent 的长期记忆场景，设计一套在内存受限环境下运行的动态向量检索底层 I/O 存储引擎。项目目标不是单纯把所有向量加载到内存获得高 QPS，而是在数据规模远大于物理内存、读写请求持续并发的条件下，通过用户态缓存、图拓扑感知预取、异步 I/O 和日志结构写入路径，降低随机 SSD 访问带来的性能损耗。
 
 系统以 DiskANN/Vamana 图索引为检索骨架，以 Product Quantization 压缩编码作为内存常驻的近似过滤层，将全精度向量下沉到 SSD，通过 O_DIRECT 绕过操作系统 Page Cache，并由 Graph-Aware 2Q BufferPool 接管缓存淘汰策略。读路径使用 io_uring 批量异步读取和下一跳预取来隐藏 I/O 延迟；写路径借鉴 LSM-Tree，将实时随机写转化为 WAL 与 SSTable 的顺序追加写，并通过后台 Compaction 保持读写混合负载下的延迟稳定性。
 
@@ -358,7 +359,7 @@ cmake .. -DCMAKE_BUILD_TYPE=Release
 make -j$(nproc)
 
 # 单元测试
-./agent_mem_io_tests
+./agent_aware_tests
 
 # P5 混合读写 benchmark
 ./bench_mixed_rw --num_operations 10000 --topk 10
@@ -429,6 +430,6 @@ make -j$(nproc)
 
 ## 15. 结论
 
-Agent-Mem-IO 的计划重点是围绕赛题的真实约束构建系统，而不是绕开内存限制追求纯内存性能。通过“PQ 压缩导航 + SSD 全精度向量 + 用户态图感知缓存 + io_uring 异步预取 + LSM 顺序写入”的组合，系统能够在 10%-20% 内存预算下保持高召回率，并对高并发读写混合负载提供可解释、可复现、可调优的 I/O 优化能力。
+agent-aware 的计划重点是围绕赛题的真实约束构建系统，而不是绕开内存限制追求纯内存性能。通过“PQ 压缩导航 + SSD 全精度向量 + 用户态图感知缓存 + io_uring 异步预取 + LSM 顺序写入”的组合，系统能够在 10%-20% 内存预算下保持高召回率，并对高并发读写混合负载提供可解释、可复现、可调优的 I/O 优化能力。
 
 后续工作应集中在三点：一是扩大 SIFT1M 与真实 NVMe 环境测试，二是完善 Compaction 与图连通性的一致性验证，三是将实验结果整理为图表化报告和答辩演示材料。

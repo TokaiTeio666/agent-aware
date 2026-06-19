@@ -1,4 +1,4 @@
-#include "agentmem/dynamic/manifest.h"
+#include "agent_aware/dynamic/manifest.h"
 
 #include <charconv>
 #include <cctype>
@@ -7,7 +7,7 @@
 #include <string>
 #include <utility>
 
-namespace agentmem::dynamic {
+namespace agent_aware::dynamic {
 namespace {
 
 constexpr std::uint32_t kManifestVersion = 1;
@@ -162,4 +162,4 @@ bool Manifest::save(const ManifestData& data) const {
   return !error;
 }
 
-}  // namespace agentmem::dynamic
+}  // namespace agent_aware::dynamic

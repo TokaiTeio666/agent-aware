@@ -1,14 +1,15 @@
-#include "agentmem/graph/disk_page_codec.h"
+#include "agent_aware/graph/disk_page_codec.h"
 
 #include <algorithm>
 #include <limits>
 #include <utility>
 
-namespace agentmem {
+namespace agent_aware {
 
-std::size_t graph_record_bytes(std::size_t dim, std::size_t degree) {
+std::size_t graph_record_bytes(std::size_t dim, std::size_t degree,
+                               std::size_t neighbor_pq_code_bytes) {
   return sizeof(std::uint32_t) * 2 + dim * sizeof(float) +
-         degree * sizeof(std::uint32_t);
+         degree * sizeof(std::uint32_t) + degree * neighbor_pq_code_bytes;
 }
 
 std::uint64_t align_up(std::uint64_t value, std::uint64_t alignment) {
@@ -20,13 +21,15 @@ std::uint64_t align_up(std::uint64_t value, std::uint64_t alignment) {
 }
 
 std::size_t packed_nodes_per_page(std::size_t dim, std::size_t degree,
-                                  std::size_t page_size) {
+                                  std::size_t page_size,
+                                  std::size_t neighbor_pq_code_bytes) {
   if (page_size <= sizeof(std::uint32_t) * 2) {
     return 0;
   }
   const std::size_t per_node = sizeof(std::uint32_t) * 2 +
                                dim * sizeof(float) +
-                               degree * sizeof(std::uint32_t);
+                               degree * sizeof(std::uint32_t) +
+                               degree * neighbor_pq_code_bytes;
   return (page_size - sizeof(std::uint32_t) * 2) / per_node;
 }
 
@@ -34,7 +37,13 @@ std::vector<char> DiskPageCodec::encode_packed_page(
     std::uint32_t page_id, const VectorSet& base,
     const std::vector<std::vector<std::uint32_t>>& graph,
     const std::vector<std::uint32_t>& order, std::size_t nodes_per_page,
-    std::size_t page_size, std::size_t degree) {
+    std::size_t page_size, std::size_t degree,
+    const PqAdcModel* pq_model) {
+  const std::size_t pq_code_bytes =
+      pq_model != nullptr && pq_model->enabled() ? pq_model->subspaces() : 0;
+  if (pq_code_bytes > 0 && pq_model->vector_count() < base.size()) {
+    throw std::runtime_error("PQ model does not cover packed graph base vectors");
+  }
   const std::size_t begin = static_cast<std::size_t>(page_id) * nodes_per_page;
   const std::size_t end = std::min(begin + nodes_per_page, order.size());
   const auto node_count = static_cast<std::uint32_t>(end - begin);
@@ -80,6 +89,30 @@ std::vector<char> DiskPageCodec::encode_packed_page(
         neighbor = graph[node_id][n];
       }
       put_bytes(page, offset, neighbor);
+    }
+  }
+
+  if (pq_code_bytes > 0) {
+    const auto& codes = pq_model->codes();
+    for (std::size_t slot = 0; slot < nodes_per_page; ++slot) {
+      const std::uint32_t node_id =
+          slot < node_count ? order[begin + slot]
+                            : std::numeric_limits<std::uint32_t>::max();
+      for (std::size_t n = 0; n < degree; ++n) {
+        const bool has_neighbor =
+            slot < node_count && n < graph[node_id].size() &&
+            graph[node_id][n] != std::numeric_limits<std::uint32_t>::max();
+        const std::uint32_t neighbor =
+            has_neighbor ? graph[node_id][n]
+                         : std::numeric_limits<std::uint32_t>::max();
+        for (std::size_t b = 0; b < pq_code_bytes; ++b) {
+          std::uint8_t code = 0;
+          if (has_neighbor) {
+            code = codes[static_cast<std::size_t>(neighbor) * pq_code_bytes + b];
+          }
+          put_bytes(page, offset, code);
+        }
+      }
     }
   }
 
@@ -138,6 +171,28 @@ PackedDiskGraphIndex::DecodedPage DiskPageCodec::decode_packed_page(
     }
   }
 
+  const std::size_t pq_code_bytes = metadata.neighbor_pq_code_bytes;
+  if (pq_code_bytes > 0) {
+    for (std::uint32_t slot = 0; slot < metadata.nodes_per_page; ++slot) {
+      std::vector<std::uint8_t> codes;
+      if (slot < node_count) {
+        codes.resize(static_cast<std::size_t>(degrees[slot]) * pq_code_bytes);
+      }
+      std::size_t written = 0;
+      for (std::uint32_t n = 0; n < metadata.degree; ++n) {
+        for (std::size_t b = 0; b < pq_code_bytes; ++b) {
+          const auto code = get_bytes<std::uint8_t>(decoded.bytes, cursor);
+          if (slot < node_count && n < degrees[slot]) {
+            codes[written++] = code;
+          }
+        }
+      }
+      if (slot < node_count) {
+        decoded.nodes[slot].neighbor_pq_codes = std::move(codes);
+      }
+    }
+  }
+
   return decoded;
 }
 
@@ -163,4 +218,4 @@ const float* DiskPageCodec::vector_data(
   return reinterpret_cast<const float*>(page.bytes.data() + node.vector_offset);
 }
 
-}  // namespace agentmem
+}  // namespace agent_aware

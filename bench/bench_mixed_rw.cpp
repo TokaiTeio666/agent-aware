@@ -6,6 +6,7 @@
 #include <fstream>
 #include <iomanip>
 #include <iostream>
+#include <memory>
 #include <numeric>
 #include <random>
 #include <stdexcept>
@@ -14,11 +15,12 @@
 #include <utility>
 #include <vector>
 
-#include "agentmem/core/brute_force.h"
-#include "agentmem/data/dataset.h"
-#include "agentmem/dynamic/compaction.h"
-#include "agentmem/dynamic/dynamic_write_manager.h"
-#include "agentmem/dynamic/manifest.h"
+#include "agent_aware/core/brute_force.h"
+#include "agent_aware/data/dataset.h"
+#include "agent_aware/dynamic/compaction.h"
+#include "agent_aware/dynamic/dynamic_write_manager.h"
+#include "agent_aware/dynamic/manifest.h"
+#include "agent_aware/engine/storage_engine.h"
 
 namespace {
 
@@ -40,6 +42,15 @@ struct Args {
   std::size_t query_count = 256;
   std::size_t dim = 32;
   std::size_t memtable_flush_bytes = 256 * 1024;
+  std::size_t dynamic_graph_degree = 16;
+  std::size_t search_width = 350;
+  std::size_t entry_count = 64;
+  std::size_t beam_width = 16;
+  std::string io_mode = "pread";
+  std::size_t io_batch = 16;
+  std::size_t io_depth = 32;
+  std::string cache_policy = "graph-aware-2q";
+  std::size_t cache_pages = 0;
   std::uint32_t seed = 42;
 };
 
@@ -72,6 +83,9 @@ struct ScenarioResult {
   double memory_usage_mb = 0.0;
   double disk_usage_mb = 0.0;
   double recovery_time_ms = 0.0;
+  std::string search_mode = "memory_exact";
+  double graph_reads_per_read = 0.0;
+  double cache_hit_rate = 0.0;
 };
 
 std::string require_value(int& index, int argc, char** argv,
@@ -135,6 +149,31 @@ Args parse_args(int argc, char** argv) {
     } else if (name == "--memtable_flush_bytes") {
       args.memtable_flush_bytes =
           static_cast<std::size_t>(std::stoull(require_value(i, argc, argv, name)));
+    } else if (name == "--dynamic_graph_degree") {
+      args.dynamic_graph_degree =
+          static_cast<std::size_t>(std::stoull(require_value(i, argc, argv, name)));
+    } else if (name == "--search_width") {
+      args.search_width =
+          static_cast<std::size_t>(std::stoull(require_value(i, argc, argv, name)));
+    } else if (name == "--entry_count") {
+      args.entry_count =
+          static_cast<std::size_t>(std::stoull(require_value(i, argc, argv, name)));
+    } else if (name == "--beam_width") {
+      args.beam_width =
+          static_cast<std::size_t>(std::stoull(require_value(i, argc, argv, name)));
+    } else if (name == "--io_mode") {
+      args.io_mode = require_value(i, argc, argv, name);
+    } else if (name == "--io_batch") {
+      args.io_batch =
+          static_cast<std::size_t>(std::stoull(require_value(i, argc, argv, name)));
+    } else if (name == "--io_depth") {
+      args.io_depth =
+          static_cast<std::size_t>(std::stoull(require_value(i, argc, argv, name)));
+    } else if (name == "--cache_policy") {
+      args.cache_policy = require_value(i, argc, argv, name);
+    } else if (name == "--cache_pages") {
+      args.cache_pages =
+          static_cast<std::size_t>(std::stoull(require_value(i, argc, argv, name)));
     } else if (name == "--seed") {
       args.seed = static_cast<std::uint32_t>(
           std::stoul(require_value(i, argc, argv, name)));
@@ -142,13 +181,20 @@ Args parse_args(int argc, char** argv) {
       std::cout
           << "Usage: bench_mixed_rw [options]\n"
           << "  --data_path PATH             Optional fvecs base vectors\n"
-          << "  --index_path PATH            Accepted for compatibility; unused\n"
+          << "  --index_path PATH            Optional SSD packed graph index\n"
           << "  --dynamic_dir PATH           Dynamic WAL/SSTable directory\n"
           << "  --num_operations N           Operation events per scenario\n"
           << "  --read_ratio R               Run one custom scenario\n"
           << "  --write_ratio R              Custom scenario write ratio\n"
           << "  --topk N                     Search top-k, default 10\n"
           << "  --insert_batch_size N        Inserts per write event\n"
+          << "  --dynamic_graph_degree N     Delta graph neighbor count\n"
+          << "  --search_width N             SSD graph expansion budget\n"
+          << "  --entry_count N              SSD graph entry points\n"
+          << "  --beam_width N               SSD graph beam batch width\n"
+          << "  --io_mode NAME               pread, odirect, or io_uring\n"
+          << "  --cache_policy NAME          none/lru/2q/graph-aware-2q\n"
+          << "  --cache_pages N              SSD graph cache pages\n"
           << "  --enable_flush 0|1           Flush at end and allow auto flush\n"
           << "  --enable_compaction 0|1      Run a measured manual compaction\n"
           << "  --output PATH                CSV output path\n";
@@ -158,27 +204,30 @@ Args parse_args(int argc, char** argv) {
     }
   }
   if (args.num_operations == 0 || args.topk == 0 ||
-      args.insert_batch_size == 0) {
-    throw std::runtime_error("num_operations, topk and insert_batch_size must be positive");
+      args.insert_batch_size == 0 || args.search_width == 0 ||
+      args.entry_count == 0 || args.beam_width == 0 || args.io_batch == 0 ||
+      args.io_depth == 0) {
+    throw std::runtime_error(
+        "num_operations, topk, insert_batch_size, and SSD search parameters must be positive");
   }
   return args;
 }
 
-agentmem::VectorSet make_dataset(const Args& args) {
+agent_aware::VectorSet make_dataset(const Args& args) {
   if (!args.data_path.empty()) {
-    return agentmem::load_fvecs(args.data_path, args.base_count);
+    return agent_aware::load_fvecs(args.data_path, args.base_count);
   }
 
-  agentmem::SyntheticConfig config;
+  agent_aware::SyntheticConfig config;
   config.base_count = args.base_count;
   config.query_count = args.query_count;
   config.dim = args.dim;
   config.clusters = std::max<std::size_t>(1, std::min<std::size_t>(64, args.base_count));
   config.seed = args.seed;
-  return agentmem::generate_synthetic(config).base;
+  return agent_aware::generate_synthetic(config).base;
 }
 
-std::vector<std::vector<float>> make_queries(const agentmem::VectorSet& base,
+std::vector<std::vector<float>> make_queries(const agent_aware::VectorSet& base,
                                              std::size_t query_count,
                                              std::uint32_t seed) {
   std::vector<std::vector<float>> queries;
@@ -262,18 +311,18 @@ std::uintmax_t directory_bytes(const std::filesystem::path& dir) {
   return bytes;
 }
 
-double estimate_memory_mb(const std::vector<agentmem::DynamicRecord>& records) {
+double estimate_memory_mb(const std::vector<agent_aware::DynamicRecord>& records) {
   std::uint64_t bytes = 0;
   for (const auto& record : records) {
     bytes += sizeof(record);
     bytes += record.vector.size() * sizeof(float);
-    bytes += record.neighbors.size() * sizeof(agentmem::NodeId);
+    bytes += record.neighbors.size() * sizeof(agent_aware::NodeId);
   }
   return static_cast<double>(bytes) / (1024.0 * 1024.0);
 }
 
-double recall_at_k(const std::vector<agentmem::SearchResult>& result,
-                   const std::vector<agentmem::SearchResult>& truth,
+double recall_at_k(const std::vector<agent_aware::SearchResult>& result,
+                   const std::vector<agent_aware::SearchResult>& truth,
                    std::size_t k) {
   if (k == 0 || truth.empty()) {
     return 1.0;
@@ -294,13 +343,13 @@ double recall_at_k(const std::vector<agentmem::SearchResult>& result,
 }
 
 double run_optional_compaction(const std::filesystem::path& dynamic_dir) {
-  agentmem::dynamic::ManifestData manifest_data;
-  agentmem::dynamic::Manifest manifest(dynamic_dir / "manifest.json");
+  agent_aware::dynamic::ManifestData manifest_data;
+  agent_aware::dynamic::Manifest manifest(dynamic_dir / "manifest.json");
   if (!manifest.load(manifest_data) || manifest_data.sstables.size() < 2) {
     return 0.0;
   }
 
-  agentmem::dynamic::CompactionInput input;
+  agent_aware::dynamic::CompactionInput input;
   input.output_dir = dynamic_dir / "sstable";
   input.output_sstable_id = manifest_data.next_sstable_id + 100000;
   input.output_level = 1;
@@ -309,7 +358,7 @@ double run_optional_compaction(const std::filesystem::path& dynamic_dir) {
         entry.base_path.is_absolute() ? entry.base_path
                                       : dynamic_dir / entry.base_path;
     auto reader =
-        std::make_shared<agentmem::dynamic::SSTableReader>(base_path);
+        std::make_shared<agent_aware::dynamic::SSTableReader>(base_path);
     if (reader->open()) {
       input.input_tables.push_back(std::move(reader));
     }
@@ -319,27 +368,45 @@ double run_optional_compaction(const std::filesystem::path& dynamic_dir) {
   }
 
   const auto start = Clock::now();
-  const auto result = agentmem::dynamic::CompactionJob(std::move(input)).run();
+  const auto result = agent_aware::dynamic::CompactionJob(std::move(input)).run();
   const auto end = Clock::now();
   return result.success ? elapsed_ms(start, end) : 0.0;
 }
 
 ScenarioResult run_scenario(const Args& args, const Scenario& scenario,
-                            const agentmem::VectorSet& base,
+                            const agent_aware::VectorSet& base,
                             const std::vector<std::vector<float>>& queries) {
   const auto scenario_dir = args.dynamic_dir / scenario.name;
   std::filesystem::remove_all(scenario_dir);
   std::filesystem::create_directories(scenario_dir);
 
-  agentmem::dynamic::DynamicWriteOptions options;
+  agent_aware::dynamic::DynamicWriteOptions options;
   options.dynamic_dir = scenario_dir;
   options.memtable_flush_bytes = args.memtable_flush_bytes;
+  options.dynamic_graph_degree = args.dynamic_graph_degree;
   options.enable_wal = true;
   options.enable_auto_flush = args.enable_flush;
 
-  agentmem::dynamic::DynamicWriteManager manager(options);
-  if (!manager.open()) {
+  auto manager =
+      std::make_shared<agent_aware::dynamic::DynamicWriteManager>(options);
+  if (!manager->open()) {
     throw std::runtime_error("Failed to open DynamicWriteManager");
+  }
+  std::unique_ptr<agent_aware::StorageEngine> engine;
+  if (!args.index_path.empty()) {
+    agent_aware::PackedGraphEngineConfig engine_config;
+    engine_config.index_path = args.index_path;
+    engine_config.dynamic_manager = manager;
+    engine_config.cache_policy = args.cache_policy;
+    engine_config.cache_pages = args.cache_pages;
+    engine_config.io_mode = args.io_mode;
+    engine_config.io_batch_size = args.io_batch;
+    engine_config.io_depth = args.io_depth;
+    engine_config.search.search_width = args.search_width;
+    engine_config.search.entry_count = args.entry_count;
+    engine_config.search.beam_width = args.beam_width;
+    engine = std::make_unique<agent_aware::PackedGraphEngine>(
+        std::move(engine_config));
   }
 
   std::mt19937 rng(args.seed ^ static_cast<std::uint32_t>(scenario.name.size()));
@@ -352,6 +419,7 @@ ScenarioResult run_scenario(const Args& args, const Scenario& scenario,
   std::size_t write_records = 0;
   double recall_sum = 0.0;
   std::size_t recall_samples = 0;
+  agent_aware::DiskGraphSearchStats graph_stats;
   std::size_t next_node_id = base.size();
   std::size_t next_query = 0;
 
@@ -361,18 +429,27 @@ ScenarioResult run_scenario(const Args& args, const Scenario& scenario,
     const auto op_start = Clock::now();
     if (do_read) {
       const auto& query = queries[next_query++ % queries.size()];
-      const auto base_results =
-          agentmem::search_memory_fast(base, query.data(), args.topk);
-      const auto delta_results =
-          manager.search_delta_l2(query.data(), static_cast<std::uint32_t>(base.dim),
-                                  args.topk);
-      const auto merged = agentmem::dynamic::merge_base_and_delta_l2(
-          base_results, delta_results, query.data(),
-          static_cast<std::uint32_t>(base.dim), args.topk);
+      std::vector<agent_aware::SearchResult> merged;
+      if (engine) {
+        const auto engine_result = engine->search_one(query.data(), args.topk);
+        merged = engine_result.topk;
+        graph_stats.node_reads += engine_result.stats.graph.node_reads;
+        graph_stats.page_requests += engine_result.stats.graph.page_requests;
+        graph_stats.page_cache_hits +=
+            engine_result.stats.graph.page_cache_hits;
+      } else {
+        const auto base_results =
+            agent_aware::search_memory_fast(base, query.data(), args.topk);
+        const auto delta_results = manager->search_delta_l2(
+            query.data(), static_cast<std::uint32_t>(base.dim), args.topk);
+        merged = agent_aware::dynamic::merge_base_and_delta_l2(
+            base_results, delta_results, query.data(),
+            static_cast<std::uint32_t>(base.dim), args.topk);
+      }
 
-      const auto all_delta = manager.collect_all_delta_records();
-      const auto exact = agentmem::dynamic::merge_base_and_delta_l2(
-          agentmem::search_memory_fast(base, query.data(), args.topk), all_delta,
+      const auto all_delta = manager->collect_all_delta_records();
+      const auto exact = agent_aware::dynamic::merge_base_and_delta_l2(
+          agent_aware::search_memory_fast(base, query.data(), args.topk), all_delta,
           query.data(), static_cast<std::uint32_t>(base.dim), args.topk);
       recall_sum += recall_at_k(merged, exact, std::min<std::size_t>(10, args.topk));
       ++recall_samples;
@@ -380,8 +457,12 @@ ScenarioResult run_scenario(const Args& args, const Scenario& scenario,
     } else {
       for (std::size_t i = 0; i < args.insert_batch_size; ++i) {
         auto vector = make_insert_vector(write_records, base.dim, rng);
-        if (!manager.insert(static_cast<agentmem::NodeId>(next_node_id++),
-                            vector.data(), static_cast<std::uint32_t>(base.dim))) {
+        if (engine) {
+          engine->insert(static_cast<agent_aware::NodeId>(next_node_id++),
+                         vector.data());
+        } else if (!manager->insert(
+                       static_cast<agent_aware::NodeId>(next_node_id++),
+                       vector.data(), static_cast<std::uint32_t>(base.dim))) {
           throw std::runtime_error("Dynamic insert failed");
         }
         ++write_records;
@@ -399,7 +480,7 @@ ScenarioResult run_scenario(const Args& args, const Scenario& scenario,
   double flush_ms = 0.0;
   if (args.enable_flush) {
     const auto flush_start = Clock::now();
-    if (!manager.flush()) {
+    if (!manager->flush()) {
       throw std::runtime_error("Dynamic flush failed");
     }
     flush_ms = elapsed_ms(flush_start, Clock::now());
@@ -408,13 +489,13 @@ ScenarioResult run_scenario(const Args& args, const Scenario& scenario,
     flush_ms += run_optional_compaction(scenario_dir);
   }
 
-  const auto delta_records = manager.collect_all_delta_records();
-  if (!manager.close()) {
+  const auto delta_records = manager->collect_all_delta_records();
+  if (!manager->close()) {
     throw std::runtime_error("Dynamic close failed");
   }
 
   const auto recovery_start = Clock::now();
-  agentmem::dynamic::DynamicWriteManager recovered(options);
+  agent_aware::dynamic::DynamicWriteManager recovered(options);
   if (!recovered.open()) {
     throw std::runtime_error("Dynamic recovery open failed");
   }
@@ -441,6 +522,16 @@ ScenarioResult run_scenario(const Args& args, const Scenario& scenario,
   result.disk_usage_mb =
       static_cast<double>(directory_bytes(scenario_dir)) / (1024.0 * 1024.0);
   result.recovery_time_ms = recovery_ms;
+  result.search_mode = engine ? "ssd_graph" : "memory_exact";
+  result.graph_reads_per_read =
+      read_ops == 0 ? 0.0
+                    : static_cast<double>(graph_stats.node_reads) /
+                          static_cast<double>(read_ops);
+  result.cache_hit_rate =
+      graph_stats.page_requests == 0
+          ? 0.0
+          : static_cast<double>(graph_stats.page_cache_hits) /
+                static_cast<double>(graph_stats.page_requests);
   return result;
 }
 
@@ -475,7 +566,8 @@ void write_csv(const std::filesystem::path& output_path,
             "insert_throughput,avg_latency,p50_latency,p95_latency,p99_latency,"
             "recall_at_10,memtable_insert_avg_us,"
             "flush_duration_ms,sstable_count,delta_record_count,"
-            "memory_usage_mb,disk_usage_mb,recovery_time_ms\n";
+            "memory_usage_mb,disk_usage_mb,recovery_time_ms,"
+            "search_mode,graph_reads_per_read,cache_hit_rate\n";
   output << std::fixed << std::setprecision(6);
   for (const auto& result : results) {
     output << result.scenario << ','
@@ -495,7 +587,10 @@ void write_csv(const std::filesystem::path& output_path,
            << result.delta_record_count << ','
            << result.memory_usage_mb << ','
            << result.disk_usage_mb << ','
-           << result.recovery_time_ms << '\n';
+           << result.recovery_time_ms << ','
+           << result.search_mode << ','
+           << result.graph_reads_per_read << ','
+           << result.cache_hit_rate << '\n';
   }
 }
 
@@ -504,11 +599,6 @@ void write_csv(const std::filesystem::path& output_path,
 int main(int argc, char** argv) {
   try {
     const Args args = parse_args(argc, argv);
-    if (!args.index_path.empty()) {
-      std::cerr << "warning: --index_path is accepted for compatibility; "
-                   "this P5 benchmark uses exact in-memory base search.\n";
-    }
-
     const auto base = make_dataset(args);
     if (base.empty()) {
       throw std::runtime_error("Base dataset is empty");

@@ -9,7 +9,27 @@ sift/
 sift.tar.gz
 results/
 
+!src/data/
+!src/data/**
+!include/agentmem/data/
+!include/agentmem/data/**
+
 !archive/results/
 !archive/results/**
 !archive/logs/
 !archive/logs/**
+
+# Generated benchmark artifacts
+logs/
+indexes/
+data/
+
+# Large index / model / data files
+*.idx
+*.bin
+*.npy
+*.npz
+*.faiss
+*.pt
+*.pth
+*.ckpt

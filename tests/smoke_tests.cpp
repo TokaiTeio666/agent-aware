@@ -6,14 +6,14 @@
 #include <string>
 #include <vector>
 
-#include "agentmem/core/brute_force.h"
-#include "agentmem/core/pq_encoder.h"
-#include "agentmem/core/simd_distance.h"
-#include "agentmem/data/dataset.h"
-#include "agentmem/engine/storage_engine.h"
-#include "agentmem/graph/disk_graph_index.h"
-#include "agentmem/graph/vamana_builder.h"
-#include "agentmem/storage/lsm_tree.h"
+#include "agent_aware/core/brute_force.h"
+#include "agent_aware/core/pq_encoder.h"
+#include "agent_aware/core/simd_distance.h"
+#include "agent_aware/data/dataset.h"
+#include "agent_aware/engine/storage_engine.h"
+#include "agent_aware/graph/disk_graph_index.h"
+#include "agent_aware/graph/vamana_builder.h"
+#include "agent_aware/storage/lsm_tree.h"
 
 namespace {
 
@@ -23,8 +23,8 @@ void require(bool condition, const char* message) {
   }
 }
 
-agentmem::VectorSet tiny_vectors() {
-  agentmem::VectorSet vectors(5, 2);
+agent_aware::VectorSet tiny_vectors() {
+  agent_aware::VectorSet vectors(5, 2);
   const float values[] = {
       0.0f, 0.0f,
       1.0f, 0.0f,
@@ -36,8 +36,8 @@ agentmem::VectorSet tiny_vectors() {
   return vectors;
 }
 
-agentmem::VectorSet patterned_vectors(std::size_t count, std::size_t dim) {
-  agentmem::VectorSet vectors(count, dim);
+agent_aware::VectorSet patterned_vectors(std::size_t count, std::size_t dim) {
+  agent_aware::VectorSet vectors(count, dim);
   for (std::size_t row = 0; row < count; ++row) {
     float* values = vectors.mutable_row(row);
     for (std::size_t d = 0; d < dim; ++d) {
@@ -50,19 +50,19 @@ agentmem::VectorSet patterned_vectors(std::size_t count, std::size_t dim) {
 
 void test_brute_force() {
   const auto base = tiny_vectors();
-  const agentmem::BruteForceIndex exact(base);
+  const agent_aware::BruteForceIndex exact(base);
   const float query[] = {0.05f, 0.0f};
   const auto results = exact.search_one(query, 2);
   require(results.size() == 2, "brute force result count");
   require(results[0].id == 0, "brute force nearest id");
   require(results[1].id == 1, "brute force second id");
 
-  const auto fast_results = agentmem::search_memory_fast(base, query, 3);
+  const auto fast_results = agent_aware::search_memory_fast(base, query, 3);
   require(fast_results.size() == 3, "memory fast result count");
   require(fast_results[0].id == 0, "memory fast nearest id");
   require(fast_results[1].id == 1, "memory fast second id");
 
-  agentmem::VectorSet query_batch(2, 2);
+  agent_aware::VectorSet query_batch(2, 2);
   const float batch_values[] = {
       0.05f, 0.0f,
       0.95f, 0.0f,
@@ -70,12 +70,12 @@ void test_brute_force() {
   std::copy(std::begin(batch_values), std::end(batch_values),
             query_batch.values.begin());
   const auto batch_results =
-      agentmem::search_memory_fast_batch(base, query_batch, 1);
+      agent_aware::search_memory_fast_batch(base, query_batch, 1);
   require(batch_results.size() == 2, "memory fast batch query count");
   require(batch_results[0][0].id == 0, "memory fast batch first nearest id");
   require(batch_results[1][0].id == 1, "memory fast batch second nearest id");
 
-  agentmem::ExactMemoryEngine engine(base);
+  agent_aware::ExactMemoryEngine engine(base);
   const auto engine_result = engine.search_one(query, 1);
   require(engine_result.topk.size() == 1, "exact engine result count");
   require(engine_result.topk[0].id == 0, "exact engine nearest id");
@@ -86,30 +86,30 @@ void test_simd_distance_wrapper() {
       0.0f, 1.0f, -2.0f, 3.5f, 4.0f, 5.25f, -6.0f, 7.0f, 8.5f};
   const std::vector<float> rhs = {
       1.0f, -1.0f, -3.0f, 2.5f, 5.5f, 3.25f, -4.0f, 6.0f, 10.0f};
-  const float expected = agentmem::squared_l2(lhs.data(), rhs.data(),
+  const float expected = agent_aware::squared_l2(lhs.data(), rhs.data(),
                                              lhs.size());
-  const float actual = agentmem::l2_distance_sq_simd(lhs.data(), rhs.data(),
+  const float actual = agent_aware::l2_distance_sq_simd(lhs.data(), rhs.data(),
                                                     lhs.size());
   require(actual == expected, "simd distance wrapper matches squared_l2");
 }
 
 void test_synthetic_data() {
-  agentmem::SyntheticConfig config;
+  agent_aware::SyntheticConfig config;
   config.base_count = 32;
   config.query_count = 8;
   config.dim = 4;
   config.clusters = 4;
   config.workload = "agent";
-  const auto data = agentmem::generate_synthetic(config);
+  const auto data = agent_aware::generate_synthetic(config);
   require(data.base.size() == 32, "synthetic base count");
   require(data.queries.size() == 8, "synthetic query count");
   require(data.base.dim == 4, "synthetic base dim");
   require(data.queries.dim == 4, "synthetic query dim");
 
-  agentmem::DatasetLoadConfig load_config;
+  agent_aware::DatasetLoadConfig load_config;
   load_config.synthetic = true;
   load_config.synthetic_config = config;
-  const auto loaded = agentmem::load_dataset(load_config);
+  const auto loaded = agent_aware::load_dataset(load_config);
   require(loaded.mode == "synthetic", "loaded synthetic mode");
   require(!loaded.truth_from_file, "synthetic truth source");
   require(loaded.base.size() == 32, "loaded synthetic base count");
@@ -124,7 +124,7 @@ void test_wal_and_delta() {
   const float first[] = {1.0f, 2.0f};
   const float second[] = {3.0f, 4.0f};
   {
-    agentmem::WalWriter wal(wal_path, 2);
+    agent_aware::WalWriter wal(wal_path, 2);
     wal.append_insert(10, first);
     wal.append_delete(3);
     wal.append_insert(11, second);
@@ -134,8 +134,8 @@ void test_wal_and_delta() {
 
   std::vector<std::uint32_t> replayed_ids;
   std::vector<std::uint32_t> deleted_ids;
-  agentmem::DeltaFlatIndex delta(2);
-  const auto replay = agentmem::replay_wal_records(
+  agent_aware::DeltaFlatIndex delta(2);
+  const auto replay = agent_aware::replay_wal_records(
       wal_path, 2,
       [&](std::uint32_t id, const float* vector) {
         replayed_ids.push_back(id);
@@ -159,9 +159,9 @@ void test_wal_and_delta() {
 
 void test_pq_adc() {
   const auto base = tiny_vectors();
-  agentmem::PQEncoder pq;
+  agent_aware::PQEncoder pq;
   const auto stats = pq.train(
-      base, agentmem::PQTrainingConfig{2, 2, base.size(), 2, 7});
+      base, agent_aware::PQTrainingConfig{2, 2, base.size(), 2, 7});
   require(pq.enabled(), "pq enabled");
   require(pq.subspaces() == 2, "pq subspaces");
   require(pq.code_bytes() == base.size() * 2, "pq code bytes");
@@ -176,20 +176,20 @@ void test_pq_adc() {
   const float distance = pq.adc_distance(0, table);
   require(distance >= 0.0f, "pq adc distance");
 
-  agentmem::PqAdcModel compat;
+  agent_aware::PqAdcModel compat;
   compat.train(base, 2, 2, base.size(), 2, 7);
   require(compat.code_bytes() == pq.code_bytes(), "pq compatibility wrapper");
 }
 
 void test_vamana_builder() {
   const auto base = tiny_vectors();
-  agentmem::VamanaBuildConfig config;
+  agent_aware::VamanaBuildConfig config;
   config.max_degree = 2;
   config.search_width = 8;
   config.alpha = 1.2;
   config.seed = 11;
 
-  const agentmem::VamanaBuilder builder(config);
+  const agent_aware::VamanaBuilder builder(config);
   const auto graph = builder.build(base);
   require(graph.adjacency.size() == base.size(), "vamana graph size");
   require(graph.medoid < base.size(), "vamana medoid range");
@@ -213,18 +213,18 @@ void test_vamana_builder() {
   const auto pruned = builder.robust_prune(base, 0, candidates);
   require(pruned.size() <= config.max_degree, "vamana robust prune degree");
 
-  agentmem::VamanaBuildConfig partial_delete = config;
+  agent_aware::VamanaBuildConfig partial_delete = config;
   partial_delete.deleted_ids = {0};
-  const auto partial_graph = agentmem::VamanaBuilder(partial_delete).build(base);
+  const auto partial_graph = agent_aware::VamanaBuilder(partial_delete).build(base);
   require(partial_graph.medoid != 0, "vamana medoid skips deleted nodes");
   require(partial_graph.adjacency[0].empty(),
           "vamana deleted node adjacency is empty");
 
-  agentmem::VamanaBuildConfig all_deleted = config;
+  agent_aware::VamanaBuildConfig all_deleted = config;
   all_deleted.deleted_ids = {0, 1, 2, 3, 4};
   bool threw = false;
   try {
-    (void)agentmem::VamanaBuilder(all_deleted).find_medoid(base);
+    (void)agent_aware::VamanaBuilder(all_deleted).find_medoid(base);
   } catch (const std::runtime_error&) {
     threw = true;
   }
@@ -237,20 +237,20 @@ void test_packed_graph_search() {
   std::filesystem::remove(index_path);
 
   const auto base = tiny_vectors();
-  agentmem::DiskGraphBuildConfig build;
+  agent_aware::DiskGraphBuildConfig build;
   build.degree = 2;
   build.page_size = 4096;
   build.build_policy = "vamana";
   build.packing_strategy = "bfs";
   build.approx_candidate_limit = 8;
   build.robust_prune_alpha = 1.2;
-  agentmem::PackedDiskGraphBuilder::build(base, index_path, build);
+  agent_aware::PackedDiskGraphBuilder::build(base, index_path, build);
 
-  agentmem::PackedDiskGraphIndex index(index_path);
+  agent_aware::PackedDiskGraphIndex index(index_path);
   index.configure_cache("graph-aware-2q", 2, true, 1);
   index.configure_io("pread", 1, 1);
 
-  agentmem::DiskGraphSearchConfig search;
+  agent_aware::DiskGraphSearchConfig search;
   search.top_k = 2;
   search.search_width = 8;
   search.entry_count = 2;
@@ -269,17 +269,17 @@ void test_packed_graph_beam_batching() {
   std::filesystem::remove(index_path);
 
   const auto base = patterned_vectors(32, 8);
-  agentmem::DiskGraphBuildConfig build;
+  agent_aware::DiskGraphBuildConfig build;
   build.degree = 4;
   build.page_size = 4096;
   build.build_policy = "exact";
   build.packing_strategy = "bfs";
-  agentmem::PackedDiskGraphBuilder::build(base, index_path, build);
+  agent_aware::PackedDiskGraphBuilder::build(base, index_path, build);
 
-  agentmem::PackedDiskGraphIndex index(index_path);
+  agent_aware::PackedDiskGraphIndex index(index_path);
   index.configure_io("pread", 1, 1);
 
-  agentmem::DiskGraphSearchConfig search;
+  agent_aware::DiskGraphSearchConfig search;
   search.top_k = 3;
   search.search_width = 8;
   search.entry_count = 4;
@@ -326,19 +326,19 @@ void test_packed_graph_io_uring_fallback_batch() {
   std::filesystem::remove(index_path);
 
   const auto base = patterned_vectors(24, 8);
-  agentmem::DiskGraphBuildConfig build;
+  agent_aware::DiskGraphBuildConfig build;
   build.degree = 4;
   build.page_size = 5000;
   build.build_policy = "exact";
   build.packing_strategy = "bfs";
-  agentmem::PackedDiskGraphBuilder::build(base, index_path, build);
+  agent_aware::PackedDiskGraphBuilder::build(base, index_path, build);
 
-  agentmem::PackedDiskGraphIndex index(index_path);
+  agent_aware::PackedDiskGraphIndex index(index_path);
   index.configure_io("io_uring", 8, 8);
   require(!index.io_status().io_uring_enabled,
           "unaligned page size falls back from io_uring");
 
-  agentmem::DiskGraphSearchConfig search;
+  agent_aware::DiskGraphSearchConfig search;
   search.top_k = 3;
   search.search_width = 8;
   search.beam_width = 4;
@@ -364,16 +364,16 @@ void test_packed_graph_async_prefetch() {
   std::filesystem::remove(index_path);
 
   const auto base = patterned_vectors(64, 64);
-  agentmem::DiskGraphBuildConfig build;
+  agent_aware::DiskGraphBuildConfig build;
   build.degree = 8;
   build.page_size = 4096;
   build.build_policy = "exact";
   build.packing_strategy = "bfs";
-  agentmem::PackedDiskGraphBuilder::build(base, index_path, build);
+  agent_aware::PackedDiskGraphBuilder::build(base, index_path, build);
 
-  agentmem::PackedDiskGraphIndex sync_index(index_path);
+  agent_aware::PackedDiskGraphIndex sync_index(index_path);
   sync_index.configure_io("pread", 1, 1);
-  agentmem::DiskGraphSearchConfig search;
+  agent_aware::DiskGraphSearchConfig search;
   search.top_k = 5;
   search.search_width = 24;
   search.entry_count = 4;
@@ -385,7 +385,7 @@ void test_packed_graph_async_prefetch() {
   require(sync_result.topk.size() == search.top_k,
           "sync packed graph result count");
 
-  agentmem::PackedDiskGraphIndex async_index(index_path);
+  agent_aware::PackedDiskGraphIndex async_index(index_path);
   async_index.configure_io("io_uring", 4, 4);
   if (!async_index.io_status().io_uring_enabled) {
     std::filesystem::remove(index_path);

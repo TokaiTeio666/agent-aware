@@ -1,4 +1,4 @@
-#include "agentmem/data/dataset.h"
+#include "agent_aware/data/dataset.h"
 
 #include <algorithm>
 #include <fstream>
@@ -6,7 +6,7 @@
 #include <stdexcept>
 #include <utility>
 
-namespace agentmem {
+namespace agent_aware {
 namespace {
 
 std::int32_t read_i32(std::ifstream& input, const std::string& path) {
@@ -205,6 +205,16 @@ LoadedDataset load_dataset(const DatasetLoadConfig& config) {
       throw std::runtime_error(
           "Ground-truth query count does not match loaded queries");
     }
+    for (std::size_t query_id = 0; query_id < loaded.truth.size();
+         ++query_id) {
+      for (const auto id : loaded.truth[query_id]) {
+        if (id >= loaded.base.size()) {
+          throw std::runtime_error(
+              "Ground-truth id exceeds loaded base count; provide a truth file "
+              "for the selected --base-limit or load the full base set");
+        }
+      }
+    }
     loaded.truth_from_file = true;
     loaded.truth_source = paths.truth;
   }
@@ -212,5 +222,5 @@ LoadedDataset load_dataset(const DatasetLoadConfig& config) {
   return loaded;
 }
 
-}  // namespace agentmem
+}  // namespace agent_aware
 

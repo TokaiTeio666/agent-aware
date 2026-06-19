@@ -4,7 +4,7 @@
 #include <string>
 #include <vector>
 
-#include "agentmem/dynamic/dynamic_write_manager.h"
+#include "agent_aware/dynamic/dynamic_write_manager.h"
 
 namespace {
 
@@ -21,9 +21,9 @@ std::filesystem::path test_dir(const std::string& name) {
   return dir;
 }
 
-agentmem::dynamic::DynamicWriteOptions options_for(
+agent_aware::dynamic::DynamicWriteOptions options_for(
     const std::filesystem::path& dir) {
-  agentmem::dynamic::DynamicWriteOptions options;
+  agent_aware::dynamic::DynamicWriteOptions options;
   options.dynamic_dir = dir;
   options.memtable_flush_bytes = 1024 * 1024;
   options.enable_wal = true;
@@ -32,14 +32,14 @@ agentmem::dynamic::DynamicWriteOptions options_for(
 }
 
 void test_insert_then_get_without_restart() {
-  auto manager = agentmem::dynamic::DynamicWriteManager(
+  auto manager = agent_aware::dynamic::DynamicWriteManager(
       options_for(test_dir("dynamic_insert_get")));
   require(manager.open(), "open manager");
 
   const float vector[] = {1.0f, 2.0f};
   require(manager.insert(10, vector, 2), "insert dynamic record");
 
-  agentmem::DynamicRecord out;
+  agent_aware::DynamicRecord out;
   require(manager.get(10, out), "get inserted record");
   require(out.node_id == 10, "get node id");
   require(out.sequence_id == 1, "get sequence id");
@@ -50,16 +50,16 @@ void test_insert_then_get_without_restart() {
 void test_restart_replays_wal() {
   const auto dir = test_dir("dynamic_wal_replay");
   {
-    auto manager = agentmem::dynamic::DynamicWriteManager(options_for(dir));
+    auto manager = agent_aware::dynamic::DynamicWriteManager(options_for(dir));
     require(manager.open(), "open replay writer manager");
     const float vector[] = {3.0f, 4.0f};
     require(manager.insert(11, vector, 2), "insert before replay");
     require(manager.close(), "close replay writer manager");
   }
   {
-    auto manager = agentmem::dynamic::DynamicWriteManager(options_for(dir));
+    auto manager = agent_aware::dynamic::DynamicWriteManager(options_for(dir));
     require(manager.open(), "open replay reader manager");
-    agentmem::DynamicRecord out;
+    agent_aware::DynamicRecord out;
     require(manager.get(11, out), "replayed record is visible");
     require(out.sequence_id == 1, "replayed sequence id");
     require(out.vector == std::vector<float>({3.0f, 4.0f}),
@@ -70,14 +70,14 @@ void test_restart_replays_wal() {
 
 void test_flush_keeps_record_readable() {
   const auto dir = test_dir("dynamic_flush");
-  auto manager = agentmem::dynamic::DynamicWriteManager(options_for(dir));
+  auto manager = agent_aware::dynamic::DynamicWriteManager(options_for(dir));
   require(manager.open(), "open flush manager");
 
   const float vector[] = {5.0f, 6.0f};
   require(manager.insert(12, vector, 2), "insert before flush");
   require(manager.flush(), "flush memtable");
 
-  agentmem::DynamicRecord out;
+  agent_aware::DynamicRecord out;
   require(manager.get(12, out), "get flushed record");
   require(out.sequence_id == 1, "flushed sequence id");
   require(std::filesystem::exists(dir / "sstable" / "sst_000001.data"),
@@ -92,7 +92,7 @@ void test_flush_keeps_record_readable() {
 }
 
 void test_newer_node_version_wins() {
-  auto manager = agentmem::dynamic::DynamicWriteManager(
+  auto manager = agent_aware::dynamic::DynamicWriteManager(
       options_for(test_dir("dynamic_version")));
   require(manager.open(), "open version manager");
 
@@ -101,7 +101,7 @@ void test_newer_node_version_wins() {
   require(manager.insert(42, old_vector, 2), "insert old version");
   require(manager.insert(42, new_vector, 2), "insert new version");
 
-  agentmem::DynamicRecord out;
+  agent_aware::DynamicRecord out;
   require(manager.get(42, out), "get overwritten id");
   require(out.sequence_id == 2, "new version sequence wins");
   require(out.vector == std::vector<float>({2.0f, 2.0f}),
@@ -109,8 +109,47 @@ void test_newer_node_version_wins() {
   require(manager.close(), "close version manager");
 }
 
+void test_update_and_erase_api() {
+  auto manager = agent_aware::dynamic::DynamicWriteManager(
+      options_for(test_dir("dynamic_update_erase")));
+  require(manager.open(), "open update erase manager");
+
+  const float first[] = {1.0f, 1.0f};
+  const float second[] = {2.0f, 2.0f};
+  require(manager.insert(64, first, 2), "insert before update");
+  require(manager.update(64, second, 2), "update dynamic record");
+
+  agent_aware::DynamicRecord out;
+  require(manager.get(64, out), "get updated record");
+  require(out.sequence_id == 2, "update advances sequence");
+  require(out.vector == std::vector<float>({2.0f, 2.0f}),
+          "update vector wins");
+  require(manager.erase(64), "erase dynamic record");
+  require(!manager.get(64, out), "erased record is hidden");
+  require(manager.close(), "close update erase manager");
+}
+
+void test_insert_records_incremental_neighbors() {
+  agent_aware::dynamic::DynamicWriteOptions options =
+      options_for(test_dir("dynamic_incremental_neighbors"));
+  options.dynamic_graph_degree = 1;
+  auto manager = agent_aware::dynamic::DynamicWriteManager(options);
+  require(manager.open(), "open neighbor manager");
+
+  const float first[] = {0.0f, 0.0f};
+  const float second[] = {0.1f, 0.0f};
+  require(manager.insert(1, first, 2), "insert first neighbor seed");
+  require(manager.insert(2, second, 2), "insert second with neighbor");
+
+  agent_aware::DynamicRecord out;
+  require(manager.get(2, out), "get second record");
+  require(out.neighbors.size() == 1, "incremental neighbor count");
+  require(out.neighbors[0] == 1, "incremental neighbor id");
+  require(manager.close(), "close neighbor manager");
+}
+
 void test_search_delta_l2_finds_inserted_vector() {
-  auto manager = agentmem::dynamic::DynamicWriteManager(
+  auto manager = agent_aware::dynamic::DynamicWriteManager(
       options_for(test_dir("dynamic_search_delta")));
   require(manager.open(), "open search delta manager");
 
@@ -127,7 +166,7 @@ void test_search_delta_l2_finds_inserted_vector() {
 }
 
 void test_base_and_delta_merge() {
-  auto manager = agentmem::dynamic::DynamicWriteManager(
+  auto manager = agent_aware::dynamic::DynamicWriteManager(
       options_for(test_dir("dynamic_merge")));
   require(manager.open(), "open merge manager");
 
@@ -135,12 +174,12 @@ void test_base_and_delta_merge() {
   const float query[] = {0.0f, 0.0f};
   require(manager.insert(500, delta_vector, 2), "insert merge delta vector");
 
-  const std::vector<agentmem::SearchResult> base_results = {
-      agentmem::SearchResult{1, 0.25f},
-      agentmem::SearchResult{2, 0.50f},
+  const std::vector<agent_aware::SearchResult> base_results = {
+      agent_aware::SearchResult{1, 0.25f},
+      agent_aware::SearchResult{2, 0.50f},
   };
   const auto delta_records = manager.search_delta_l2(query, 2, 2);
-  const auto merged = agentmem::dynamic::merge_base_and_delta_l2(
+  const auto merged = agent_aware::dynamic::merge_base_and_delta_l2(
       base_results, delta_records, query, 2, 2);
 
   require(merged.size() == 2, "merged topk count");
@@ -152,7 +191,7 @@ void test_base_and_delta_merge() {
 void test_flush_then_restart_loads_sstable() {
   const auto dir = test_dir("dynamic_flush_restart");
   {
-    auto manager = agentmem::dynamic::DynamicWriteManager(options_for(dir));
+    auto manager = agent_aware::dynamic::DynamicWriteManager(options_for(dir));
     require(manager.open(), "open flush restart writer");
     const float vector[] = {7.0f, 8.0f};
     require(manager.insert(77, vector, 2), "insert before flush restart");
@@ -160,9 +199,9 @@ void test_flush_then_restart_loads_sstable() {
     require(manager.close(), "close flush restart writer");
   }
   {
-    auto manager = agentmem::dynamic::DynamicWriteManager(options_for(dir));
+    auto manager = agent_aware::dynamic::DynamicWriteManager(options_for(dir));
     require(manager.open(), "open flush restart reader");
-    agentmem::DynamicRecord out;
+    agent_aware::DynamicRecord out;
     require(manager.get(77, out), "sstable record visible after restart");
     require(out.vector == std::vector<float>({7.0f, 8.0f}),
             "sstable restart vector");
@@ -177,6 +216,8 @@ int main() {
   test_restart_replays_wal();
   test_flush_keeps_record_readable();
   test_newer_node_version_wins();
+  test_update_and_erase_api();
+  test_insert_records_incremental_neighbors();
   test_search_delta_l2_finds_inserted_vector();
   test_base_and_delta_merge();
   test_flush_then_restart_loads_sstable();

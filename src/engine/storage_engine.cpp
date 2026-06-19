@@ -1,9 +1,9 @@
-#include "agentmem/engine/storage_engine.h"
+#include "agent_aware/engine/storage_engine.h"
 
 #include <stdexcept>
 #include <utility>
 
-namespace agentmem {
+namespace agent_aware {
 
 void StorageEngine::insert(std::uint32_t, const float*) {
   throw std::runtime_error("StorageEngine insert is not implemented");
@@ -11,6 +11,10 @@ void StorageEngine::insert(std::uint32_t, const float*) {
 
 void StorageEngine::update(std::uint32_t, const float*) {
   throw std::runtime_error("StorageEngine update is not implemented");
+}
+
+void StorageEngine::erase(std::uint32_t) {
+  throw std::runtime_error("StorageEngine erase is not implemented");
 }
 
 ExactMemoryEngine::ExactMemoryEngine(const VectorSet& base) : index_(base) {}
@@ -51,4 +55,31 @@ EngineSearchResult PackedGraphEngine::search_one(const float* query,
   return output;
 }
 
-}  // namespace agentmem
+void PackedGraphEngine::insert(std::uint32_t id, const float* vector) {
+  if (!config_.dynamic_manager) {
+    throw std::runtime_error("PackedGraphEngine insert requires DynamicWriteManager");
+  }
+  if (!config_.dynamic_manager->insert(id, vector, metadata().dim)) {
+    throw std::runtime_error("PackedGraphEngine insert failed");
+  }
+}
+
+void PackedGraphEngine::update(std::uint32_t id, const float* vector) {
+  if (!config_.dynamic_manager) {
+    throw std::runtime_error("PackedGraphEngine update requires DynamicWriteManager");
+  }
+  if (!config_.dynamic_manager->update(id, vector, metadata().dim)) {
+    throw std::runtime_error("PackedGraphEngine update failed");
+  }
+}
+
+void PackedGraphEngine::erase(std::uint32_t id) {
+  if (!config_.dynamic_manager) {
+    throw std::runtime_error("PackedGraphEngine erase requires DynamicWriteManager");
+  }
+  if (!config_.dynamic_manager->erase(id)) {
+    throw std::runtime_error("PackedGraphEngine erase failed");
+  }
+}
+
+}  // namespace agent_aware

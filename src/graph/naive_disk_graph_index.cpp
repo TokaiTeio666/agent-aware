@@ -1,4 +1,4 @@
-#include "agentmem/graph/naive_disk_graph_index.h"
+#include "agent_aware/graph/naive_disk_graph_index.h"
 
 #include <algorithm>
 #include <chrono>
@@ -13,18 +13,19 @@
 #include <unordered_set>
 #include <vector>
 
-#include "agentmem/core/async_page_reader.h"
-#include "agentmem/core/brute_force.h"
-#include "agentmem/graph/disk_page_codec.h"
+#include "agent_aware/core/async_page_reader.h"
+#include "agent_aware/core/brute_force.h"
+#include "agent_aware/graph/disk_page_codec.h"
 
-namespace agentmem {
+namespace agent_aware {
 namespace {
 
 constexpr char kMagic[8] = {'A', 'M', 'F', 'G', 'V', '1', '\0', '\0'};
 constexpr std::uint32_t kVersion = 1;
 
-std::size_t record_bytes(std::size_t dim, std::size_t degree) {
-  return graph_record_bytes(dim, degree);
+std::size_t record_bytes(std::size_t dim, std::size_t degree,
+                         std::size_t neighbor_pq_code_bytes = 0) {
+  return graph_record_bytes(dim, degree, neighbor_pq_code_bytes);
 }
 
 struct CloserFirst {
@@ -117,6 +118,7 @@ NaiveDiskGraphIndex::NaiveDiskGraphIndex(const std::string& path)
   metadata_.degree = read_value<std::uint32_t>(input_);
   metadata_.page_size = read_value<std::uint32_t>(input_);
   metadata_.records_offset = read_value<std::uint64_t>(input_);
+  metadata_.neighbor_pq_code_bytes = read_value<std::uint32_t>(input_);
   metadata_.directory_offset = 0;
   metadata_.page_count = metadata_.vector_count;
   metadata_.nodes_per_page = 1;
@@ -125,7 +127,8 @@ NaiveDiskGraphIndex::NaiveDiskGraphIndex(const std::string& path)
       metadata_.degree == 0 || metadata_.page_size == 0) {
     throw std::runtime_error("Graph index metadata is invalid");
   }
-  if (record_bytes(metadata_.dim, metadata_.degree) > metadata_.page_size) {
+  if (record_bytes(metadata_.dim, metadata_.degree,
+                   metadata_.neighbor_pq_code_bytes) > metadata_.page_size) {
     throw std::runtime_error("Graph index record is larger than page size");
   }
   page_reader_ = std::make_unique<AsyncPageReader>(path_, metadata_.page_size);
@@ -176,6 +179,19 @@ NaiveDiskGraphIndex::DiskNode NaiveDiskGraphIndex::read_node(
     const auto neighbor = get_bytes<std::uint32_t>(page, cursor);
     if (i < degree && neighbor != std::numeric_limits<std::uint32_t>::max()) {
       node.neighbors.push_back(neighbor);
+    }
+  }
+  if (metadata_.neighbor_pq_code_bytes > 0) {
+    node.neighbor_pq_codes.resize(
+        static_cast<std::size_t>(degree) * metadata_.neighbor_pq_code_bytes);
+    std::size_t written = 0;
+    for (std::uint32_t i = 0; i < metadata_.degree; ++i) {
+      for (std::size_t b = 0; b < metadata_.neighbor_pq_code_bytes; ++b) {
+        const auto code = get_bytes<std::uint8_t>(page, cursor);
+        if (i < degree) {
+          node.neighbor_pq_codes[written++] = code;
+        }
+      }
     }
   }
   return node;
@@ -357,4 +373,4 @@ DiskGraphSearchResult NaiveDiskGraphIndex::search_one(
 }
 
 
-}  // namespace agentmem
+}  // namespace agent_aware

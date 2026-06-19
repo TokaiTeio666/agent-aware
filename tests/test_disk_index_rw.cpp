@@ -6,11 +6,11 @@
 #include <string>
 #include <vector>
 
-#include "agentmem/storage/disk_index_reader.h"
-#include "agentmem/storage/disk_index_writer.h"
+#include "agent_aware/storage/disk_index_reader.h"
+#include "agent_aware/storage/disk_index_writer.h"
 
-#ifndef AGENTMEM_ENABLE_DIRECT_IO
-#define AGENTMEM_ENABLE_DIRECT_IO 1
+#ifndef AGENT_AWARE_ENABLE_DIRECT_IO
+#define AGENT_AWARE_ENABLE_DIRECT_IO 1
 #endif
 
 namespace {
@@ -24,6 +24,7 @@ void require(bool condition, const char* message) {
 struct Fixture {
   std::vector<std::vector<float>> vectors;
   std::vector<std::vector<std::uint32_t>> neighbors;
+  std::vector<std::vector<std::uint8_t>> neighbor_pq_codes;
 };
 
 Fixture make_fixture(std::size_t nodes, std::uint32_t dim,
@@ -31,6 +32,7 @@ Fixture make_fixture(std::size_t nodes, std::uint32_t dim,
   Fixture fixture;
   fixture.vectors.resize(nodes);
   fixture.neighbors.resize(nodes);
+  fixture.neighbor_pq_codes.resize(nodes);
 
   for (std::size_t node = 0; node < nodes; ++node) {
     auto& vector = fixture.vectors[node];
@@ -45,16 +47,24 @@ Fixture make_fixture(std::size_t nodes, std::uint32_t dim,
     for (std::uint32_t j = 0; j < degree; ++j) {
       neighbors.push_back(static_cast<std::uint32_t>((node + j + 1) % nodes));
     }
+    auto& pq_codes = fixture.neighbor_pq_codes[node];
+    pq_codes.resize(static_cast<std::size_t>(degree) * 2);
+    for (std::size_t j = 0; j < pq_codes.size(); ++j) {
+      pq_codes[j] = static_cast<std::uint8_t>((node + j) % 251);
+    }
   }
   return fixture;
 }
 
-void compare_record(const agentmem::NodeRecord& record, std::uint32_t node_id,
+void compare_record(const agent_aware::NodeRecord& record, std::uint32_t node_id,
                     const Fixture& fixture) {
   require(record.node_id == node_id, "read node id matches");
   require(record.vector == fixture.vectors[node_id], "read vector matches");
   require(record.neighbors == fixture.neighbors[node_id],
           "read neighbors match");
+  require(record.neighbor_pq_code_bytes == 2, "read pq code width matches");
+  require(record.neighbor_pq_codes == fixture.neighbor_pq_codes[node_id],
+          "read pq codes match");
 }
 
 std::filesystem::path test_path(const std::string& name) {
@@ -72,24 +82,25 @@ void test_index_rw(bool direct_io, const std::string& name) {
   const Fixture fixture = make_fixture(kNodes, kDim, kMaxDegree);
 
   {
-    agentmem::DiskIndexWriter writer(path.string(), kDim, kMaxDegree,
+    agent_aware::DiskIndexWriter writer(path.string(), kDim, kMaxDegree,
                                      direct_io);
     writer.write_header(kNodes, 0);
     for (std::uint32_t node = 0; node < kNodes; ++node) {
       writer.write_node(node, fixture.vectors[node].data(), kDim,
-                        fixture.neighbors[node]);
+                        fixture.neighbors[node],
+                        fixture.neighbor_pq_codes[node], 2);
     }
     writer.close();
   }
 
   {
-    agentmem::DiskIndexReader reader(path.string(), direct_io);
+    agent_aware::DiskIndexReader reader(path.string(), direct_io);
     require(reader.header().dim == kDim, "header dim");
     require(reader.header().num_nodes == kNodes, "header node count");
     require(reader.header().max_degree == kMaxDegree, "header max degree");
-    require(reader.header().record_size == agentmem::kDiskIndexPageSize,
+    require(reader.header().record_size == agent_aware::kDiskIndexPageSize,
             "header record size");
-    require(reader.header().header_size == agentmem::kDiskIndexPageSize,
+    require(reader.header().header_size == agent_aware::kDiskIndexPageSize,
             "header header size");
 
     std::mt19937 rng(123);
@@ -120,7 +131,7 @@ void test_writer_rejects_degree_overflow() {
 
   std::vector<float> vector(kDim, 1.0f);
   std::vector<std::uint32_t> neighbors = {1, 2, 3, 4, 5};
-  agentmem::DiskIndexWriter writer(path.string(), kDim, kMaxDegree, false);
+  agent_aware::DiskIndexWriter writer(path.string(), kDim, kMaxDegree, false);
   writer.write_header(1, 0);
 
   bool threw = false;
@@ -138,7 +149,7 @@ void test_writer_rejects_degree_overflow() {
 
 int main() {
   test_index_rw(false, "disk_index_rw_stream.ssdindex");
-#if defined(__linux__) && AGENTMEM_ENABLE_DIRECT_IO
+#if defined(__linux__) && AGENT_AWARE_ENABLE_DIRECT_IO
   test_index_rw(true, "disk_index_rw_direct.ssdindex");
 #endif
   test_writer_rejects_degree_overflow();

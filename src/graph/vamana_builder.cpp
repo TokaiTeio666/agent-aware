@@ -1,4 +1,4 @@
-#include "agentmem/graph/vamana_builder.h"
+#include "agent_aware/graph/vamana_builder.h"
 
 #include <algorithm>
 #include <limits>
@@ -9,9 +9,9 @@
 #include <unordered_set>
 #include <utility>
 
-#include "agentmem/core/simd_distance.h"
+#include "agent_aware/core/simd_distance.h"
 
-namespace agentmem {
+namespace agent_aware {
 namespace {
 
 struct Candidate {
@@ -48,6 +48,15 @@ bool contains_id(const std::vector<std::uint32_t>& ids, std::uint32_t target) {
   return std::find(ids.begin(), ids.end(), target) != ids.end();
 }
 
+bool is_deleted(const std::vector<char>& deleted, std::uint32_t id) {
+  return !deleted.empty() &&
+         (id >= deleted.size() || deleted[static_cast<std::size_t>(id)]);
+}
+
+bool is_deleted(const std::vector<char>& deleted, std::size_t id) {
+  return !deleted.empty() && (id >= deleted.size() || deleted[id]);
+}
+
 std::vector<std::uint32_t> unique_ids(std::vector<std::uint32_t> ids,
                                       std::uint32_t excluded,
                                       const std::vector<char>& deleted) {
@@ -57,7 +66,7 @@ std::vector<std::uint32_t> unique_ids(std::vector<std::uint32_t> ids,
   std::unordered_set<std::uint32_t> seen;
   seen.reserve(ids.size());
   for (const auto id : ids) {
-    if (id == excluded || id >= deleted.size() || deleted[id]) {
+    if (id == excluded || is_deleted(deleted, id)) {
       continue;
     }
     if (seen.insert(id).second) {
@@ -98,7 +107,7 @@ VamanaGraph VamanaBuilder::build(const VectorSet& base) const {
 
   const auto order = build_order(base.size());
   for (const auto node_id : order) {
-    if (node_id >= deleted.size() || deleted[node_id]) {
+    if (is_deleted(deleted, node_id)) {
       output.adjacency[node_id].clear();
       continue;
     }
@@ -118,7 +127,7 @@ std::uint32_t VamanaBuilder::find_medoid(const VectorSet& base) const {
   std::vector<float> centroid(base.dim, 0.0f);
   std::size_t valid_count = 0;
   for (std::size_t i = 0; i < base.size(); ++i) {
-    if (i < deleted.size() && deleted[i]) {
+    if (is_deleted(deleted, i)) {
       continue;
     }
     const float* row = base.row(i);
@@ -138,7 +147,7 @@ std::uint32_t VamanaBuilder::find_medoid(const VectorSet& base) const {
   std::uint32_t best = std::numeric_limits<std::uint32_t>::max();
   float best_distance = std::numeric_limits<float>::max();
   for (std::size_t i = 0; i < base.size(); ++i) {
-    if (i < deleted.size() && deleted[i]) {
+    if (is_deleted(deleted, i)) {
       continue;
     }
     const float distance =
@@ -165,21 +174,32 @@ std::vector<std::uint32_t> VamanaBuilder::search_for_construction(
     throw std::runtime_error("Vamana construction graph size mismatch");
   }
   const auto deleted = deleted_mask(base.size());
-  if (entry_id >= graph.size() || deleted[entry_id]) {
+  if (entry_id >= graph.size() || is_deleted(deleted, entry_id)) {
     entry_id = find_medoid(base);
   }
 
-  std::vector<char> visited(graph.size(), 0);
+  thread_local std::vector<std::uint32_t> visited_epoch;
+  thread_local std::uint32_t current_epoch = 0;
+  if (visited_epoch.size() < graph.size()) {
+    visited_epoch.assign(graph.size(), 0);
+  }
+  if (current_epoch == std::numeric_limits<std::uint32_t>::max()) {
+    std::fill(visited_epoch.begin(), visited_epoch.end(), 0);
+    current_epoch = 0;
+  }
+  ++current_epoch;
   std::priority_queue<Candidate, std::vector<Candidate>, CloserFirst> frontier;
   std::vector<Candidate> explored;
   explored.reserve(std::min(config_.search_width, graph.size()));
 
   auto push = [&](std::uint32_t id) {
-    if (id >= graph.size() || id == excluded_id || deleted[id] ||
-        visited[id]) {
+    if (id >= graph.size() || id == excluded_id || is_deleted(deleted, id)) {
       return;
     }
-    visited[id] = 1;
+    if (visited_epoch[id] == current_epoch) {
+      return;
+    }
+    visited_epoch[id] = current_epoch;
     frontier.push(
         Candidate{id, l2_distance_sq_simd(query, base.row(id), base.dim)});
   };
@@ -220,7 +240,7 @@ std::vector<std::uint32_t> VamanaBuilder::robust_prune(
     throw std::runtime_error("Vamana robust_prune node id out of range");
   }
   const auto deleted = deleted_mask(base.size());
-  if (node_id >= deleted.size() || deleted[node_id]) {
+  if (is_deleted(deleted, node_id)) {
     return {};
   }
 
@@ -277,7 +297,7 @@ void VamanaBuilder::insert(const VectorSet& base,
     throw std::runtime_error("Vamana insert node id out of range");
   }
   const auto deleted = deleted_mask(base.size());
-  if (deleted[node_id]) {
+  if (is_deleted(deleted, node_id)) {
     graph[node_id].clear();
     return;
   }
@@ -303,6 +323,9 @@ void VamanaBuilder::insert(const VectorSet& base,
 }
 
 std::vector<char> VamanaBuilder::deleted_mask(std::size_t count) const {
+  if (config_.deleted_ids.empty()) {
+    return {};
+  }
   std::vector<char> deleted(count, 0);
   for (const auto id : config_.deleted_ids) {
     if (id < count) {
@@ -325,7 +348,7 @@ std::vector<std::vector<std::uint32_t>> VamanaBuilder::initial_graph(
       ring_degree, std::min<std::size_t>(config_.search_width, base.size() - 1));
 
   for (std::size_t i = 0; i < base.size(); ++i) {
-    if (i < deleted.size() && deleted[i]) {
+    if (is_deleted(deleted, i)) {
       continue;
     }
     std::vector<std::uint32_t> candidates;
@@ -370,7 +393,8 @@ void VamanaBuilder::add_reverse_edge(
     return;
   }
   const auto deleted = deleted_mask(base.size());
-  if (deleted[source] || deleted[target] || contains_id(graph[target], source)) {
+  if (is_deleted(deleted, source) || is_deleted(deleted, target) ||
+      contains_id(graph[target], source)) {
     return;
   }
 
@@ -431,4 +455,4 @@ void VamanaBuilder::finalize_stats(
   stats.candidate_p99 = percentile(0.99);
 }
 
-}  // namespace agentmem
+}  // namespace agent_aware

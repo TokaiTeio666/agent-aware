@@ -1,4 +1,4 @@
-#include "agentmem/core/async_page_reader.h"
+#include "agent_aware/core/async_page_reader.h"
 
 #include <algorithm>
 #include <cerrno>
@@ -10,21 +10,21 @@
 #include <unordered_map>
 #include <utility>
 
-#include "agentmem/graph/disk_graph_index.h"
+#include "agent_aware/graph/disk_graph_index.h"
 
 #ifdef __linux__
 #include <fcntl.h>
 #include <unistd.h>
 #endif
 
-#if defined(__linux__) && AGENTMEM_HAS_LIBURING
+#if defined(__linux__) && AGENT_AWARE_HAS_LIBURING
 #include <liburing.h>
-#define AGENTMEM_ASYNC_CAN_USE_LIBURING 1
+#define AGENT_AWARE_ASYNC_CAN_USE_LIBURING 1
 #else
-#define AGENTMEM_ASYNC_CAN_USE_LIBURING 0
+#define AGENT_AWARE_ASYNC_CAN_USE_LIBURING 0
 #endif
 
-namespace agentmem {
+namespace agent_aware {
 namespace {
 
 #ifdef __linux__
@@ -123,7 +123,7 @@ class AlignedBufferPool {
   std::size_t alignment_ = 0;
 };
 
-#if AGENTMEM_ASYNC_CAN_USE_LIBURING
+#if AGENT_AWARE_ASYNC_CAN_USE_LIBURING
 class LibUring {
  public:
   LibUring() = default;
@@ -323,7 +323,7 @@ struct AsyncPageReader::Impl {
       return;
     }
 
-#if AGENTMEM_ASYNC_CAN_USE_LIBURING
+#if AGENT_AWARE_ASYNC_CAN_USE_LIBURING
     bool direct_opened = false;
     if (direct_io_layout_supported()) {
       direct_opened = try_open_linux_fd(O_RDONLY | O_CLOEXEC | O_DIRECT);
@@ -380,7 +380,7 @@ struct AsyncPageReader::Impl {
       throw std::runtime_error("Async graph reads require io_uring mode");
     }
 #ifdef __linux__
-#if AGENTMEM_ASYNC_CAN_USE_LIBURING
+#if AGENT_AWARE_ASYNC_CAN_USE_LIBURING
     if (status.direct_enabled &&
         (offset % kDirectIoAlignment != 0 || bytes % kDirectIoAlignment != 0)) {
       throw std::runtime_error(
@@ -460,7 +460,7 @@ struct AsyncPageReader::Impl {
       return;
     }
 #ifdef __linux__
-#if AGENTMEM_ASYNC_CAN_USE_LIBURING
+#if AGENT_AWARE_ASYNC_CAN_USE_LIBURING
     std::string reason;
     std::size_t submit_syscalls = 0;
     if (!ring.submit_queued(reason, &submit_syscalls)) {
@@ -487,7 +487,7 @@ struct AsyncPageReader::Impl {
       return false;
     }
 #ifdef __linux__
-#if AGENTMEM_ASYNC_CAN_USE_LIBURING
+#if AGENT_AWARE_ASYNC_CAN_USE_LIBURING
     LibUring::Completion completion;
     std::string reason;
     if (!ring.pop_completion(completion, wait, reason)) {
@@ -566,7 +566,7 @@ struct AsyncPageReader::Impl {
       bool ok = false;
       std::string reason;
       if (status.effective_mode == "io_uring") {
-#if AGENTMEM_ASYNC_CAN_USE_LIBURING
+#if AGENT_AWARE_ASYNC_CAN_USE_LIBURING
         ok = ring.read(fd, offset, aligned, bytes, stats, reason);
         ++stats.p4_io.sync_reads;
         ++stats.p4_io.ssd_reads;
@@ -677,7 +677,7 @@ struct AsyncPageReader::Impl {
     inline_completions.clear();
     async_buffer_pool.reset();
 #ifdef __linux__
-#if AGENTMEM_ASYNC_CAN_USE_LIBURING
+#if AGENT_AWARE_ASYNC_CAN_USE_LIBURING
     ring.close();
 #endif
     if (fd >= 0) {
@@ -700,7 +700,7 @@ struct AsyncPageReader::Impl {
   std::uint64_t next_async_token = 1;
 #ifdef __linux__
   int fd = -1;
-#if AGENTMEM_ASYNC_CAN_USE_LIBURING
+#if AGENT_AWARE_ASYNC_CAN_USE_LIBURING
   LibUring ring;
 #endif
 #else
@@ -761,4 +761,4 @@ bool AsyncPageReader::reap_async_read(bool wait, CompletedRead& completed,
   return impl_->reap_async_read(wait, completed, stats);
 }
 
-}  // namespace agentmem
+}  // namespace agent_aware

@@ -1,4 +1,4 @@
-#include "agentmem/core/brute_force.h"
+#include "agent_aware/core/brute_force.h"
 
 #include <algorithm>
 #include <queue>
@@ -9,7 +9,7 @@
 #include <immintrin.h>
 #endif
 
-namespace agentmem {
+namespace agent_aware {
 namespace {
 
 struct HeapItem {
@@ -150,4 +150,4 @@ std::vector<std::vector<SearchResult>> search_memory_fast_batch(
   return all_results;
 }
 
-}  // namespace agentmem
+}  // namespace agent_aware

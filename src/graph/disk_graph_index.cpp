@@ -1,4 +1,4 @@
-#include "agentmem/graph/disk_graph_index.h"
+#include "agent_aware/graph/disk_graph_index.h"
 
 #include <algorithm>
 #include <atomic>
@@ -16,13 +16,14 @@
 #include <unordered_set>
 #include <utility>
 
-#include "agentmem/core/async_page_reader.h"
-#include "agentmem/core/brute_force.h"
-#include "agentmem/core/query_page_session.h"
-#include "agentmem/graph/disk_page_codec.h"
-#include "agentmem/graph/vamana_builder.h"
+#include "agent_aware/core/async_page_reader.h"
+#include "agent_aware/core/brute_force.h"
+#include "agent_aware/core/query_page_session.h"
+#include "agent_aware/graph/disk_page_codec.h"
+#include "agent_aware/graph/entry_selector.h"
+#include "agent_aware/graph/vamana_builder.h"
 
-namespace agentmem {
+namespace agent_aware {
 namespace {
 
 struct CloserFirst {
@@ -42,35 +43,6 @@ struct WorseResultFirst {
     return lhs.distance < rhs.distance;
   }
 };
-
-std::vector<std::uint32_t> entry_points(std::uint64_t count,
-                                        std::size_t requested) {
-  std::vector<std::uint32_t> entries;
-  if (count == 0 || requested == 0) {
-    return entries;
-  }
-
-  const std::size_t actual =
-      std::min<std::size_t>(requested, static_cast<std::size_t>(count));
-  std::unordered_set<std::uint32_t> seen;
-  entries.reserve(actual);
-
-  for (std::size_t i = 0; i < actual; ++i) {
-    std::uint64_t id = 0;
-    if (actual == 1) {
-      id = 0;
-    } else {
-      id = (static_cast<std::uint64_t>(i) * (count - 1)) /
-           static_cast<std::uint64_t>(actual - 1);
-    }
-    const auto id32 = static_cast<std::uint32_t>(id);
-    if (seen.insert(id32).second) {
-      entries.push_back(id32);
-    }
-  }
-
-  return entries;
-}
 
 std::vector<SearchResult> sorted_results(
     std::priority_queue<SearchResult, std::vector<SearchResult>,
@@ -203,11 +175,17 @@ PackedDiskGraphIndex::PackedDiskGraphIndex(const std::string& path)
   metadata_.directory_offset = read_value<std::uint64_t>(input_);
   metadata_.page_count = read_value<std::uint64_t>(input_);
   metadata_.nodes_per_page = read_value<std::uint32_t>(input_);
+  metadata_.neighbor_pq_code_bytes = read_value<std::uint32_t>(input_);
 
   if (metadata_.vector_count == 0 || metadata_.dim == 0 ||
       metadata_.degree == 0 || metadata_.page_size == 0 ||
       metadata_.page_count == 0 || metadata_.nodes_per_page == 0) {
     throw std::runtime_error("Packed graph index metadata is invalid");
+  }
+  if (graph_record_bytes(metadata_.dim, metadata_.degree,
+                         metadata_.neighbor_pq_code_bytes) >
+      metadata_.page_size) {
+    throw std::runtime_error("Packed graph node payload exceeds page size");
   }
 
   node_to_page_.resize(static_cast<std::size_t>(metadata_.vector_count));
@@ -334,6 +312,11 @@ void PackedDiskGraphIndex::configure_io(const std::string& mode,
 
 const DiskGraphIoStatus& PackedDiskGraphIndex::io_status() const {
   return page_reader_->status();
+}
+
+const std::vector<std::uint32_t>& PackedDiskGraphIndex::node_in_degrees() {
+  ensure_node_in_degrees();
+  return node_in_degrees_;
 }
 
 PackedDiskGraphIndex::DecodedPage PackedDiskGraphIndex::read_page(
@@ -653,7 +636,8 @@ PackedDiskGraphIndex::initialize_search_state(
 
   const std::vector<std::uint32_t> entries =
       config.seed_ids.empty()
-          ? entry_points(metadata_.vector_count, config.entry_count)
+          ? select_evenly_spaced_entries(metadata_.vector_count,
+                                         config.entry_count)
           : config.seed_ids;
 
   state->session.submit_next_hop_prefetch(entries, state->visited);
@@ -860,4 +844,4 @@ DiskGraphSearchResult PackedDiskGraphIndex::search_one(
 }
 
 
-}  // namespace agentmem
+}  // namespace agent_aware

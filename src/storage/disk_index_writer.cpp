@@ -1,29 +1,29 @@
-#include "agentmem/storage/disk_index_writer.h"
+#include "agent_aware/storage/disk_index_writer.h"
 
 #include <cerrno>
 #include <cstring>
 #include <limits>
 #include <stdexcept>
 
-#ifndef AGENTMEM_ENABLE_DIRECT_IO
-#define AGENTMEM_ENABLE_DIRECT_IO 1
+#ifndef AGENT_AWARE_ENABLE_DIRECT_IO
+#define AGENT_AWARE_ENABLE_DIRECT_IO 1
 #endif
 
 #if !defined(_WIN32)
 #include <fcntl.h>
 #include <unistd.h>
-#define AGENTMEM_CAN_USE_POSIX_IO 1
+#define AGENT_AWARE_CAN_USE_POSIX_IO 1
 #else
-#define AGENTMEM_CAN_USE_POSIX_IO 0
+#define AGENT_AWARE_CAN_USE_POSIX_IO 0
 #endif
 
-#if defined(__linux__) && AGENTMEM_ENABLE_DIRECT_IO
-#define AGENTMEM_CAN_USE_DIRECT_IO 1
+#if defined(__linux__) && AGENT_AWARE_ENABLE_DIRECT_IO
+#define AGENT_AWARE_CAN_USE_DIRECT_IO 1
 #else
-#define AGENTMEM_CAN_USE_DIRECT_IO 0
+#define AGENT_AWARE_CAN_USE_DIRECT_IO 0
 #endif
 
-namespace agentmem {
+namespace agent_aware {
 namespace {
 
 std::string errno_message(const std::string& prefix, const std::string& path) {
@@ -38,7 +38,7 @@ std::streamoff checked_stream_offset(std::uint64_t offset) {
   return static_cast<std::streamoff>(offset);
 }
 
-#if AGENTMEM_CAN_USE_POSIX_IO
+#if AGENT_AWARE_CAN_USE_POSIX_IO
 void write_posix_page(int fd, const void* buffer, std::size_t bytes,
                       std::uint64_t offset, bool direct,
                       const std::string& path) {
@@ -84,10 +84,10 @@ DiskIndexWriter::DiskIndexWriter(const std::string& path, std::uint32_t dim,
       use_direct_io_(use_direct_io) {
   validate_disk_record_shape(dim_, max_degree_);
 
-#if AGENTMEM_CAN_USE_POSIX_IO
+#if AGENT_AWARE_CAN_USE_POSIX_IO
   int flags = O_CREAT | O_TRUNC | O_WRONLY;
   if (use_direct_io_) {
-#if AGENTMEM_CAN_USE_DIRECT_IO
+#if AGENT_AWARE_CAN_USE_DIRECT_IO
     flags |= O_DIRECT;
 #else
     throw std::runtime_error("O_DIRECT is unavailable in this build");
@@ -129,7 +129,9 @@ void DiskIndexWriter::write_header(std::uint64_t num_nodes,
 
 void DiskIndexWriter::write_node(
     std::uint32_t node_id, const float* vector, std::uint32_t dim,
-    const std::vector<std::uint32_t>& neighbors) {
+    const std::vector<std::uint32_t>& neighbors,
+    const std::vector<std::uint8_t>& neighbor_pq_codes,
+    std::uint16_t neighbor_pq_code_bytes) {
   if (closed_) {
     throw std::runtime_error("Cannot write to closed disk index writer");
   }
@@ -145,12 +147,13 @@ void DiskIndexWriter::write_node(
 
   auto page = allocate_aligned_buffer();
   encode_node_record(node_id, vector, dim, neighbors, page.get(),
-                     kDiskIndexPageSize);
+                     kDiskIndexPageSize, neighbor_pq_codes,
+                     neighbor_pq_code_bytes);
   write_page_at(page.get(), disk_record_offset(node_id, header_));
 }
 
 void DiskIndexWriter::write_page_at(const void* buffer, std::uint64_t offset) {
-#if AGENTMEM_CAN_USE_POSIX_IO
+#if AGENT_AWARE_CAN_USE_POSIX_IO
   if (fd_ >= 0) {
     write_posix_page(fd_, buffer, kDiskIndexPageSize, offset, use_direct_io_,
                      path_);
@@ -174,7 +177,7 @@ void DiskIndexWriter::close() {
     return;
   }
 
-#if AGENTMEM_CAN_USE_POSIX_IO
+#if AGENT_AWARE_CAN_USE_POSIX_IO
   if (fd_ >= 0) {
     if (::fsync(fd_) != 0) {
       const auto message = errno_message("Failed to fsync disk index", path_);
@@ -207,4 +210,4 @@ void DiskIndexWriter::close() {
   closed_ = true;
 }
 
-}  // namespace agentmem
+}  // namespace agent_aware

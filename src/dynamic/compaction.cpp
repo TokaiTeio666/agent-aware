@@ -1,4 +1,4 @@
-#include "agentmem/dynamic/compaction.h"
+#include "agent_aware/dynamic/compaction.h"
 
 #include <algorithm>
 #include <iomanip>
@@ -7,7 +7,7 @@
 #include <unordered_map>
 #include <utility>
 
-namespace agentmem::dynamic {
+namespace agent_aware::dynamic {
 namespace {
 
 std::string sstable_name(std::uint64_t sstable_id) {
@@ -75,4 +75,4 @@ CompactionResult CompactionJob::run() {
   return result;
 }
 
-}  // namespace agentmem::dynamic
+}  // namespace agent_aware::dynamic

@@ -1,29 +1,29 @@
-#include "agentmem/storage/disk_index_reader.h"
+#include "agent_aware/storage/disk_index_reader.h"
 
 #include <cerrno>
 #include <cstring>
 #include <limits>
 #include <stdexcept>
 
-#ifndef AGENTMEM_ENABLE_DIRECT_IO
-#define AGENTMEM_ENABLE_DIRECT_IO 1
+#ifndef AGENT_AWARE_ENABLE_DIRECT_IO
+#define AGENT_AWARE_ENABLE_DIRECT_IO 1
 #endif
 
 #if !defined(_WIN32)
 #include <fcntl.h>
 #include <unistd.h>
-#define AGENTMEM_CAN_USE_POSIX_IO 1
+#define AGENT_AWARE_CAN_USE_POSIX_IO 1
 #else
-#define AGENTMEM_CAN_USE_POSIX_IO 0
+#define AGENT_AWARE_CAN_USE_POSIX_IO 0
 #endif
 
-#if defined(__linux__) && AGENTMEM_ENABLE_DIRECT_IO
-#define AGENTMEM_CAN_USE_DIRECT_IO 1
+#if defined(__linux__) && AGENT_AWARE_ENABLE_DIRECT_IO
+#define AGENT_AWARE_CAN_USE_DIRECT_IO 1
 #else
-#define AGENTMEM_CAN_USE_DIRECT_IO 0
+#define AGENT_AWARE_CAN_USE_DIRECT_IO 0
 #endif
 
-namespace agentmem {
+namespace agent_aware {
 namespace {
 
 std::string errno_message(const std::string& prefix, const std::string& path) {
@@ -44,7 +44,7 @@ void require_direct_aligned(const void* buffer) {
   }
 }
 
-#if AGENTMEM_CAN_USE_POSIX_IO
+#if AGENT_AWARE_CAN_USE_POSIX_IO
 void read_posix_page(int fd, void* buffer, std::size_t bytes,
                      std::uint64_t offset, bool direct,
                      const std::string& path) {
@@ -83,10 +83,10 @@ void read_posix_page(int fd, void* buffer, std::size_t bytes,
 
 DiskIndexReader::DiskIndexReader(const std::string& path, bool use_direct_io)
     : path_(path), use_direct_io_(use_direct_io) {
-#if AGENTMEM_CAN_USE_POSIX_IO
+#if AGENT_AWARE_CAN_USE_POSIX_IO
   int flags = O_RDONLY;
   if (use_direct_io_) {
-#if AGENTMEM_CAN_USE_DIRECT_IO
+#if AGENT_AWARE_CAN_USE_DIRECT_IO
     flags |= O_DIRECT;
 #else
     throw std::runtime_error("O_DIRECT is unavailable in this build");
@@ -150,7 +150,7 @@ void DiskIndexReader::read_node_into(std::uint32_t node_id,
 }
 
 void DiskIndexReader::read_page_at(void* buffer, std::uint64_t offset) {
-#if AGENTMEM_CAN_USE_POSIX_IO
+#if AGENT_AWARE_CAN_USE_POSIX_IO
   if (fd_ >= 0) {
     read_posix_page(fd_, buffer, kDiskIndexPageSize, offset, use_direct_io_,
                     path_);
@@ -174,7 +174,7 @@ void DiskIndexReader::close() {
     return;
   }
 
-#if AGENTMEM_CAN_USE_POSIX_IO
+#if AGENT_AWARE_CAN_USE_POSIX_IO
   if (fd_ >= 0) {
     if (::close(fd_) != 0) {
       fd_ = -1;
@@ -195,4 +195,4 @@ void DiskIndexReader::close() {
   closed_ = true;
 }
 
-}  // namespace agentmem
+}  // namespace agent_aware
