@@ -15,6 +15,7 @@ namespace agent_aware {
 
 struct EngineSearchStats {
   bool used_graph_path = false;
+  std::uint64_t dynamic_read_sequence = 0;
   DiskGraphSearchStats graph;
 };
 

@@ -5,6 +5,8 @@
 #include <filesystem>
 #include <memory>
 #include <mutex>
+#include <optional>
+#include <unordered_map>
 #include <vector>
 
 #include "agent_aware/core/types.h"
@@ -24,6 +26,21 @@ struct DynamicWriteOptions {
   bool enable_auto_flush = true;
 };
 
+struct DynamicSnapshot {
+  std::uint64_t read_sequence = 0;
+  std::vector<DynamicRecord> records;
+  std::size_t deleted_count = 0;
+};
+
+struct DynamicCompactionStats {
+  bool attempted = false;
+  bool success = false;
+  std::size_t input_table_count = 0;
+  std::size_t input_record_count = 0;
+  std::size_t output_record_count = 0;
+  std::uint64_t output_sstable_id = 0;
+};
+
 class DynamicWriteManager {
  public:
   explicit DynamicWriteManager(DynamicWriteOptions options);
@@ -36,11 +53,27 @@ class DynamicWriteManager {
 
   bool get(NodeId node_id, DynamicRecord& out) const;
 
+  std::uint64_t current_sequence() const;
+  std::optional<DynamicRecord> latest_record(
+      NodeId node_id, std::uint64_t read_sequence,
+      bool include_deleted = true) const;
+  std::unordered_map<NodeId, DynamicRecord> latest_records_for(
+      const std::vector<NodeId>& node_ids, std::uint64_t read_sequence,
+      bool include_deleted = true) const;
+  DynamicSnapshot snapshot(std::uint64_t read_sequence) const;
+
   std::vector<DynamicRecord> collect_all_delta_records() const;
+  std::vector<DynamicRecord> collect_all_delta_records_at(
+      std::uint64_t read_sequence) const;
 
   std::vector<DynamicRecord> search_delta_l2(const float* query,
                                              std::uint32_t dim,
                                              std::size_t topk) const;
+  std::vector<DynamicRecord> search_delta_l2_at(
+      const float* query, std::uint32_t dim, std::size_t topk,
+      std::uint64_t read_sequence) const;
+
+  bool compact_once(DynamicCompactionStats* stats = nullptr);
 
   bool close();
 
@@ -48,9 +81,12 @@ class DynamicWriteManager {
   bool append_record_locked(DynamicRecord record);
   bool flush_locked();
   bool rotate_wal_locked();
+  bool latest_record_locked(NodeId node_id, std::uint64_t read_sequence,
+                            bool include_deleted, DynamicRecord& out) const;
   std::vector<NodeId> select_incremental_neighbors_locked(
       NodeId node_id, const float* vector, std::uint32_t dim) const;
-  std::vector<DynamicRecord> collect_all_delta_records_locked() const;
+  std::vector<DynamicRecord> collect_all_delta_records_locked(
+      std::uint64_t read_sequence = UINT64_MAX) const;
   std::filesystem::path manifest_path() const;
   std::filesystem::path wal_dir() const;
   std::filesystem::path wal_path() const;
@@ -62,6 +98,7 @@ class DynamicWriteManager {
   std::unique_ptr<MemTable> memtable_;
   std::unique_ptr<WalWriter> wal_writer_;
   std::vector<std::shared_ptr<SSTableReader>> sstables_;
+  std::vector<DynamicRecord> recent_records_;
   bool opened_ = false;
 };
 

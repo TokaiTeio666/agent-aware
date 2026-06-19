@@ -188,6 +188,106 @@ void test_base_and_delta_merge() {
   require(manager.close(), "close merge manager");
 }
 
+void test_sequence_snapshot_and_latest_record() {
+  auto manager = agent_aware::dynamic::DynamicWriteManager(
+      options_for(test_dir("dynamic_sequence_snapshot")));
+  require(manager.open(), "open sequence manager");
+
+  const float first[] = {1.0f, 0.0f};
+  const float second[] = {2.0f, 0.0f};
+  const float query[] = {1.0f, 0.0f};
+  require(manager.insert(90, first, 2), "insert snapshot first");
+  const auto seq_first = manager.current_sequence();
+  require(manager.update(90, second, 2), "update snapshot second");
+  const auto seq_second = manager.current_sequence();
+  require(manager.erase(90), "erase snapshot record");
+  const auto seq_delete = manager.current_sequence();
+
+  const auto first_record = manager.latest_record(90, seq_first, true);
+  require(first_record.has_value(), "latest first exists");
+  require(first_record->sequence_id == seq_first, "latest first sequence");
+  require(first_record->vector == std::vector<float>({1.0f, 0.0f}),
+          "latest first vector");
+
+  const auto second_record = manager.latest_record(90, seq_second, true);
+  require(second_record.has_value(), "latest second exists");
+  require(second_record->sequence_id == seq_second, "latest second sequence");
+  require(second_record->vector == std::vector<float>({2.0f, 0.0f}),
+          "latest second vector");
+
+  const auto deleted_record = manager.latest_record(90, seq_delete, true);
+  require(deleted_record.has_value(), "latest delete exists");
+  require(deleted_record->deleted, "latest delete tombstone");
+  require(!manager.latest_record(90, seq_delete, false).has_value(),
+          "latest delete hidden when deleted excluded");
+
+  const auto before_delete = manager.search_delta_l2_at(query, 2, 1, seq_first);
+  require(before_delete.size() == 1, "delta search at first sequence");
+  require(before_delete[0].node_id == 90, "delta search first id");
+  const auto after_delete = manager.search_delta_l2_at(query, 2, 1, seq_delete);
+  require(after_delete.empty(), "delta search hides deleted sequence");
+
+  const auto snapshot = manager.snapshot(seq_delete);
+  require(snapshot.records.size() == 1, "snapshot deduplicates by id");
+  require(snapshot.deleted_count == 1, "snapshot counts tombstone");
+  require(manager.close(), "close sequence manager");
+}
+
+void test_merge_applies_update_and_tombstone() {
+  const float query[] = {0.0f, 0.0f};
+  const std::vector<agent_aware::SearchResult> base_results = {
+      agent_aware::SearchResult{7, 0.25f},
+      agent_aware::SearchResult{8, 0.50f},
+  };
+
+  agent_aware::DynamicRecord update;
+  update.sequence_id = 1;
+  update.node_id = 7;
+  update.dim = 2;
+  update.vector = {0.0f, 0.0f};
+  auto merged = agent_aware::dynamic::merge_base_and_delta_l2(
+      base_results, {update}, query, 2, 2);
+  require(merged.size() == 2, "update merge result count");
+  require(merged[0].id == 7, "update keeps base id");
+  require(merged[0].distance == 0.0f, "update recomputes distance");
+
+  agent_aware::DynamicRecord tombstone;
+  tombstone.sequence_id = 2;
+  tombstone.node_id = 7;
+  tombstone.deleted = true;
+  merged = agent_aware::dynamic::merge_base_and_delta_l2(
+      base_results, {tombstone}, query, 2, 2);
+  require(merged.size() == 1, "tombstone removes base id");
+  require(merged[0].id == 8, "tombstone leaves other base result");
+}
+
+void test_manager_compact_once_publishes_manifest() {
+  const auto dir = test_dir("dynamic_manager_compact_once");
+  auto manager = agent_aware::dynamic::DynamicWriteManager(options_for(dir));
+  require(manager.open(), "open compact manager");
+
+  const float first[] = {1.0f, 1.0f};
+  const float second[] = {2.0f, 2.0f};
+  require(manager.insert(1, first, 2), "compact insert first");
+  require(manager.flush(), "compact flush first");
+  require(manager.insert(2, second, 2), "compact insert second");
+  require(manager.flush(), "compact flush second");
+
+  agent_aware::dynamic::DynamicCompactionStats stats;
+  require(manager.compact_once(&stats), "compact once succeeds");
+  require(stats.success, "compact stats success");
+  require(stats.input_table_count == 2, "compact input table count");
+  require(stats.output_record_count == 2, "compact output record count");
+
+  const auto records = manager.collect_all_delta_records();
+  require(records.size() == 2, "compact records remain visible");
+  agent_aware::dynamic::ManifestData manifest_data;
+  agent_aware::dynamic::Manifest manifest(dir / "manifest.json");
+  require(manifest.load(manifest_data), "compact manifest loads");
+  require(manifest_data.sstables.size() == 1, "compact manifest table count");
+  require(manager.close(), "close compact manager");
+}
+
 void test_flush_then_restart_loads_sstable() {
   const auto dir = test_dir("dynamic_flush_restart");
   {
@@ -220,6 +320,9 @@ int main() {
   test_insert_records_incremental_neighbors();
   test_search_delta_l2_finds_inserted_vector();
   test_base_and_delta_merge();
+  test_sequence_snapshot_and_latest_record();
+  test_merge_applies_update_and_tombstone();
+  test_manager_compact_once_publishes_manifest();
   test_flush_then_restart_loads_sstable();
   return 0;
 }

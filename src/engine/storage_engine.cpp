@@ -40,17 +40,31 @@ EngineSearchResult PackedGraphEngine::search_one(const float* query,
   DiskGraphSearchConfig search = config_.search;
   search.top_k = top_k;
 
+  const std::uint64_t read_sequence =
+      config_.dynamic_manager ? config_.dynamic_manager->current_sequence() : 0;
   const auto graph_result = index_.search_one(query, search);
   EngineSearchResult output;
   if (config_.dynamic_manager) {
-    const auto delta_records = config_.dynamic_manager->search_delta_l2(
-        query, metadata().dim, top_k);
+    std::vector<std::uint32_t> base_ids;
+    base_ids.reserve(graph_result.topk.size());
+    for (const auto& result : graph_result.topk) {
+      base_ids.push_back(result.id);
+    }
+    auto latest_base_records = config_.dynamic_manager->latest_records_for(
+        base_ids, read_sequence, true);
+    auto delta_records = config_.dynamic_manager->search_delta_l2_at(
+        query, metadata().dim, top_k, read_sequence);
+    delta_records.reserve(delta_records.size() + latest_base_records.size());
+    for (auto& item : latest_base_records) {
+      delta_records.push_back(std::move(item.second));
+    }
     output.topk = dynamic::merge_base_and_delta_l2(
         graph_result.topk, delta_records, query, metadata().dim, top_k);
   } else {
     output.topk = graph_result.topk;
   }
   output.stats.used_graph_path = true;
+  output.stats.dynamic_read_sequence = read_sequence;
   output.stats.graph = graph_result.stats;
   return output;
 }
