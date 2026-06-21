@@ -1,0 +1,2 @@
+False
+\' >/dev/null 2>&1 & pid=$!; echo "$pid" > "$OUT/pid"; printf "%s\n" "$OUT"

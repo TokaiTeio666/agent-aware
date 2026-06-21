@@ -124,6 +124,7 @@ struct DiskGraphSearchStats {
   std::size_t rerank_reads = 0;
   std::size_t pq_filter_reject_count = 0;
   std::size_t pq_filter_accept_count = 0;
+  double search_mutex_wait_us = 0.0;
 };
 
 struct DiskGraphSearchResult {

@@ -794,7 +794,12 @@ void PackedDiskGraphIndex::finalize_topk(SearchState& state) {
 
 DiskGraphSearchResult PackedDiskGraphIndex::search_one(
     const float* query, const DiskGraphSearchConfig& config) {
-  std::lock_guard<std::mutex> search_lock(search_mutex_);
+  const auto lock_start = std::chrono::steady_clock::now();
+  std::unique_lock<std::mutex> search_lock(search_mutex_);
+  const double search_mutex_wait_us =
+      std::chrono::duration<double, std::micro>(
+          std::chrono::steady_clock::now() - lock_start)
+          .count();
   if (config.top_k == 0 || config.search_width == 0 ||
       config.entry_count == 0) {
     throw std::runtime_error("Packed graph search top_k, search_width, and entry_count must be positive");
@@ -805,6 +810,7 @@ DiskGraphSearchResult PackedDiskGraphIndex::search_one(
                  std::size_t{1}, config.search_width);
 
   DiskGraphSearchResult output;
+  output.stats.search_mutex_wait_us = search_mutex_wait_us;
   auto state = initialize_search_state(query, config, output);
   while (!state->candidates.empty() &&
          output.stats.expanded < config.search_width) {

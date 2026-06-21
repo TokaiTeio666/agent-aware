@@ -1,5 +1,6 @@
 #include "agent_aware/engine/storage_engine.h"
 
+#include <chrono>
 #include <stdexcept>
 #include <utility>
 
@@ -40,26 +41,53 @@ EngineSearchResult PackedGraphEngine::search_one(const float* query,
   DiskGraphSearchConfig search = config_.search;
   search.top_k = top_k;
 
+  EngineSearchResult output;
+  const auto snapshot_start = std::chrono::steady_clock::now();
   const std::uint64_t read_sequence =
       config_.dynamic_manager ? config_.dynamic_manager->current_sequence() : 0;
+  output.stats.timing.dynamic_snapshot_ms =
+      std::chrono::duration<double, std::milli>(
+          std::chrono::steady_clock::now() - snapshot_start)
+          .count();
+
+  const auto base_start = std::chrono::steady_clock::now();
   const auto graph_result = index_.search_one(query, search);
-  EngineSearchResult output;
+  output.stats.timing.base_search_ms =
+      std::chrono::duration<double, std::milli>(
+          std::chrono::steady_clock::now() - base_start)
+          .count();
   if (config_.dynamic_manager) {
     std::vector<std::uint32_t> base_ids;
     base_ids.reserve(graph_result.topk.size());
     for (const auto& result : graph_result.topk) {
       base_ids.push_back(result.id);
     }
+    const auto latest_start = std::chrono::steady_clock::now();
     auto latest_base_records = config_.dynamic_manager->latest_records_for(
         base_ids, read_sequence, true);
+    output.stats.timing.latest_record_lookup_ms =
+        std::chrono::duration<double, std::milli>(
+            std::chrono::steady_clock::now() - latest_start)
+            .count();
+
+    const auto delta_start = std::chrono::steady_clock::now();
     auto delta_records = config_.dynamic_manager->search_delta_l2_at(
         query, metadata().dim, top_k, read_sequence);
+    output.stats.timing.delta_search_ms =
+        std::chrono::duration<double, std::milli>(
+            std::chrono::steady_clock::now() - delta_start)
+            .count();
     delta_records.reserve(delta_records.size() + latest_base_records.size());
     for (auto& item : latest_base_records) {
       delta_records.push_back(std::move(item.second));
     }
+    const auto merge_start = std::chrono::steady_clock::now();
     output.topk = dynamic::merge_base_and_delta_l2(
         graph_result.topk, delta_records, query, metadata().dim, top_k);
+    output.stats.timing.merge_ms =
+        std::chrono::duration<double, std::milli>(
+            std::chrono::steady_clock::now() - merge_start)
+            .count();
   } else {
     output.topk = graph_result.topk;
   }

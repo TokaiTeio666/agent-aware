@@ -2,6 +2,7 @@
 
 #include <algorithm>
 #include <cstring>
+#include <functional>
 #include <iomanip>
 #include <limits>
 #include <queue>
@@ -65,7 +66,111 @@ bool search_result_less(const SearchResult& lhs, const SearchResult& rhs) {
   return lhs.distance < rhs.distance;
 }
 
+struct RecordVersionKey {
+  NodeId node_id = 0;
+  std::uint64_t sequence_id = 0;
+
+  bool operator==(const RecordVersionKey& other) const {
+    return node_id == other.node_id && sequence_id == other.sequence_id;
+  }
+};
+
+struct RecordVersionKeyHash {
+  std::size_t operator()(const RecordVersionKey& key) const {
+    const auto lhs = std::hash<NodeId>{}(key.node_id);
+    const auto rhs = std::hash<std::uint64_t>{}(key.sequence_id);
+    return lhs ^ (rhs + 0x9e3779b97f4a7c15ULL + (lhs << 6) + (lhs >> 2));
+  }
+};
+
+std::vector<DynamicRecord> unique_record_versions(
+    const std::vector<DynamicRecord>& records) {
+  std::vector<DynamicRecord> output;
+  output.reserve(records.size());
+  std::unordered_set<RecordVersionKey, RecordVersionKeyHash> seen;
+  seen.reserve(records.size());
+  for (const auto& record : records) {
+    if (seen.insert(RecordVersionKey{record.node_id, record.sequence_id})
+            .second) {
+      output.push_back(record);
+    }
+  }
+  return output;
+}
+
+std::vector<DynamicRecord> deduplicate_newest_at(
+    const std::vector<DynamicRecord>& records, std::uint64_t read_sequence) {
+  std::vector<DynamicRecord> visible;
+  visible.reserve(records.size());
+  for (const auto& record : records) {
+    if (record.sequence_id <= read_sequence) {
+      visible.push_back(record);
+    }
+  }
+  return deduplicate_newest(visible);
+}
+
+std::optional<DynamicRecord> latest_record_from_history(
+    const std::vector<DynamicRecord>& records, NodeId node_id,
+    std::uint64_t read_sequence, bool include_deleted) {
+  DynamicRecord latest;
+  bool found = false;
+  for (const auto& record : records) {
+    if (record.node_id != node_id || record.sequence_id > read_sequence) {
+      continue;
+    }
+    if (!found || record.sequence_id > latest.sequence_id) {
+      latest = record;
+      found = true;
+    }
+  }
+  if (!found || (latest.deleted && !include_deleted)) {
+    return std::nullopt;
+  }
+  return latest;
+}
+
+std::unordered_map<NodeId, DynamicRecord> latest_records_for_from_history(
+    const std::vector<DynamicRecord>& records,
+    const std::vector<NodeId>& node_ids, std::uint64_t read_sequence,
+    bool include_deleted) {
+  std::unordered_set<NodeId> wanted;
+  wanted.reserve(node_ids.size());
+  for (const auto node_id : node_ids) {
+    wanted.insert(node_id);
+  }
+
+  std::unordered_map<NodeId, DynamicRecord> latest;
+  latest.reserve(node_ids.size());
+  for (const auto& record : records) {
+    if (record.sequence_id > read_sequence ||
+        wanted.find(record.node_id) == wanted.end()) {
+      continue;
+    }
+    const auto found = latest.find(record.node_id);
+    if (found == latest.end() ||
+        record.sequence_id > found->second.sequence_id) {
+      latest[record.node_id] = record;
+    }
+  }
+  if (!include_deleted) {
+    for (auto it = latest.begin(); it != latest.end();) {
+      if (it->second.deleted) {
+        it = latest.erase(it);
+      } else {
+        ++it;
+      }
+    }
+  }
+  return latest;
+}
 }  // namespace
+
+struct DynamicWriteManager::DynamicReadView {
+  bool opened = false;
+  std::uint64_t latest_sequence = 0;
+  std::vector<DynamicRecord> history_records;
+};
 
 DynamicWriteManager::DynamicWriteManager(DynamicWriteOptions options)
     : options_(std::move(options)),
@@ -97,6 +202,7 @@ bool DynamicWriteManager::open() {
   }
 
   sstables_.clear();
+  recent_records_.clear();
   std::uint64_t max_loaded_sequence = 0;
   for (const auto& entry : manifest_.sstables) {
     const auto base_path =
@@ -109,11 +215,14 @@ bool DynamicWriteManager::open() {
     }
     max_loaded_sequence =
         std::max(max_loaded_sequence, reader->max_sequence_id());
+    for (const auto& record : reader->scan_all()) {
+      recent_records_.push_back(record);
+      max_loaded_sequence = std::max(max_loaded_sequence, record.sequence_id);
+    }
     sstables_.push_back(std::move(reader));
   }
 
   memtable_ = std::make_unique<MemTable>(options_.memtable_flush_bytes);
-  recent_records_.clear();
   if (options_.enable_wal) {
     std::uint64_t max_wal_sequence = 0;
     for (const auto& record : WalReader(wal_path()).replay()) {
@@ -133,7 +242,12 @@ bool DynamicWriteManager::open() {
         std::max(manifest_.next_sequence_id, max_loaded_sequence + 1);
   }
 
+  latest_sequence_.store(manifest_.next_sequence_id == 0
+                             ? 0
+                             : manifest_.next_sequence_id - 1,
+                         std::memory_order_release);
   opened_ = true;
+  publish_read_view_locked();
   return true;
 }
 
@@ -190,6 +304,7 @@ bool DynamicWriteManager::append_record_locked(DynamicRecord record) {
   }
   recent_records_.push_back(record);
   ++manifest_.next_sequence_id;
+  publish_read_view_locked();
 
   if (options_.enable_auto_flush && memtable_->should_flush()) {
     return flush_locked();
@@ -242,66 +357,67 @@ bool DynamicWriteManager::flush_locked() {
   return rotate_wal_locked();
 }
 
+void DynamicWriteManager::publish_read_view_locked() {
+  auto mutable_view = std::make_shared<DynamicReadView>();
+  mutable_view->opened = opened_;
+  mutable_view->latest_sequence = manifest_.next_sequence_id == 0
+                                      ? 0
+                                      : manifest_.next_sequence_id - 1;
+  mutable_view->history_records = unique_record_versions(recent_records_);
+  std::shared_ptr<const DynamicReadView> view = mutable_view;
+  std::atomic_store_explicit(&read_view_, view, std::memory_order_release);
+  latest_sequence_.store(view->latest_sequence, std::memory_order_release);
+}
+
+std::shared_ptr<const DynamicWriteManager::DynamicReadView>
+DynamicWriteManager::load_read_view() const {
+  return std::atomic_load_explicit(&read_view_, std::memory_order_acquire);
+}
+
 bool DynamicWriteManager::get(NodeId node_id, DynamicRecord& out) const {
-  std::lock_guard<std::mutex> lock(mutex_);
-  if (!opened_) {
+  const auto record = latest_record(node_id, current_sequence(), false);
+  if (!record.has_value()) {
     return false;
   }
-
-  return latest_record_locked(node_id,
-                              manifest_.next_sequence_id == 0
-                                  ? 0
-                                  : manifest_.next_sequence_id - 1,
-                              false, out);
+  out = *record;
+  return true;
 }
 
 std::uint64_t DynamicWriteManager::current_sequence() const {
-  std::lock_guard<std::mutex> lock(mutex_);
-  if (!opened_ || manifest_.next_sequence_id == 0) {
-    return 0;
-  }
-  return manifest_.next_sequence_id - 1;
+  return latest_sequence_.load(std::memory_order_acquire);
 }
 
 std::optional<DynamicRecord> DynamicWriteManager::latest_record(
     NodeId node_id, std::uint64_t read_sequence, bool include_deleted) const {
-  std::lock_guard<std::mutex> lock(mutex_);
-  if (!opened_) {
+  const auto view = load_read_view();
+  if (!view || !view->opened) {
     return std::nullopt;
   }
-
-  DynamicRecord out;
-  if (!latest_record_locked(node_id, read_sequence, include_deleted, out)) {
-    return std::nullopt;
-  }
-  return out;
+  return latest_record_from_history(view->history_records, node_id,
+                                    read_sequence, include_deleted);
 }
 
 std::unordered_map<NodeId, DynamicRecord>
 DynamicWriteManager::latest_records_for(const std::vector<NodeId>& node_ids,
                                         std::uint64_t read_sequence,
                                         bool include_deleted) const {
-  std::lock_guard<std::mutex> lock(mutex_);
-  std::unordered_map<NodeId, DynamicRecord> output;
-  if (!opened_) {
-    return output;
+  const auto view = load_read_view();
+  if (!view || !view->opened) {
+    return {};
   }
-  output.reserve(node_ids.size());
-  for (const auto node_id : node_ids) {
-    DynamicRecord record;
-    if (latest_record_locked(node_id, read_sequence, include_deleted, record)) {
-      output[node_id] = std::move(record);
-    }
-  }
-  return output;
+  return latest_records_for_from_history(view->history_records, node_ids,
+                                         read_sequence, include_deleted);
 }
 
 DynamicSnapshot DynamicWriteManager::snapshot(
     std::uint64_t read_sequence) const {
-  std::lock_guard<std::mutex> lock(mutex_);
   DynamicSnapshot output;
   output.read_sequence = read_sequence;
-  output.records = collect_all_delta_records_locked(read_sequence);
+  const auto view = load_read_view();
+  if (!view || !view->opened) {
+    return output;
+  }
+  output.records = deduplicate_newest_at(view->history_records, read_sequence);
   for (const auto& record : output.records) {
     if (record.deleted) {
       ++output.deleted_count;
@@ -328,14 +444,16 @@ bool DynamicWriteManager::latest_record_locked(NodeId node_id,
 
 std::vector<DynamicRecord> DynamicWriteManager::collect_all_delta_records()
     const {
-  std::lock_guard<std::mutex> lock(mutex_);
-  return collect_all_delta_records_locked();
+  return collect_all_delta_records_at(std::numeric_limits<std::uint64_t>::max());
 }
 
 std::vector<DynamicRecord> DynamicWriteManager::collect_all_delta_records_at(
     std::uint64_t read_sequence) const {
-  std::lock_guard<std::mutex> lock(mutex_);
-  return collect_all_delta_records_locked(read_sequence);
+  const auto view = load_read_view();
+  if (!view || !view->opened) {
+    return {};
+  }
+  return deduplicate_newest_at(view->history_records, read_sequence);
 }
 
 std::vector<DynamicRecord> DynamicWriteManager::collect_all_delta_records_locked(
@@ -345,23 +463,9 @@ std::vector<DynamicRecord> DynamicWriteManager::collect_all_delta_records_locked
     return records;
   }
 
-  auto mem_records = memtable_->snapshot();
-  for (auto& record : mem_records) {
-    if (record.sequence_id <= read_sequence) {
-      records.push_back(std::move(record));
-    }
-  }
   for (const auto& record : recent_records_) {
     if (record.sequence_id <= read_sequence) {
       records.push_back(record);
-    }
-  }
-  for (const auto& table : sstables_) {
-    auto table_records = table->scan_all();
-    for (auto& record : table_records) {
-      if (record.sequence_id <= read_sequence) {
-        records.push_back(std::move(record));
-      }
     }
   }
   return deduplicate_newest(records);
@@ -528,6 +632,7 @@ bool DynamicWriteManager::close() {
     wal_writer_.reset();
   }
   opened_ = false;
+  publish_read_view_locked();
   return ok;
 }
 

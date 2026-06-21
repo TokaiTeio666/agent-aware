@@ -1,5 +1,6 @@
 #pragma once
 
+#include <atomic>
 #include <cstddef>
 #include <cstdint>
 #include <filesystem>
@@ -78,9 +79,13 @@ class DynamicWriteManager {
   bool close();
 
  private:
+  struct DynamicReadView;
+
   bool append_record_locked(DynamicRecord record);
   bool flush_locked();
   bool rotate_wal_locked();
+  void publish_read_view_locked();
+  std::shared_ptr<const DynamicReadView> load_read_view() const;
   bool latest_record_locked(NodeId node_id, std::uint64_t read_sequence,
                             bool include_deleted, DynamicRecord& out) const;
   std::vector<NodeId> select_incremental_neighbors_locked(
@@ -99,6 +104,8 @@ class DynamicWriteManager {
   std::unique_ptr<WalWriter> wal_writer_;
   std::vector<std::shared_ptr<SSTableReader>> sstables_;
   std::vector<DynamicRecord> recent_records_;
+  mutable std::shared_ptr<const DynamicReadView> read_view_;
+  std::atomic<std::uint64_t> latest_sequence_{0};
   bool opened_ = false;
 };
 

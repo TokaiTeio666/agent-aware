@@ -7,6 +7,21 @@
 > 文档版本：v1.0  
 > 编写日期：2026-06-16
 
+## 当前实现状态（2026-06-21）
+
+项目已经从最初计划推进到 SIFT1M 可展示版本：SSD packed Vamana 主路径、PQ/ADC、Graph-Aware cache 统计、io_uring/pread fallback、拓扑预取、LSM 动态写入、manifest/compaction/recovery、真实并发 mixed RW benchmark 和动态 Recall 抽样均已形成闭环。
+
+| 能力 | 当前状态 | 说明 |
+| --- | --- | --- |
+| SSD 主路径 | 已完成 SIFT1M 验证 | Recall@10 `0.9940`，resident ratio `0.199992` |
+| 高并发纯读 | 已完成 baseline | 8 reader 下 `56.55 read_qps`，P95 `178 ms` |
+| 混合读写 | 已完成最小闭环 | 4 reader + 1 writer 下 `23.50~28.86 read_qps`，`217~221 write_qps` |
+| 动态写入一致性 | 已完成基础版 | WAL/MemTable/SSTable/manifest/compaction/recovery 均有测试覆盖 |
+| 读侧锁优化 | 已完成 | `DynamicWriteManager` 使用 immutable read view 发布 |
+| 后续重点 | 待推进 | 异步 flush queue、Delta memory graph、周期性 rebuild packed graph、系统参数矩阵 |
+
+详细阶段计划和结果文档统一维护在 `docs/README.md`，评分映射和答辩材料组织见 `docs/competition/scoring-and-defense.md`。
+
 ## 1. 项目概述
 
 agent-aware 面向大模型 Agent 的长期记忆场景，设计一套在内存受限环境下运行的动态向量检索底层 I/O 存储引擎。项目目标不是单纯把所有向量加载到内存获得高 QPS，而是在数据规模远大于物理内存、读写请求持续并发的条件下，通过用户态缓存、图拓扑感知预取、异步 I/O 和日志结构写入路径，降低随机 SSD 访问带来的性能损耗。
@@ -287,7 +302,7 @@ flowchart LR
 
 | 任务 | 负责人建议 | 输入 | 输出 | 验收 |
 | --- | --- | --- | --- | --- |
-| 赛题与竞品分析 | 文档/算法成员 | PROBLEM.md、DiskANN、Milvus 资料 | 背景与创新点说明 | 评审指标映射完整 |
+| 赛题与竞品分析 | 文档/算法成员 | `docs/competition/problem.md`、DiskANN、Milvus 资料 | 背景与创新点说明 | 评审指标映射完整 |
 | PQ 编码器 | 算法成员 | 训练向量、维度配置 | PQ codes、codebooks、ADC 表 | Recall 不因过滤低于目标 |
 | Vamana 图索引 | 算法成员 | 全精度向量 | 图邻接表、entry point | 构建成功，搜索可达 |
 | SSD 布局 | 系统成员 | 向量、图、PQ codes | 4KB 对齐记录文件 | O_DIRECT 读写成功 |
@@ -368,8 +383,9 @@ make -j$(nproc)
 # 自定义读写比例
 ./bench_mixed_rw --num_operations 10000 --read_ratio 0.95 --write_ratio 0.05
 
-# 脚本入口
-../scripts/run_mixed_rw_bench.sh --num_operations 10000
+# SIFT1M 主路径脚本入口
+cd ..
+bash scripts/linux/run_sift1m_once.sh
 ```
 
 ### 10.5 最终验收标准
@@ -416,7 +432,7 @@ make -j$(nproc)
 | 构建脚本 | CMakeLists、依赖说明、Release/ASAN 构建方式 |
 | 测试程序 | 单元测试、SSD benchmark、内存对照 benchmark、混合负载 benchmark |
 | 数据脚本 | SIFT1M 下载脚本、合成数据 fallback |
-| 技术文档 | README、架构设计、实现说明、测试说明、实验报告、项目计划书 |
+| 技术文档 | README、项目计划书、赛题说明、评分映射、阶段计划、版本说明、SIFT1M 实验报告 |
 | 答辩材料 | 方案介绍、创新点、性能图表、风险说明、演示流程 |
 
 ## 14. 评审指标映射
@@ -427,6 +443,8 @@ make -j$(nproc)
 | 创新性 | 25% | Graph-Aware 2Q、PQ ADC 与 SSD 读取协同、io_uring 拓扑预取、LSM 动态写入 |
 | 代码质量 | 25% | 分层模块、统一 Error、线程安全保护、同步 fallback、可复现实验 |
 | 文档完整性 | 25% | 从赛题需求、架构、实现、测试到实验报告形成完整闭环 |
+
+详细的 90 分目标拆解、证据矩阵和答辩顺序见 `docs/competition/scoring-and-defense.md`。
 
 ## 15. 结论
 

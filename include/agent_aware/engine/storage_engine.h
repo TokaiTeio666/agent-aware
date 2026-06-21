@@ -13,10 +13,19 @@
 
 namespace agent_aware {
 
+struct EngineSearchTiming {
+  double dynamic_snapshot_ms = 0.0;
+  double base_search_ms = 0.0;
+  double latest_record_lookup_ms = 0.0;
+  double delta_search_ms = 0.0;
+  double merge_ms = 0.0;
+};
+
 struct EngineSearchStats {
   bool used_graph_path = false;
   std::uint64_t dynamic_read_sequence = 0;
   DiskGraphSearchStats graph;
+  EngineSearchTiming timing;
 };
 
 struct EngineSearchResult {

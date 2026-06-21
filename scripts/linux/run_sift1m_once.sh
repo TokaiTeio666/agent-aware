@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-# 默认参数来自 agent_aware_flow.cpp。
+# 默认参数来自 tools/benchmarks/sift_search_benchmark.cpp。
 # 第一次建图：
 #   REBUILD_INDEX=1 bash run_sift1m_once.sh
 # 后续复用索引：

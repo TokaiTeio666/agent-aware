@@ -1,5 +1,36 @@
 # 高并发与混合写入改造计划
 
+## 当前实现状态（2026-06-21）
+
+本计划的最小可交付闭环已经完成，并在 SIFT1M 上跑出可展示结果。当前版本已经具备真实并发读写 benchmark、动态 Recall 抽样、manifest 发布式 compaction、base/delta update/delete 合并语义，以及读侧 immutable snapshot 发布机制。
+
+| 计划项 | 状态 | 当前实现 |
+| --- | --- | --- |
+| 并发版 `bench_mixed_rw` | 已完成 | 支持 `--duration_sec`、`--read_threads`、`--write_threads`、JSON 输出 |
+| 动态 Recall 计算 | 已完成 | 按 `read_sequence` 构造 visible set，exact 回算单独记录 `exact_recall_*_ms` |
+| Manifest/compaction 一致性 | 已完成可交付版 | flush/compaction 发布 manifest，recovery 可打开已发布 SSTable 集合 |
+| Base/Delta merge 语义 | 已完成 | insert/update/delete/tombstone 可覆盖 base topK |
+| Reader snapshot | 已优化 | `DynamicWriteManager` 读侧使用 immutable `DynamicReadView` + atomic `shared_ptr` |
+| 后台 compaction | 已完成可运行版 | workload 中可开启 `--compaction_background 1` |
+| 周期性 rebuild 主索引 | 未完成 | 下一阶段将 delta 批量吸收到新 packed graph |
+| Delta memory graph | 未完成 | 下一阶段用于提升新写入向量近邻质量和大 delta 场景查询性能 |
+| 真正异步 flush queue | 未完成 | 当前 flush 仍沿用 manager 路径，后续可拆成后台队列 |
+
+SIFT1M 关键结果：
+
+| 场景 | read_qps | write_qps | read P95 | Recall |
+| --- | ---: | ---: | ---: | ---: |
+| SSD 主路径 | 2.5989 | - | 501 ms | 0.9940 |
+| pure read t8 | 56.55 | 0 | 178 ms | - |
+| mixed no compaction immutable view | 23.50 | 217.05 | 167 ms | - |
+| mixed compaction immutable view | 28.86 | 221.33 | 178 ms | - |
+| dynamic recall evidence | 8.84 | 250.36 | 233 ms | 1.0 |
+
+更完整的实现说明与结果解释见：
+
+- `docs/changelog.md`
+- `docs/experiments/sift1m-mixed-rw-immutable-view.md`
+
 ## 目标
 
 本文档用于规划 `agent-aware` 在赛题要求下的高并发混合读写能力改造。目标是在现有 SSD packed graph 检索、Graph-Aware 2Q 缓存、io_uring 预取、WAL/MemTable/SSTable 动态写入基础上，补齐以下能力：
