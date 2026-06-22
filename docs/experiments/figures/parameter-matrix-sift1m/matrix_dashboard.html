@@ -1,0 +1,299 @@
+<!doctype html>
+<html><head><meta charset="utf-8">
+<title>SIFT parameter matrix dashboard</title>
+<style>
+body{font-family:Arial,sans-serif;margin:24px;color:#111827}
+h1{font-size:24px} h2{font-size:18px;margin-top:28px}
+.grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(360px,1fr));gap:18px}
+.card{border:1px solid #d1d5db;border-radius:8px;padding:10px;background:#fff}
+.card img{width:100%;height:auto}
+table{border-collapse:collapse;width:100%;font-size:12px}
+th,td{border:1px solid #e5e7eb;padding:6px;text-align:right}
+th{background:#f3f4f6} td:first-child,th:first-child{text-align:left}
+code{background:#f3f4f6;padding:2px 4px;border-radius:4px}
+</style></head><body>
+<h1>SIFT parameter matrix dashboard</h1>
+<p>Records: <strong>17</strong>. Generated from benchmark JSON files.</p>
+<p>See <code>matrix_summary.csv</code> for raw extracted values and <code>parameter_matrix_audit.md</code> for parameter rationale.</p>
+<h2>Curves</h2>
+<div class="grid">
+<div class="card"><img src="charts/search_width_recall.svg" alt="search_width_recall"></div>
+<div class="card"><img src="charts/search_width_qps.svg" alt="search_width_qps"></div>
+<div class="card"><img src="charts/search_width_p95_ms.svg" alt="search_width_p95_ms"></div>
+<div class="card"><img src="charts/search_width_p99_ms.svg" alt="search_width_p99_ms"></div>
+<div class="card"><img src="charts/search_width_reads_per_query.svg" alt="search_width_reads_per_query"></div>
+<div class="card"><img src="charts/search_width_cache_hit_rate.svg" alt="search_width_cache_hit_rate"></div>
+<div class="card"><img src="charts/beam_width_recall.svg" alt="beam_width_recall"></div>
+<div class="card"><img src="charts/beam_width_qps.svg" alt="beam_width_qps"></div>
+<div class="card"><img src="charts/beam_width_p95_ms.svg" alt="beam_width_p95_ms"></div>
+<div class="card"><img src="charts/beam_width_p99_ms.svg" alt="beam_width_p99_ms"></div>
+<div class="card"><img src="charts/beam_width_reads_per_query.svg" alt="beam_width_reads_per_query"></div>
+<div class="card"><img src="charts/beam_width_cache_hit_rate.svg" alt="beam_width_cache_hit_rate"></div>
+<div class="card"><img src="charts/memory_budget_ratio_recall.svg" alt="memory_budget_ratio_recall"></div>
+<div class="card"><img src="charts/memory_budget_ratio_qps.svg" alt="memory_budget_ratio_qps"></div>
+<div class="card"><img src="charts/memory_budget_ratio_p95_ms.svg" alt="memory_budget_ratio_p95_ms"></div>
+<div class="card"><img src="charts/memory_budget_ratio_p99_ms.svg" alt="memory_budget_ratio_p99_ms"></div>
+<div class="card"><img src="charts/memory_budget_ratio_reads_per_query.svg" alt="memory_budget_ratio_reads_per_query"></div>
+<div class="card"><img src="charts/memory_budget_ratio_cache_hit_rate.svg" alt="memory_budget_ratio_cache_hit_rate"></div>
+<div class="card"><img src="charts/io_mode_recall.svg" alt="io_mode_recall"></div>
+<div class="card"><img src="charts/io_mode_qps.svg" alt="io_mode_qps"></div>
+<div class="card"><img src="charts/io_mode_p95_ms.svg" alt="io_mode_p95_ms"></div>
+<div class="card"><img src="charts/io_mode_p99_ms.svg" alt="io_mode_p99_ms"></div>
+<div class="card"><img src="charts/io_mode_reads_per_query.svg" alt="io_mode_reads_per_query"></div>
+<div class="card"><img src="charts/io_mode_cache_hit_rate.svg" alt="io_mode_cache_hit_rate"></div>
+</div>
+<h2>Extracted Results</h2>
+<table><thead><tr>
+<th>matrix_phase</th>
+<th>axis</th>
+<th>search_width</th>
+<th>beam_width</th>
+<th>memory_budget_ratio</th>
+<th>io_mode</th>
+<th>recall</th>
+<th>qps</th>
+<th>p95_ms</th>
+<th>p99_ms</th>
+<th>reads_per_query</th>
+<th>cache_hit_rate</th>
+</tr></thead><tbody>
+<tr>
+<td>m1_search_width</td>
+<td>search_width</td>
+<td>128</td>
+<td>16.0</td>
+<td>0.200</td>
+<td>io_uring</td>
+<td>0.970</td>
+<td>11.1</td>
+<td>172</td>
+<td>179</td>
+<td>318</td>
+<td>0.652</td>
+</tr>
+<tr>
+<td>m1_search_width</td>
+<td>search_width</td>
+<td>192</td>
+<td>16.0</td>
+<td>0.200</td>
+<td>io_uring</td>
+<td>0.984</td>
+<td>6.25</td>
+<td>248</td>
+<td>260</td>
+<td>473</td>
+<td>0.634</td>
+</tr>
+<tr>
+<td>m1_search_width</td>
+<td>search_width</td>
+<td>256</td>
+<td>16.0</td>
+<td>0.200</td>
+<td>io_uring</td>
+<td>0.990</td>
+<td>4.26</td>
+<td>326</td>
+<td>338</td>
+<td>644</td>
+<td>0.575</td>
+</tr>
+<tr>
+<td>m1_search_width</td>
+<td>search_width</td>
+<td>350</td>
+<td>16.0</td>
+<td>0.200</td>
+<td>io_uring</td>
+<td>0.994</td>
+<td>2.77</td>
+<td>467</td>
+<td>478</td>
+<td>912</td>
+<td>0.510</td>
+</tr>
+<tr>
+<td>m1_search_width</td>
+<td>search_width</td>
+<td>512</td>
+<td>16.0</td>
+<td>0.200</td>
+<td>io_uring</td>
+<td>0.995</td>
+<td>1.62</td>
+<td>761</td>
+<td>775</td>
+<td>1398</td>
+<td>0.389</td>
+</tr>
+<tr>
+<td>m2_beam_width</td>
+<td>beam_width</td>
+<td>256</td>
+<td>16.0</td>
+<td>0.200</td>
+<td>io_uring</td>
+<td>0.990</td>
+<td>4.08</td>
+<td>340</td>
+<td>353</td>
+<td>649</td>
+<td>0.577</td>
+</tr>
+<tr>
+<td>m2_beam_width</td>
+<td>beam_width</td>
+<td>256</td>
+<td>32.0</td>
+<td>0.200</td>
+<td>io_uring</td>
+<td>0.989</td>
+<td>8.46</td>
+<td>208</td>
+<td>221</td>
+<td>385</td>
+<td>0.588</td>
+</tr>
+<tr>
+<td>m2_beam_width</td>
+<td>beam_width</td>
+<td>256</td>
+<td>8.00</td>
+<td>0.200</td>
+<td>io_uring</td>
+<td>0.993</td>
+<td>2.06</td>
+<td>641</td>
+<td>648</td>
+<td>1103</td>
+<td>0.637</td>
+</tr>
+<tr>
+<td>m2_beam_width</td>
+<td>beam_width</td>
+<td>350</td>
+<td>16.0</td>
+<td>0.200</td>
+<td>io_uring</td>
+<td>0.994</td>
+<td>2.74</td>
+<td>470</td>
+<td>487</td>
+<td>914</td>
+<td>0.510</td>
+</tr>
+<tr>
+<td>m2_beam_width</td>
+<td>beam_width</td>
+<td>350</td>
+<td>32.0</td>
+<td>0.200</td>
+<td>io_uring</td>
+<td>0.993</td>
+<td>5.25</td>
+<td>278</td>
+<td>287</td>
+<td>559</td>
+<td>0.509</td>
+</tr>
+<tr>
+<td>m2_beam_width</td>
+<td>beam_width</td>
+<td>350</td>
+<td>8.00</td>
+<td>0.200</td>
+<td>io_uring</td>
+<td>0.994</td>
+<td>1.45</td>
+<td>847</td>
+<td>859</td>
+<td>1543</td>
+<td>0.515</td>
+</tr>
+<tr>
+<td>m3_memory_budget</td>
+<td>memory_budget_ratio</td>
+<td>256</td>
+<td>16.0</td>
+<td>0.100</td>
+<td>io_uring</td>
+<td>0.990</td>
+<td>22.7</td>
+<td>52.1</td>
+<td>54.7</td>
+<td>794</td>
+<td>0.194</td>
+</tr>
+<tr>
+<td>m3_memory_budget</td>
+<td>memory_budget_ratio</td>
+<td>256</td>
+<td>16.0</td>
+<td>0.150</td>
+<td>io_uring</td>
+<td>0.990</td>
+<td>7.07</td>
+<td>187</td>
+<td>237</td>
+<td>710</td>
+<td>0.432</td>
+</tr>
+<tr>
+<td>m3_memory_budget</td>
+<td>memory_budget_ratio</td>
+<td>256</td>
+<td>16.0</td>
+<td>0.200</td>
+<td>io_uring</td>
+<td>0.990</td>
+<td>4.18</td>
+<td>332</td>
+<td>343</td>
+<td>645</td>
+<td>0.572</td>
+</tr>
+<tr>
+<td>m4_io_mode</td>
+<td>io_mode</td>
+<td>256</td>
+<td>16.0</td>
+<td>0.200</td>
+<td>io_uring</td>
+<td>0.990</td>
+<td>4.14</td>
+<td>335</td>
+<td>345</td>
+<td>645</td>
+<td>0.572</td>
+</tr>
+<tr>
+<td>m4_io_mode</td>
+<td>io_mode</td>
+<td>256</td>
+<td>16.0</td>
+<td>0.200</td>
+<td>odirect</td>
+<td>0.990</td>
+<td>19.0</td>
+<td>140</td>
+<td>144</td>
+<td>204</td>
+<td>0.393</td>
+</tr>
+<tr>
+<td>m4_io_mode</td>
+<td>io_mode</td>
+<td>256</td>
+<td>16.0</td>
+<td>0.200</td>
+<td>pread</td>
+<td>0.990</td>
+<td>43.5</td>
+<td>85.3</td>
+<td>88.2</td>
+<td>204</td>
+<td>0.393</td>
+</tr>
+</tbody></table>
+</body></html>

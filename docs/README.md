@@ -35,6 +35,7 @@
 | 21 | `docs/roadmap/dynamic-write-task-breakdown.md` | T1-T5 已有实现 | 动态写入拆分任务和验收清单，异步 flush queue 仍可推进 |
 | 22 | `docs/experiments/high-concurrency-mixed-rw.md` | 已完成可展示版 | 高并发 mixed RW、动态 Recall、base/delta merge、一致性策略 |
 | 23 | `docs/roadmap/next-sift1m-mixed-rw-optimization.md` | 下一阶段计划 | SIFT1M mixed RW 后续优化项、对照实验和验收标准 |
+| 24 | `docs/roadmap/defense-gap-closure-plan.md` | 答辩前补强计划 | 参数矩阵、真实 NVMe/比赛环境复测、delta 查询退化优化 |
 | 30 | `docs/experiments/param-tuning-and-sift-scale-test.md` | 已完成关键 evidence | 参数调优、SIFT 规模化测试矩阵和可复现实验计划 |
 | 31 | `docs/design/fresh-streaming-ann.md` | 创新路线归档 | LSM delta + immutable read view 已完成，Delta memory graph 和周期性 rebuild 为后续路线 |
 
@@ -55,6 +56,7 @@
 | P0 | 保持当前 immutable read view mixed RW baseline 可复现，答辩时先展示 SIFT1M 证据 | `docs/experiments/sift1m-mixed-rw-immutable-view.md` |
 | P0 | 用评分矩阵组织答辩，避免只讲实现不讲得分点 | `docs/competition/scoring-and-defense.md` |
 | P1 | 扩展参数矩阵，输出 Recall/QPS/延迟/I/O 的稳定曲线 | `docs/experiments/param-tuning-and-sift-scale-test.md` |
+| P1 | 按答辩前三项缺口补强：参数曲线、真实 NVMe 复测、delta 退化治理 | `docs/roadmap/defense-gap-closure-plan.md` |
 | P1 | 将 flush 拆成真正后台队列，降低写路径同步停顿 | `docs/experiments/high-concurrency-mixed-rw.md` |
 | P2 | 实现 Delta memory graph，提高新写入向量检索质量 | `docs/design/fresh-streaming-ann.md` |
 | P2 | 周期性 rebuild packed graph，将 delta 批量吸收到 base | `docs/roadmap/next-sift1m-mixed-rw-optimization.md` |

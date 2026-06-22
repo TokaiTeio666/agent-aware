@@ -2,7 +2,7 @@
 
 ## 当前实现状态（2026-06-21）
 
-本计划中的 SIFT1M 主路径验证已经完成一轮：当前结果显示 Recall@10 `0.9940`、resident ratio `0.199992`，并补充了纯读并发 baseline 与 mixed RW evidence。完整参数矩阵尚未系统扫描，后续应优先固定 index、分离 build/search 成本，并输出 search width、beam width、io depth、prefetch width、memory budget 的曲线。
+本计划中的 SIFT1M 主路径验证已经完成一轮：当前结果显示 Recall@10 `0.9940`、resident ratio `0.199992`，并补充了纯读并发 baseline、mixed RW evidence 与一轮 staged 参数矩阵。后续应在真实 NVMe/比赛环境复跑矩阵，并继续补 io depth、prefetch width、三轮稳定性等细分曲线。
 
 | 项目 | 状态 | 当前结果 |
 | --- | --- | --- |
@@ -10,7 +10,47 @@
 | 纯读并发 baseline | 已完成一轮 | `build/sift1m_readonly_t1.json` ~ `build/sift1m_readonly_t8.json` |
 | mixed RW benchmark | 已完成一轮 | `build/sift1m_mixed_rw_no_recall_compaction_immutable_view.json` |
 | dynamic Recall evidence | 已完成一轮 | `build/sift1m_dynamic_recall_immutable_view.json` |
-| 系统参数矩阵 | 未完成 | 下一步按本计划批量扫描 |
+| 系统参数矩阵 | 已完成一轮 staged matrix | `docs/experiments/figures/parameter-matrix-sift1m/matrix_dashboard.html` |
+
+## 最新参数矩阵结果（2026-06-21）
+
+已补齐一轮 SIFT1M staged 参数矩阵，覆盖 `search_width`、`beam_width`、`memory_budget_ratio`、`io_mode` 四个主轴，均为会进入搜索或 I/O 主路径并影响结果的参数。`prefetch_depth` 当前只支持 0/1，且只有 `io_uring` 生效时才会启用，因此保留为二级 I/O 实验轴，不放入第一轮主矩阵。
+
+结果产物：
+
+```text
+logs/sift_bench/matrix_sift1m_20260621/
+docs/experiments/figures/parameter-matrix-sift1m/matrix_summary.csv
+docs/experiments/figures/parameter-matrix-sift1m/matrix_dashboard.html
+docs/experiments/figures/parameter-matrix-sift1m/charts/*.svg
+docs/experiments/figures/parameter-matrix-sift1m/parameter_matrix_audit.md
+```
+
+关键结论：
+
+| 主轴 | 观察 |
+| --- | --- |
+| `search_width` | 从 `128` 增到 `512` 时，Recall 从 `0.970` 升到 `0.995`，但 QPS 从 `11.09` 降到 `1.62`，P95 从 `172 ms` 升到 `761 ms`，I/O reads/query 从 `318` 升到 `1398`。 |
+| `beam_width` | 在 `search_width=256/350` 下，`beam_width=32` 的 QPS 和 P95 明显优于 `8/16`，说明 beam batching 对当前 I/O 路径有实际影响。 |
+| `memory_budget_ratio` | 在自动 `cache_pages` 下，`0.10/0.15/0.20` 会改变 cache 容量和 hit rate；该轴会影响结果，但当前环境下更大 cache 不一定带来更高 QPS，需要在真实 NVMe 上复测解释。 |
+| `io_mode` | `pread/odirect/io_uring` 结果差异明显，说明该轴有效；当前 WSL 环境中 `pread` 表现最好，正式结论仍需真实 NVMe/比赛环境复跑。 |
+
+运行脚本：
+
+```bash
+EXTRA_ARGS="--query-limit 100" \
+python3 scripts/linux/run_agent_aware_flow_sift.py \
+  --date-tag matrix_sift1m_20260621 \
+  --visualize-output-dir docs/experiments/figures/parameter-matrix-sift1m
+```
+
+只重新生成可视化：
+
+```bash
+python3 scripts/linux/plot_sift_matrix.py \
+  logs/sift_bench/matrix_sift1m_20260621 \
+  --output-dir docs/experiments/figures/parameter-matrix-sift1m
+```
 
 ## 1. 文档目标
 

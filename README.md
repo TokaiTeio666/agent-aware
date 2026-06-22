@@ -1,87 +1,138 @@
 # agent-aware
 
-## 当前版本摘要（2026-06-21）
-
-本版本已经完成 SIFT1M SSD 主图上的高并发混合读写闭环，并完成一次关键读路径优化：`DynamicWriteManager` 的读侧 `snapshot/latest_record(s)/search_delta_l2_at` 已改为 immutable read view 发布模型。Reader 通过 atomic `shared_ptr<const DynamicReadView>` 读取动态层快照，不再在查询 base 覆盖记录时和 writer、flush、compaction 抢全局 `mutex_`。
-
-当前可展示能力：
-
-| 能力 | 当前状态 |
-| --- | --- |
-| SIFT1M SSD packed Vamana 主图 | 已构建并可复用 `indexes/sift1m_vamana_pq100_p4096_sm.idx` |
-| Recall@10 | SSD 主路径 `0.9940`；动态 Recall evidence `1.0` |
-| 内存约束 | SIFT1M 主路径 resident ratio `0.199992` |
-| 高并发纯读 | 8 reader 下 `56.55 read_qps`，P95 `178 ms` |
-| 混合读写 no compaction | 4 reader + 1 writer 下 `23.50 read_qps`、`217.05 write_qps`、P95 `167 ms` |
-| 混合读写 compaction | 4 reader + 1 writer + 后台 compaction 下 `28.86 read_qps`、`221.33 write_qps`、P95 `178 ms` |
-| 动态层一致性 | WAL/MemTable/SSTable/manifest/compaction/recovery 均通过测试 |
-| 读路径诊断 | JSON 输出 `base_search/latest_record_lookup/delta_search/merge/exact_recall` 分段耗时 |
-
-关键结果文件：
-
-| 文件 | 用途 |
-| --- | --- |
-| `logs/sift_bench/codex_sift1m_once_20260620-022610/result.json` | SIFT1M SSD 主路径 Recall/QPS/内存比例结果 |
-| `build/sift1m_readonly_t1.json` ~ `build/sift1m_readonly_t8.json` | 纯读扩展性 baseline |
-| `build/sift1m_mixed_rw_no_recall_no_compaction_immutable_view.json` | 混合读写主路径，不含 Recall exact 回算，不开 compaction |
-| `build/sift1m_mixed_rw_no_recall_compaction_immutable_view.json` | 混合读写主路径，不含 Recall exact 回算，开启后台 compaction |
-| `build/sift1m_dynamic_recall_immutable_view.json` | 动态 Recall 单独验证实验 |
-
-更完整的版本说明与结果分析见：
-
-- `docs/changelog.md`
-- `docs/experiments/sift1m-mixed-rw-immutable-view.md`
-
-## 面向赛事评分的阅读顺序
-
-赛题评审由性能指标、创新性、代码质量、文档完整性四项组成，各占 25%。本仓库推荐按下面顺序阅读，先看约束和证据，再进入实现细节。
-
-| 顺序 | 文档 | 用途 |
-| ---: | --- | --- |
-| 1 | `docs/competition/problem.md` | 赛题原始要求、内存约束、Recall 要求和 4 项评分权重 |
-| 2 | `PROJECT_PLAN.md` | 项目总计划、系统架构、关键模块和验收标准 |
-| 3 | `docs/competition/scoring-and-defense.md` | 90 分目标拆解、评分证据矩阵、答辩材料组织 |
-| 4 | `docs/experiments/sift1m-mixed-rw-immutable-view.md` | SIFT1M 主结果、混合读写、读路径优化前后对比 |
-| 5 | `docs/changelog.md` | 当前版本能力边界、关键改动、已验证命令和遗留工作 |
-| 6 | `docs/README.md` | 全部阶段计划、结果报告和下一步路线索引 |
-
-## 文档导航
-
-| 文档 | 用途 |
-| --- | --- |
-| `PROJECT_PLAN.md` | 项目总计划、架构路线、验收目标 |
-| `docs/README.md` | 阶段计划、结果报告和下一步工作的统一索引 |
-| `docs/design/ssd-storage-path.md` | SSD 4KB record、磁盘索引读写、O_DIRECT 链路设计 |
-| `docs/design/cache-zero-copy.md` | 缓存、同页复用、direct distance、零拷贝优化计划 |
-| `docs/design/async-prefetch.md` | io_uring、异步 page 读取和拓扑预取计划 |
-| `docs/design/beam-width-io-uring.md` | `beam_width` 与 io_uring 批量读取语义归档 |
-| `docs/design/dynamic-write.md` | WAL/MemTable/SSTable/Compaction 动态写入主计划 |
-| `docs/roadmap/dynamic-write-task-breakdown.md` | P5 动态写入拆分任务和验收清单 |
-| `docs/experiments/high-concurrency-mixed-rw.md` | 高并发混合读写、动态 Recall、一致性方案 |
-| `docs/roadmap/next-sift1m-mixed-rw-optimization.md` | SIFT1M mixed RW 下一步优化计划 |
-| `docs/experiments/param-tuning-and-sift-scale-test.md` | 参数调优与 SIFT 规模化测试矩阵 |
-| `docs/design/fresh-streaming-ann.md` | Fresh Streaming ANN 创新点和后续动态层路线 |
-
 agent-aware 是一个面向大模型 Agent 长期记忆场景的向量检索 I/O 优化原型。项目目标是在全精度向量常驻 SSD、内存预算约束为数据集大小 10%-20% 的条件下，提供可复现的 Top-K 近似最近邻检索、缓存/预取/I/O 统计，以及动态写入路径验证。
 
 当前主线实现围绕 `agent_aware_flow` benchmark 展开：SIFT 或合成数据加载后，系统训练 PQ ADC 模型、构建或复用 Vamana packed graph index，再通过 Graph-Aware 2Q BufferPool、O_DIRECT/io_uring/pread 读路径和拓扑预取完成查询，并输出 JSON 结果。动态写入由 `bench_mixed_rw` 和 `StorageEngine`/`DynamicWriteManager` 验证，覆盖 WAL、MemTable、SSTable、flush、compaction 和 base/delta Top-K merge。
 
+核心结果：
+
+| 指标                                |                                      数值 |
+| ----------------------------------- | ----------------------------------------: |
+| dataset                             |  SIFT, base=1,000,000, query=100, dim=128 |
+| Recall@10                           |                                  `0.9940` |
+| QPS                                 |                                  `2.4062` |
+| avg query latency                   |                              `415.597 ms` |
+| P95 / P99 latency                   |               `522.014 ms` / `543.594 ms` |
+| effective search width / beam width |                              `350` / `16` |
+| entry strategy / seed count         |                     `single-medoid` / `1` |
+| I/O effective mode                  |                                `io_uring` |
+| prefetch                            | enabled, `next-hop`, width=`4`, depth=`1` |
+| cache policy / pages                |                `graph-aware-2q` / `15186` |
+| cache hit rate                      |                                  `0.5024` |
+| page reads per query                |                                  `918.99` |
+| visited per query                   |                                 `5291.59` |
+| expanded per query                  |                                  `350.00` |
+| estimated resident ratio            |                                `0.199992` |
+| warnings                            |                                      none |
+
+## 技术架构
+
+```text
+┌──────────────────────────────────────────────────────────────────────────────┐
+│                         Agent-Aware Architecture                             │
+├──────────────────────────────────────────────────────────────────────────────┤
+│                                                                              │
+│  Benchmark / Agent API                                                       │
+│  agent_aware_flow, bench_mixed_rw, StorageEngine                             │
+│                                │                                             │
+│                                ▼                                             │
+│  ┌────────────────────────────────────────────────────────────────────────┐  │
+│  │ Engine Layer                                                           │  │
+│  │ PackedGraphEngine: base graph search + dynamic delta merge             │  │
+│  └───────────────────────────────┬────────────────────────────────────────┘  │
+│                                  │                                           │
+│              ┌───────────────────┴───────────────────┐                       │
+│              ▼                                       ▼                       │
+│  ┌───────────────────────────────┐       ┌───────────────────────────────┐   │
+│  │ In-Memory Components          │       │ Dynamic Write Layer           │   │
+│  │ <= 20% resident budget        │       │ DynamicWriteManager           │   │
+│  │                               │       │                               │   │
+│  │  PQ Codes                     │       │  WAL append                   │   │
+│  │  Graph Nav Data               │       │  MemTable / immutable view    │   │
+│  │  PQ Codebooks                 │       │  SSTable + Manifest           │   │
+│  │  Graph-Aware 2Q BufferPool    │       │  Compaction / recovery        │   │
+│  │  VisitedBitmap                │       │                               │   │
+│  └───────────────┬───────────────┘       └───────────────┬───────────────┘   │
+│                  │                                       │                   │
+│                  │ PQ ADC filter + exact rerank          │ updates/deletes   │
+│                  │ pread / O_DIRECT / io_uring           │ delta records     │
+│                  ▼                                       ▼                   │
+│  ┌────────────────────────────────────────────────────────────────────────┐  │
+│  │ SSD-Resident Components                                                │  │
+│  │ Packed Vamana graph index                                              │  │
+│  │ Disk node records: fixed 4KB pages                                     │  │
+│  │ [NodeID][FullVector][NeighborIDs][NeighborPQCodes][Padding]            │  │
+│  └───────────────────────────────┬────────────────────────────────────────┘  │
+│                                  │                                           │
+│                                  ▼                                           │
+│  ┌────────────────────────────────────────────────────────────────────────┐  │
+│  │ Query Runtime                                                          │  │
+│  │ EntrySelector -> beam search -> QueryPageSession -> PrefetchPlanner    │  │
+│  │ Async batch read + topology-aware next-hop prefetch                    │  │
+│  └────────────────────────────────────────────────────────────────────────┘  │
+│                                                                              │
+└──────────────────────────────────────────────────────────────────────────────┘
+```
+
 ## 项目结构
 
-| 路径 | 说明 |
-| --- | --- |
-| `include/agent_aware/core`, `src/agent_aware/core` | 基础类型、暴力检索、SIMD/L2 距离、PQ ADC、异步 page reader、预取规划 |
-| `include/agent_aware/data`, `src/agent_aware/data` | SIFT `.fvecs`/`.ivecs` 读取与 synthetic 数据生成 |
-| `include/agent_aware/graph`, `src/agent_aware/graph` | Vamana/近似图构建、packed page 编码、SSD graph index、entry point 选择 |
-| `include/agent_aware/storage`, `src/agent_aware/storage` | 4KB disk record、disk index reader/writer、LSM 基础组件 |
-| `include/agent_aware/dynamic`, `src/agent_aware/dynamic` | WAL、MemTable、SSTable、Manifest、Compaction、动态写入管理 |
-| `include/agent_aware/engine`, `src/agent_aware/engine` | 对上层 Agent 或 benchmark 暴露的 `StorageEngine` 统一接口 |
-| `tools/benchmarks/sift_search_benchmark.cpp` | SSD 检索主 benchmark，输出 JSON |
-| `tools/benchmarks/mixed_rw_benchmark.cpp` | P5 混合读写 benchmark，输出 CSV 或 JSON |
-| `tests/unit` | core、storage、dynamic、graph 分组单元测试 |
-| `scripts/linux/run_sift1m_once.sh` | SIFT1M 一键构建/运行/归档脚本 |
-| `PROJECT_PLAN.md` | 项目计划、技术路线、参数调优范围和验收标准 |
-| `docs/README.md` | 文档导航、阶段计划完成度、结果报告索引和后续优先级 |
+```text
+agent-aware/
+├── CMakeLists.txt                         # 顶层构建入口，生成库和 benchmark 可执行文件
+├── README.md                              # 项目入口、构建运行、实验结果和参数说明
+├── PROJECT_PLAN.md                        # 总体计划、技术路线和验收标准
+├── include/                               # 对外头文件
+│   ├── agent_aware.h                      # 聚合入口头
+│   ├── core/                              # 基础类型、距离计算、PQ、预取和异步 page reader
+│   │   ├── types.h
+│   │   ├── brute_force.h
+│   │   ├── pq_encoder.h
+│   │   ├── async_page_reader.h
+│   │   ├── query_page_session.h
+│   │   └── prefetch_planner.h
+│   ├── data/                              # SIFT/fvecs/ivecs 读取与 synthetic 数据生成
+│   ├── graph/                             # Vamana 构图、packed page 编码、SSD graph index
+│   ├── storage/                           # 4KB disk record、disk index reader/writer、LSM 基础组件
+│   ├── dynamic/                           # WAL、MemTable、SSTable、Manifest、Compaction
+│   └── engine/                            # StorageEngine / PackedGraphEngine 对外接口
+├── src/                                   # C++ 实现
+│   ├── core/                              # PQ ADC、SIMD/L2、io_uring/pread/O_DIRECT 读路径
+│   ├── data/                              # 数据集加载实现
+│   ├── graph/                             # 图构建、entry selection、packed graph search
+│   ├── storage/                           # 磁盘 record 与索引读写实现
+│   ├── dynamic/                           # 动态写入、flush、recovery、compaction
+│   ├── engine/                            # base graph + delta merge 查询引擎
+│   ├── sift_search_benchmark.cpp          # 构建为 agent_aware_flow，输出 SSD 检索 JSON
+│   └── mixed_rw_benchmark.cpp             # 构建为 bench_mixed_rw，输出混合读写 CSV/JSON
+├── scripts/
+│   ├── run_sift1m_once.sh                 # SIFT1M 一键构建/运行/归档
+│   ├── run_agent_aware_flow_sift.py       # 参数矩阵实验运行器
+│   └── plot_sift_matrix.py                # 参数矩阵结果汇总与图表生成
+└── docs/
+    ├── README.md                          # 文档中心索引
+    ├── changelog.md                       # 当前版本能力边界、验证命令、已知限制
+    ├── competition/                       # 赛题要求、评分映射、答辩清单
+    ├── design/                            # SSD 存储、缓存、异步预取、动态写入设计
+    ├── experiments/                       # SIFT1M、混合读写、参数调优实验报告
+    └── roadmap/                           # 后续优化计划、任务拆分和冲刺路线
+```
+
+## 核心特性
+
+| 特性 | 状态 | 说明 |
+| --- | --- | --- |
+| Recall@10 高召回 | 已验证 | SIFT1M SSD 主路径 Recall@10 `0.9940`，超过赛题 `85%` 目标 |
+| 内存预算控制 | 已验证 | resident ratio `0.199992`，满足 `10%-20%` 内存约束展示口径 |
+| Vamana packed graph | 已实现 | 支持 Vamana 构图、BFS/coaccess 等 packing 策略和 SSD page 化存储 |
+| PQ ADC 编码器 | 已实现 | 支持 PQ codes、codebooks、ADC 候选评分和 exact rerank |
+| SIMD/L2 距离计算 | 已实现 | core 路径提供 L2 距离计算，查询中支持 direct distance/rerank |
+| O_DIRECT / pread 读路径 | 已实现 | Linux 下支持 O_DIRECT；不满足条件时保持 `pread` fallback |
+| io_uring 异步 I/O | 已实现 | liburing 可用时启用 batch submit、completion 和拓扑预取 |
+| Graph-Aware 2Q 缓存 | 已实现 | 支持 graph-aware-2q、hot page protection、缓存命中统计 |
+| 动态写入路径 | 已实现 | WAL + MemTable + SSTable + Manifest + Compaction + recovery |
+| immutable read view | 已实现 | reader 通过 atomic read view 读取动态层快照，降低读写锁竞争 |
+| 混合读写 benchmark | 已实现 | `bench_mixed_rw` 支持并发读写、JSON 输出和读路径分段耗时 |
+| SIFT 参数矩阵工具 | 已实现 | Python 脚本支持批量跑参数矩阵并生成曲线/汇总结果 |
 
 ## 环境与构建
 
@@ -109,18 +160,11 @@ cmake --build build -j"$(nproc)"
 | `ENABLE_DIRECT_IO` | `ON` | `ON`/`OFF` | 是否启用 Linux O_DIRECT 支持 |
 | `AGENT_AWARE_REQUIRE_LIBURING` | `OFF` | `ON`/`OFF` | 为 `ON` 时，缺少 liburing 会直接配置失败 |
 
-测试：
+构建验证：
 
 ```bash
-./build/agent_aware_tests
-./build/test_disk_record
-./build/test_disk_index_rw
-./build/test_memtable
-./build/test_dynamic_wal
-./build/test_sstable
-./build/test_compaction
-./build/test_dynamic_insert
-./build/test_entry_selector
+./build/agent_aware_flow --help
+./build/bench_mixed_rw --help
 ```
 
 ## 数据准备
@@ -153,27 +197,27 @@ cmake --build build -j"$(nproc)"
 
 ## 使用方式
 
-### 一键 SIFT 运行
+###  SIFT 运行
 
-`scripts/linux/run_sift1m_once.sh` 会构建 `agent_aware_flow`、执行 benchmark，并保存命令、stdout JSON、结果 JSON 和耗时信息。
+`scripts/run_sift1m_once.sh` 会构建 `agent_aware_flow`、执行 benchmark，并保存命令、stdout JSON、结果 JSON 和耗时信息。
 
 第一次建图：
 
 ```bash
-REBUILD_INDEX=1 bash scripts/linux/run_sift1m_once.sh
+REBUILD_INDEX=1 bash scripts/run_sift1m_once.sh
 ```
 
 后续复用索引：
 
 ```bash
-bash scripts/linux/run_sift1m_once.sh
+bash scripts/run_sift1m_once.sh
 ```
 
 临时覆盖参数：
 
 ```bash
 EXTRA_ARGS="--search-width 512 --beam-width 32 --io-depth 64" \
-  bash scripts/linux/run_sift1m_once.sh
+  bash scripts/run_sift1m_once.sh
 ```
 
 输出目录默认形如 `logs/sift_bench/sift1m_once_YYYYMMDD-HHMMSS/`：
@@ -484,27 +528,6 @@ done
   --output-json logs/sift_bench/sift1m_once_20260618-181128/result.json
 ```
 
-核心结果：
-
-| 指标 | 数值 |
-| --- | ---: |
-| dataset | SIFT, base=1,000,000, query=100, dim=128 |
-| Recall@10 | `0.9940` |
-| QPS | `2.4062` |
-| avg query latency | `415.597 ms` |
-| P95 / P99 latency | `522.014 ms` / `543.594 ms` |
-| effective search width / beam width | `350` / `16` |
-| entry strategy / seed count | `single-medoid` / `1` |
-| I/O effective mode | `io_uring` |
-| prefetch | enabled, `next-hop`, width=`4`, depth=`1` |
-| cache policy / pages | `graph-aware-2q` / `15186` |
-| cache hit rate | `0.5024` |
-| page reads per query | `918.99` |
-| visited per query | `5291.59` |
-| expanded per query | `350.00` |
-| estimated resident ratio | `0.199992` |
-| warnings | none |
-
 结果 JSON 会同时保留参数、有效参数和统计值。常用字段：
 
 | 字段 | 说明 |
@@ -712,5 +735,3 @@ manager.close();
 | 观察 io_uring 收益 | 对比 `--io-mode pread` 与 `--io-mode io_uring` | `qps`、`latency_p95_ms`、`io_submit_syscalls` |
 | 评估预取 | 对比 `--prefetch-policy none`、`next-hop`、`frontier-next-hop` | `prefetch_useful_pages`、`prefetch_wasted_pages` |
 | 验证动态写入 | 调整 `--read_ratio`、`--write_ratio`、`--memtable_flush_bytes` | `write_qps`、`flush_duration_ms`、`recovery_time_ms` |
-
-正式报告建议固定记录：完整命令、git commit、dirty files、数据路径、随机种子、index path、JSON/CSV 结果、硬件环境和是否发生 I/O fallback。

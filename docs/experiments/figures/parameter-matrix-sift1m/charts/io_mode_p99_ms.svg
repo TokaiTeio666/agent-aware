@@ -1,0 +1,28 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="760" height="430" viewBox="0 0 760 430">
+<rect width="100%" height="100%" fill="#ffffff"/>
+<text x="380.0" y="24.0" font-size="16" text-anchor="middle" fill="#1f2937" >I/O mode -&gt; P99 latency</text>
+<line x1="72" y1="358" x2="736" y2="358" stroke="#374151" stroke-width="1"/>
+<line x1="72" y1="46" x2="72" y2="358" stroke="#374151" stroke-width="1"/>
+<line x1="72" y1="46.0" x2="736" y2="46.0" stroke="#e5e7eb" stroke-width="1"/>
+<text x="62.0" y="50.0" font-size="11" text-anchor="end" fill="#1f2937" >365</text>
+<line x1="72" y1="124.0" x2="736" y2="124.0" stroke="#e5e7eb" stroke-width="1"/>
+<text x="62.0" y="128.0" font-size="11" text-anchor="end" fill="#1f2937" >291</text>
+<line x1="72" y1="202.0" x2="736" y2="202.0" stroke="#e5e7eb" stroke-width="1"/>
+<text x="62.0" y="206.0" font-size="11" text-anchor="end" fill="#1f2937" >216</text>
+<line x1="72" y1="280.0" x2="736" y2="280.0" stroke="#e5e7eb" stroke-width="1"/>
+<text x="62.0" y="284.0" font-size="11" text-anchor="end" fill="#1f2937" >142</text>
+<line x1="72" y1="358.0" x2="736" y2="358.0" stroke="#e5e7eb" stroke-width="1"/>
+<text x="62.0" y="362.0" font-size="11" text-anchor="end" fill="#1f2937" >67.6</text>
+<polyline points="72.0,67.5 404.0,278.1 736.0,336.5" fill="none" stroke="#2563eb" stroke-width="2.5" stroke-linejoin="round"/>
+<circle cx="72.0" cy="67.5" r="4" fill="#2563eb"/>
+<text x="72.0" y="58.5" font-size="10" text-anchor="middle" fill="#1f2937" >345</text>
+<circle cx="404.0" cy="278.1" r="4" fill="#2563eb"/>
+<text x="404.0" y="269.1" font-size="10" text-anchor="middle" fill="#1f2937" >144</text>
+<circle cx="736.0" cy="336.5" r="4" fill="#2563eb"/>
+<text x="736.0" y="327.5" font-size="10" text-anchor="middle" fill="#1f2937" >88.2</text>
+<text x="72.0" y="380.0" font-size="11" text-anchor="middle" fill="#1f2937" >io_uring</text>
+<text x="404.0" y="380.0" font-size="11" text-anchor="middle" fill="#1f2937" >odirect</text>
+<text x="736.0" y="380.0" font-size="11" text-anchor="middle" fill="#1f2937" >pread</text>
+<text x="404.0" y="412.0" font-size="12" text-anchor="middle" fill="#1f2937" >I/O mode</text>
+<text x="18.0" y="202.0" font-size="12" text-anchor="middle" fill="#1f2937" transform="rotate(-90 18 202)">ms</text>
+</svg>
