@@ -4,7 +4,7 @@ build/
 *.o
 *.obj
 *.log
-data/
+/data/
 sift/
 sift.tar.gz
 results/
@@ -22,7 +22,7 @@ results/
 # Generated benchmark artifacts
 logs/
 indexes/
-data/
+/data/
 
 # Large index / model / data files
 *.idx
@@ -33,3 +33,9 @@ data/
 *.pt
 *.pth
 *.ckpt
+
+# Keep source directories named data
+!/src/data/
+!/src/data/**
+!/include/data/
+!/include/data/**
