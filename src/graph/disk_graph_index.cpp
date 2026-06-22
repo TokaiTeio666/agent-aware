@@ -673,6 +673,21 @@ PackedDiskGraphIndex::initialize_search_state(
   return state;
 }
 
+std::vector<std::uint32_t> PackedDiskGraphIndex::collect_frontier_pages(
+    const SearchState& state, std::size_t scan_width) const {
+  auto frontier = state.candidates;
+  std::vector<std::uint32_t> page_ids;
+  page_ids.reserve(scan_width);
+  while (!frontier.empty() && page_ids.size() < scan_width) {
+    const auto next = frontier.top();
+    frontier.pop();
+    if (!state.session.is_node_materialized(next.id)) {
+      page_ids.push_back(state.session.page_for_node(next.id));
+    }
+  }
+  return page_ids;
+}
+
 void PackedDiskGraphIndex::maybe_issue_prefetch(SearchState& state) const {
   if (state.session.async_prefetch_enabled()) {
     state.session.drain_ready_pages();
@@ -682,22 +697,13 @@ void PackedDiskGraphIndex::maybe_issue_prefetch(SearchState& state) const {
     return;
   }
 
-  auto frontier = state.candidates;
-  std::vector<std::uint32_t> page_ids;
   const std::size_t requested_beam_width =
       state.config.beam_width == 0 ? state.config.search_width
                                    : state.config.beam_width;
   const std::size_t candidate_scan_width =
       std::clamp(requested_beam_width, std::size_t{1},
                  state.config.search_width);
-  page_ids.reserve(candidate_scan_width);
-  while (!frontier.empty() && page_ids.size() < candidate_scan_width) {
-    const auto next = frontier.top();
-    frontier.pop();
-    if (!state.session.is_node_materialized(next.id)) {
-      page_ids.push_back(state.session.page_for_node(next.id));
-    }
-  }
+  const auto page_ids = collect_frontier_pages(state, candidate_scan_width);
   state.session.submit_candidate_prefetch(page_ids);
 }
 
@@ -716,11 +722,25 @@ void PackedDiskGraphIndex::expand_candidate(SearchState& state,
   (void)state.session.pin_page(state.session.page_for_node(current.id));
   ++state.output.stats.expanded;
 
+  std::vector<std::uint32_t> new_neighbors;
+  new_neighbors.reserve(node.neighbors.size());
   for (const auto neighbor_id : node.neighbors) {
     if (neighbor_id >= metadata_.vector_count ||
         !state.visited.insert(neighbor_id).second) {
       continue;
     }
+    new_neighbors.push_back(neighbor_id);
+  }
+
+  if (state.session.next_hop_prefetch_enabled()) {
+    const std::unordered_set<std::uint32_t> excluded_nodes;
+    const auto fallback_pages =
+        collect_frontier_pages(state, state.config.prefetch_fallback_width);
+    state.session.submit_next_hop_prefetch(new_neighbors, excluded_nodes,
+                                           fallback_pages);
+  }
+
+  for (const auto neighbor_id : new_neighbors) {
     const float distance = state.candidate_distance(neighbor_id);
     const SearchResult candidate{neighbor_id, distance};
     state.candidates.push(candidate);
@@ -733,16 +753,28 @@ void PackedDiskGraphIndex::expand_candidate_batch(
     SearchState& state, const std::vector<SearchResult>& batch) {
   if (state.config.enable_progressive_frontier_prefetch &&
       !state.adc_table.empty()) {
+    const std::unordered_set<std::uint32_t> excluded_nodes;
     for (const auto& current : batch) {
       const DiskNode& node = state.load_node(current.id);
       (void)state.session.pin_page(state.session.page_for_node(current.id));
       ++state.output.stats.expanded;
 
+      std::vector<std::uint32_t> new_neighbors;
+      new_neighbors.reserve(node.neighbors.size());
       for (const auto neighbor_id : node.neighbors) {
         if (neighbor_id >= metadata_.vector_count ||
             !state.visited.insert(neighbor_id).second) {
           continue;
         }
+        new_neighbors.push_back(neighbor_id);
+      }
+      if (state.session.next_hop_prefetch_enabled()) {
+        const auto fallback_pages =
+            collect_frontier_pages(state, state.config.prefetch_fallback_width);
+        state.session.submit_next_hop_prefetch(new_neighbors, excluded_nodes,
+                                               fallback_pages);
+      }
+      for (const auto neighbor_id : new_neighbors) {
         const float distance = state.candidate_distance(neighbor_id);
         const SearchResult candidate{neighbor_id, distance};
         state.candidates.push(candidate);
@@ -760,6 +792,7 @@ void PackedDiskGraphIndex::expand_candidate_batch(
   std::vector<std::vector<std::uint32_t>> new_neighbors_by_candidate;
   new_neighbors_by_candidate.reserve(batch.size());
   std::vector<std::uint32_t> neighbor_pages;
+  const std::unordered_set<std::uint32_t> excluded_nodes;
 
   for (const auto& current : batch) {
     const DiskNode& node = state.load_node(current.id);
@@ -777,6 +810,12 @@ void PackedDiskGraphIndex::expand_candidate_batch(
       if (state.adc_table.empty()) {
         neighbor_pages.push_back(state.session.page_for_node(neighbor_id));
       }
+    }
+    if (state.session.next_hop_prefetch_enabled()) {
+      const auto fallback_pages =
+          collect_frontier_pages(state, state.config.prefetch_fallback_width);
+      state.session.submit_next_hop_prefetch(new_neighbors, excluded_nodes,
+                                             fallback_pages);
     }
     new_neighbors_by_candidate.push_back(std::move(new_neighbors));
   }

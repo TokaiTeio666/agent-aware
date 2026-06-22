@@ -37,7 +37,7 @@ PARAMETER_AUDIT = [
     (
         "prefetch_depth",
         "secondary",
-        "Current binary supports only 0/1; staged I/O mode comparisons keep prefetch disabled by default for a pure mode sweep.",
+        "0 disables prefetch; positive values scale the query-level prefetch budget when effective io_uring is available.",
         "Demand/prefetch/submitted reads, useful/wasted prefetch pages, and page read wait.",
     ),
 ]

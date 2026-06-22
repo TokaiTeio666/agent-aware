@@ -31,7 +31,8 @@ PARAMETER_RATIONALE = {
         "it should change sync/odirect/io_uring behavior and I/O wait stats."
     ),
     "prefetch_depth": (
-        "Only supports 0/1 and only becomes active with effective io_uring. "
+        "0 disables prefetch; positive values scale the query-level prefetch "
+        "budget with prefetch_width when effective io_uring is available. "
         "The staged io_mode sweep keeps it disabled by default so I/O mode is "
         "not conflated with prefetch."
     ),
@@ -368,14 +369,12 @@ def build_command(binary, output_json, spec, rebuild_index_passed, extra_args, a
 
     if spec.prefetch_depth == 0:
         command.extend(["--enable-prefetch", "0"])
-    elif spec.prefetch_depth == 1:
-        command.extend(["--prefetch-depth", "1"])
+    else:
+        command.extend(["--prefetch-depth", str(spec.prefetch_depth)])
         if args.prefetch_policy:
             command.extend(["--prefetch-policy", args.prefetch_policy])
         if args.prefetch_width:
             command.extend(["--prefetch-width", str(args.prefetch_width)])
-    else:
-        raise ValueError("current agent_aware_flow supports only prefetch_depth 0 or 1")
 
     if rebuild_index_passed:
         command.extend(["--rebuild-index", "1"])
@@ -552,11 +551,6 @@ def main():
             "memory_budget_ratio will not change cache_pages because EXTRA_ARGS "
             "contains an explicit cache-pages override"
         )
-    if args.prefetch_depth not in (0, 1):
-        warnings.append("prefetch_depth must be 0 or 1 for current agent_aware_flow")
-    if args.io_mode_prefetch_depth not in (0, 1):
-        warnings.append("io_mode_prefetch_depth must be 0 or 1 for current agent_aware_flow")
-
     specs = build_specs(args)
     output_dir.mkdir(parents=True, exist_ok=True)
     write_plan_metadata(output_dir / "matrix_plan.json", args, specs, warnings)
@@ -588,18 +582,6 @@ def main():
             write_command_file(command_path, root, [str(binary), "--help"], spec, False, extra_args)
             payload = skip_payload(root, binary, spec, reason, extra_args)
             payload["beam_width_supported"] = False
-            write_json(output_json, payload)
-            skipped += 1
-            continue
-
-        if spec.prefetch_depth not in (0, 1):
-            reason = (
-                f"prefetch_depth={spec.prefetch_depth} skipped because current "
-                "agent_aware_flow supports only 0 or 1"
-            )
-            write_command_file(command_path, root, [str(binary), "--help"], spec, False, extra_args)
-            payload = skip_payload(root, binary, spec, reason, extra_args)
-            payload["beam_width_supported"] = True
             write_json(output_json, payload)
             skipped += 1
             continue

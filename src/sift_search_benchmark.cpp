@@ -77,11 +77,14 @@ struct Args {
   std::size_t requested_prefetch_depth = 0;
   std::optional<std::size_t> effective_prefetch_depth = 1;
   std::size_t prefetch_width = 1;
+  std::size_t prefetch_fallback_width = 0;
   std::size_t prefetch_min_candidates_per_page = 2;
   bool adaptive_prefetch = true;
   std::size_t adaptive_prefetch_window = 32;
   bool enable_progressive_frontier_prefetch = false;
   std::string prefetch_policy = "next-hop";
+  bool page_dedup = true;
+  bool page_coalesce = true;
 
   std::string io_mode = "io_uring";
   std::size_t io_batch = 16;
@@ -197,10 +200,13 @@ void print_help() {
       << "  --rerank-topk N              Exact rerank pool after PQ, default 100\n"
       << "Prefetch/cache/I/O:\n"
       << "  --enable-prefetch 0|1        Disable/enable async prefetch\n"
-      << "  --prefetch-depth N           Supported values: 0 or 1, default 1\n"
+      << "  --prefetch-depth N           Next-hop prefetch depth; 0 disables prefetch, default 1\n"
       << "  --prefetch-width N           Frontier/next-hop prefetch width, default 1\n"
+      << "  --prefetch-fallback-width N  Frontier pages to use when next-hop has no pages, default 0\n"
       << "  --prefetch-min-candidates-per-page N Candidate page reuse threshold, default 2\n"
-      << "  --adaptive-prefetch 0|1      Disable prefetch after low ready-hit ratio, default 1\n"
+      << "  --page-dedup 0|1             Deduplicate prefetch pages across a query, default 1\n"
+      << "  --page-coalesce 0|1          Rank candidate pages by page reuse, default 1\n"
+      << "  --adaptive-prefetch 0|1      Adapt width by useful prefetch hit ratio, default 1\n"
       << "  --adaptive-prefetch-window N Query window for adaptive gate, default 32\n"
       << "  --enable-progressive-frontier-prefetch 0|1 Experimental intra-beam frontier prefetch, default 0\n"
       << "  --prefetch-policy NAME       none/frontier/next-hop/frontier-next-hop, default next-hop\n"
@@ -333,10 +339,21 @@ Args parse_args(int argc, char** argv) {
     } else if (name == "--prefetch-width" || name == "--prefetch_width") {
       args.prefetch_width = parse_size_value(require_value(i, argc, argv, name),
                                              name, 1);
+    } else if (name == "--prefetch-fallback-width" ||
+               name == "--prefetch_fallback_width" ||
+               name == "--fallback-width" || name == "--fallback_width") {
+      args.prefetch_fallback_width =
+          parse_size_value(require_value(i, argc, argv, name), name, 0);
     } else if (name == "--prefetch-min-candidates-per-page" ||
                name == "--prefetch_min_candidates_per_page") {
       args.prefetch_min_candidates_per_page =
           parse_size_value(require_value(i, argc, argv, name), name, 1);
+    } else if (name == "--page-dedup" || name == "--page_dedup") {
+      args.page_dedup =
+          parse_bool_value(require_value(i, argc, argv, name), name);
+    } else if (name == "--page-coalesce" || name == "--page_coalesce") {
+      args.page_coalesce =
+          parse_bool_value(require_value(i, argc, argv, name), name);
     } else if (name == "--adaptive-prefetch" ||
                name == "--adaptive_prefetch") {
       args.adaptive_prefetch =
@@ -401,13 +418,10 @@ void validate_and_finalize_args(Args& args) {
       args.enable_prefetch = false;
       args.enable_prefetch_explicit = true;
       args.effective_prefetch_depth.reset();
-    } else if (args.requested_prefetch_depth == 1) {
+    } else {
       args.enable_prefetch = true;
       args.enable_prefetch_explicit = true;
-      args.effective_prefetch_depth = 1;
-    } else {
-      throw std::runtime_error(
-          "Unsupported --prefetch-depth: current agent_aware_flow supports only 0 or 1");
+      args.effective_prefetch_depth = args.requested_prefetch_depth;
     }
   } else if (args.enable_prefetch) {
     args.effective_prefetch_depth = 1;
@@ -814,11 +828,14 @@ agent_aware::DiskGraphSearchConfig make_search_config(
   search.prefetch_policy = args.enable_prefetch ? args.prefetch_policy : "none";
   search.prefetch_depth = args.effective_prefetch_depth.value_or(1);
   search.prefetch_width = prefetch_width_override;
+  search.prefetch_fallback_width = args.prefetch_fallback_width;
   search.prefetch_min_candidates_per_page =
       args.prefetch_min_candidates_per_page;
   search.adaptive_prefetch = args.adaptive_prefetch;
   search.enable_progressive_frontier_prefetch =
       args.enable_progressive_frontier_prefetch;
+  search.page_dedup = args.page_dedup;
+  search.page_coalesce = args.page_coalesce;
   return search;
 }
 
@@ -850,16 +867,22 @@ SearchAggregate run_search_worker(const Args& args,
     add_stats(aggregate, result.stats);
     window_stats.prefetch_submitted += result.stats.prefetch_submitted;
     window_stats.prefetch_ready_hit += result.stats.prefetch_ready_hit;
+    window_stats.prefetch_pending_hit += result.stats.prefetch_pending_hit;
+    window_stats.prefetch_useful_pages += result.stats.prefetch_useful_pages;
     if (args.adaptive_prefetch &&
         aggregate.queries % args.adaptive_prefetch_window == 0) {
-      const double ready_hit_ratio =
-          static_cast<double>(window_stats.prefetch_ready_hit) /
-          static_cast<double>(std::max<std::size_t>(
-              1, window_stats.prefetch_submitted));
-      if (ready_hit_ratio < 0.30) {
+      if (window_stats.prefetch_submitted == 0) {
+        adaptive_prefetch_width = args.prefetch_width;
+        window_stats = agent_aware::DiskGraphSearchStats{};
+        continue;
+      }
+      const double useful_hit_ratio =
+          static_cast<double>(window_stats.prefetch_useful_pages) /
+          static_cast<double>(window_stats.prefetch_submitted);
+      if (useful_hit_ratio < 0.30) {
         adaptive_prefetch_width = 0;
       } else {
-        adaptive_prefetch_width = std::min<std::size_t>(1, args.prefetch_width);
+        adaptive_prefetch_width = args.prefetch_width;
       }
       window_stats = agent_aware::DiskGraphSearchStats{};
     }
@@ -1042,8 +1065,12 @@ std::string json_for_run(const Args& args,
                                                         : "none")
        << "\",\n";
   json << "  \"prefetch_width\": " << args.prefetch_width << ",\n";
+  json << "  \"prefetch_fallback_width\": "
+       << args.prefetch_fallback_width << ",\n";
   json << "  \"prefetch_min_candidates_per_page\": "
        << args.prefetch_min_candidates_per_page << ",\n";
+  json << "  \"page_dedup\": " << args.page_dedup << ",\n";
+  json << "  \"page_coalesce\": " << args.page_coalesce << ",\n";
   json << "  \"adaptive_prefetch\": " << args.adaptive_prefetch << ",\n";
   json << "  \"adaptive_prefetch_window\": "
        << args.adaptive_prefetch_window << ",\n";
@@ -1216,6 +1243,10 @@ std::string json_for_run(const Args& args,
        << ",\n";
   json << "    \"io_prefetch_hits\": " << aggregate.stats.io_prefetch_hits
        << ",\n";
+  json << "    \"io_prefetch_waits\": " << aggregate.stats.io_prefetch_waits
+       << ",\n";
+  json << "    \"io_pending_pages_peak\": "
+       << aggregate.stats.io_pending_pages_peak << ",\n";
   json << "    \"batch_count\": " << aggregate.stats.batch_count << ",\n";
   json << "    \"avg_batch_size\": " << avg_batch_size << ",\n";
   json << "    \"max_batch_size\": " << aggregate.stats.max_batch_size

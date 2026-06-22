@@ -1,8 +1,8 @@
 # 03 异步预取设计文档
 
-## 当前实现状态（2026-06-21）
+## 当前实现状态（2026-06-22）
 
-核心能力已经进入 SSD 查询主路径：`AsyncPageReader` 提供同步读、异步读、批量提交和 io_uring fallback；`QueryPageSession` 负责 frontier/next-hop prefetch、pending/ready page 管理和 useful/wasted 统计；`agent_aware_flow` 可通过 `--io-mode`、`--io-depth`、`--io-batch`、`--prefetch-policy`、`--prefetch-width` 调整。
+核心能力已经进入 SSD 查询主路径：`AsyncPageReader` 提供同步读、异步读、按 `io_batch` 切分的批量提交和 io_uring fallback；`QueryPageSession` 负责 frontier/next-hop prefetch、pending/ready page 管理和 useful/wasted 统计；`PackedDiskGraphIndex` 在候选扩展后把真实邻居列表接入 next-hop 预取；`agent_aware_flow` 可通过 `--io-mode`、`--io-depth`、`--io-batch`、`--prefetch-policy`、`--prefetch-width`、`--prefetch-depth`、`--prefetch-fallback-width`、`--page-coalesce` 调整。
 
 | 项目 | 状态 | 当前对应实现 |
 | --- | --- | --- |

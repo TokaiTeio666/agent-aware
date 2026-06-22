@@ -443,11 +443,14 @@ done
 | 参数 | 默认值 | 可选范围 | 说明 |
 | --- | --- | --- | --- |
 | `--enable-prefetch` | `1` | `0/1` | 是否尝试启用异步预取 |
-| `--prefetch-depth` | `1` | `0` 或 `1` | 当前实现只支持 0/1；`0` 等价关闭预取 |
+| `--prefetch-depth` | `1` | `>=0` | `0` 等价关闭预取；正数会按 `prefetch_width * depth` 扩大查询级预取预算 |
 | `--prefetch-width` | `4` | `>=1` | 每次 frontier/next-hop 预取宽度 |
+| `--prefetch-fallback-width` | `0` | `>=0` | next-hop 无可提交页时，从 frontier 候选页补充的宽度 |
+| `--page-dedup` | `1` | `0/1` | 是否跨 query session 预取计划去重 |
+| `--page-coalesce` | `1` | `0/1` | 是否按候选页复用次数重排预取页；关闭时按候选顺序取页 |
 | `--prefetch-policy` | `next-hop` | `none`、`frontier`、`next-hop`、`frontier-next-hop` | 预取策略 |
 | `--io-mode` | `io_uring` | `pread`、`odirect`、`io_uring` | 磁盘读模式；不满足条件时会 fallback 到 `pread` |
-| `--io-batch` | `16` | `>=1` | I/O batch size |
+| `--io-batch` | `16` | `>=1` | 每次 batch submit 的请求上限 |
 | `--io-depth` | `32` | `>=1`，计划推荐 `32-512` | io_uring queue depth |
 | `--cache-policy` | `graph-aware-2q` | `none`、`lru`、`2q`、`graph-aware-2q`、`agent` | page cache 淘汰策略 |
 | `--cache-pages` | `0` | `>=0` | `0` 且 cache policy 非 `none` 时按内存预算自动计算 |

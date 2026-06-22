@@ -15,7 +15,27 @@ bool session_async_prefetch_enabled(const PackedDiskGraphIndex& index,
                                     const DiskGraphSearchConfig& config) {
   const DiskGraphIoStatus& status = index.io_status();
   return status.io_uring_enabled && status.depth > 0 &&
+         config.prefetch_depth > 0 &&
+         (config.prefetch_width > 0 ||
+          config.prefetch_fallback_width > 0) &&
          config.prefetch_policy != "none";
+}
+
+std::size_t session_demand_io_reserve(const PackedDiskGraphIndex& index,
+                                      const DiskGraphSearchConfig& config) {
+  (void)config;
+  const DiskGraphIoStatus& status = index.io_status();
+  if (!status.io_uring_enabled || status.depth == 0) {
+    return 1;
+  }
+  const std::size_t io_depth = std::max<std::size_t>(1, status.depth);
+  if (io_depth <= 1) {
+    return 1;
+  }
+  const std::size_t io_batch = std::max<std::size_t>(1, status.batch_size);
+  const std::size_t reserve_cap = std::max<std::size_t>(1, io_depth / 2);
+  return std::max<std::size_t>(
+      1, std::min<std::size_t>(io_batch, reserve_cap));
 }
 
 std::size_t session_prefetch_budget(const PackedDiskGraphIndex& index,
@@ -25,8 +45,15 @@ std::size_t session_prefetch_budget(const PackedDiskGraphIndex& index,
   }
   const std::size_t io_depth = std::max<std::size_t>(1, index.io_status().depth);
   const std::size_t demand_reserve =
-      std::max<std::size_t>(1, io_depth > 1 ? io_depth - 1 : 1);
-  return io_depth > demand_reserve ? io_depth - demand_reserve : 0;
+      session_demand_io_reserve(index, config);
+  if (io_depth <= demand_reserve) {
+    return 0;
+  }
+  const std::size_t width =
+      std::max(config.prefetch_width, config.prefetch_fallback_width);
+  const std::size_t requested =
+      width * std::max<std::size_t>(1, config.prefetch_depth);
+  return std::min(requested, io_depth - demand_reserve);
 }
 
 PrefetchPlanner::Config session_prefetch_config(
@@ -34,7 +61,7 @@ PrefetchPlanner::Config session_prefetch_config(
   return PrefetchPlanner::Config{config.prefetch_policy,
                                  config.prefetch_width,
                                  config.prefetch_depth,
-                                 session_prefetch_budget(index, config),
+                                 config.prefetch_fallback_width,
                                  config.prefetch_min_candidates_per_page,
                                  config.page_dedup,
                                  config.page_coalesce};
@@ -50,8 +77,7 @@ QueryPageSession::QueryPageSession(PackedDiskGraphIndex& index,
       prefetch_planner_(session_prefetch_config(index, config)),
       async_prefetch_(session_async_prefetch_enabled(index, config)),
       prefetch_budget_pages_(session_prefetch_budget(index, config)),
-      demand_io_reserve_pages_(std::max<std::size_t>(
-          1, index.io_status().depth > 1 ? index.io_status().depth - 1 : 1)) {}
+      demand_io_reserve_pages_(session_demand_io_reserve(index, config)) {}
 
 QueryPageSession::~QueryPageSession() {
   try {
@@ -73,7 +99,7 @@ bool QueryPageSession::next_hop_prefetch_enabled() const {
 }
 
 bool QueryPageSession::candidate_prefetch_enabled() const {
-  return frontier_prefetch_enabled() || next_hop_prefetch_enabled();
+  return frontier_prefetch_enabled();
 }
 
 std::size_t QueryPageSession::prefetch_width() const {
@@ -372,19 +398,12 @@ void QueryPageSession::submit_prefetch(
         return page_availability(page_id);
       });
   apply_prefetch_plan_stats(plan.stats);
-  for (const auto page_id : plan.pages) {
-    if (async_page_footprint() >= prefetch_budget_pages_) {
-      ++stats_.prefetch_skip_budget_full;
-      break;
-    }
-    (void)prefetch_page(page_id);
-  }
-  submit_prefetches();
+  submit_prefetch_plan(plan.pages);
 }
 
 void QueryPageSession::submit_candidate_prefetch(
     const std::vector<std::uint32_t>& page_ids) {
-  if (!candidate_prefetch_enabled() || page_ids.empty()) {
+  if (!frontier_prefetch_enabled() || page_ids.empty()) {
     return;
   }
 
@@ -393,42 +412,43 @@ void QueryPageSession::submit_candidate_prefetch(
         return page_availability(page_id);
       });
   apply_prefetch_plan_stats(plan.stats);
-  for (const auto page_id : plan.pages) {
-    if (async_page_footprint() >= prefetch_budget_pages_) {
-      ++stats_.prefetch_skip_budget_full;
-      break;
-    }
-    (void)prefetch_page(page_id);
-  }
-  submit_prefetches();
+  submit_prefetch_plan(plan.pages);
 }
 
 void QueryPageSession::submit_next_hop_prefetch(
     const std::vector<std::uint32_t>& node_ids,
-    const std::unordered_set<std::uint32_t>& visited_nodes) {
-  if (!next_hop_prefetch_enabled() || node_ids.empty()) {
+    const std::unordered_set<std::uint32_t>& excluded_nodes,
+    const std::vector<std::uint32_t>& fallback_page_ids) {
+  if (!next_hop_prefetch_enabled() ||
+      (node_ids.empty() && fallback_page_ids.empty())) {
     return;
   }
 
   const auto plan = prefetch_planner_.plan_next_hop(
       node_ids, index_.metadata_.vector_count,
       [this](std::uint32_t node_id) { return page_for_node(node_id); },
-      [this, &visited_nodes](std::uint32_t node_id) {
-        return visited_nodes.find(node_id) != visited_nodes.end() ||
+      [this, &excluded_nodes](std::uint32_t node_id) {
+        return excluded_nodes.find(node_id) != excluded_nodes.end() ||
                is_node_materialized(node_id);
       },
       [this](std::uint32_t page_id) {
         return page_availability(page_id);
       });
   apply_prefetch_plan_stats(plan.stats);
-  for (const auto page_id : plan.pages) {
-    if (async_page_footprint() >= prefetch_budget_pages_) {
-      ++stats_.prefetch_skip_budget_full;
-      break;
-    }
-    (void)prefetch_page(page_id);
+  submit_prefetch_plan(plan.pages);
+
+  const std::size_t fallback_width = prefetch_planner_.fallback_width();
+  if (plan.pages.empty() && fallback_width > 0 &&
+      !fallback_page_ids.empty()) {
+    const auto fallback_plan = prefetch_planner_.plan_candidates(
+        fallback_page_ids,
+        [this](std::uint32_t page_id) {
+          return page_availability(page_id);
+        },
+        fallback_width);
+    apply_prefetch_plan_stats(fallback_plan.stats);
+    submit_prefetch_plan(fallback_plan.pages);
   }
-  submit_prefetches();
 }
 
 void QueryPageSession::drain_ready_pages() {
@@ -689,7 +709,20 @@ void QueryPageSession::wait_for_prefetch_page(std::uint32_t page_id) {
   }
 }
 
-bool QueryPageSession::prefetch_page(std::uint32_t page_id) {
+std::size_t QueryPageSession::prefetch_batch_limit() const {
+  const std::size_t io_batch =
+      std::max<std::size_t>(1, index_.io_status().batch_size);
+  if (prefetch_budget_pages_ == 0) {
+    return io_batch;
+  }
+  return std::max<std::size_t>(
+      1, std::min<std::size_t>(io_batch, prefetch_budget_pages_));
+}
+
+bool QueryPageSession::queue_prefetch_request(
+    std::uint32_t page_id,
+    std::vector<AsyncPageReader::ReadRequest>& requests,
+    std::unordered_set<std::uint32_t>& queued_pages) {
   if (!async_prefetch_ || page_id >= index_.metadata_.page_count) {
     return false;
   }
@@ -700,29 +733,20 @@ bool QueryPageSession::prefetch_page(std::uint32_t page_id) {
     return false;
   }
 
-  if (page_in_cache(page_id)) {
-    ++stats_.prefetch_skip_cached;
-    record_duplicate_skipped();
-    return false;
-  }
-  if (pending_pages_.find(page_id) != pending_pages_.end()) {
-    ++stats_.prefetch_skip_pending;
-    record_duplicate_skipped();
-    return false;
-  }
-  if (page_ready_in_session(page_id)) {
-    ++stats_.prefetch_skip_materialized;
+  if (!queued_pages.insert(page_id).second) {
+    ++stats_.prefetch_skip_seen_before;
     record_duplicate_skipped();
     return false;
   }
 
-  if (async_page_footprint() >= prefetch_budget_pages_) {
+  if (async_page_footprint() + requests.size() >= prefetch_budget_pages_) {
     (void)harvest_prefetch(false);
   }
-  if (async_page_footprint() >= prefetch_budget_pages_) {
+  if (async_page_footprint() + requests.size() >= prefetch_budget_pages_) {
     ++stats_.prefetch_skip_budget_full;
     return false;
   }
+
   if (page_in_cache(page_id)) {
     ++stats_.prefetch_skip_cached;
     record_duplicate_skipped();
@@ -739,19 +763,53 @@ bool QueryPageSession::prefetch_page(std::uint32_t page_id) {
     return false;
   }
 
-  const std::uint64_t token = index_.page_reader_->start_async_read(
-      page_offset(page_id), index_.metadata_.page_size, stats_);
-  token_to_page_[token] = page_id;
-  pending_pages_.insert(page_id);
-  visited_pages_.insert(page_id);
-  ++stats_.prefetch_reads;
-  ++stats_.node_reads;
-  ++stats_.io_prefetches;
-  ++stats_.prefetch_submitted_pages;
-  ++stats_.prefetch_submitted;
-  ++stats_.p4_io.prefetch_issued;
-  update_pending_peak();
+  requests.push_back(AsyncPageReader::ReadRequest{
+      page_id, page_offset(page_id), index_.metadata_.page_size});
   return true;
+}
+
+void QueryPageSession::flush_prefetch_requests(
+    std::vector<AsyncPageReader::ReadRequest>& requests) {
+  if (requests.empty()) {
+    return;
+  }
+
+  const auto submitted = index_.page_reader_->batch_submit(requests, stats_);
+  for (const auto& read : submitted) {
+    token_to_page_[read.token] = read.page_id;
+    pending_pages_.insert(read.page_id);
+    visited_pages_.insert(read.page_id);
+    ++stats_.prefetch_reads;
+    ++stats_.node_reads;
+    ++stats_.io_prefetches;
+    ++stats_.prefetch_submitted_pages;
+    ++stats_.prefetch_submitted;
+    ++stats_.p4_io.prefetch_issued;
+  }
+  update_pending_peak();
+  requests.clear();
+}
+
+void QueryPageSession::submit_prefetch_plan(
+    const std::vector<std::uint32_t>& page_ids) {
+  if (!async_prefetch_ || page_ids.empty()) {
+    return;
+  }
+
+  const std::size_t batch_limit = prefetch_batch_limit();
+  std::vector<AsyncPageReader::ReadRequest> requests;
+  requests.reserve(std::min(batch_limit, page_ids.size()));
+  std::unordered_set<std::uint32_t> queued_pages;
+  queued_pages.reserve(page_ids.size());
+
+  for (const auto page_id : page_ids) {
+    if (requests.size() >= batch_limit) {
+      flush_prefetch_requests(requests);
+    }
+    (void)queue_prefetch_request(page_id, requests, queued_pages);
+  }
+  flush_prefetch_requests(requests);
+  (void)harvest_prefetch(false);
 }
 
 void QueryPageSession::submit_prefetches() {

@@ -44,7 +44,8 @@ class QueryPageSession {
   void submit_candidate_prefetch(const std::vector<std::uint32_t>& page_ids);
   void submit_next_hop_prefetch(
       const std::vector<std::uint32_t>& node_ids,
-      const std::unordered_set<std::uint32_t>& visited_nodes);
+      const std::unordered_set<std::uint32_t>& excluded_nodes,
+      const std::vector<std::uint32_t>& fallback_page_ids = {});
   void drain_ready_pages();
 
   bool pin_page(std::uint32_t page_id);
@@ -70,7 +71,14 @@ class QueryPageSession {
                                    bool keep_ready);
   bool harvest_prefetch(bool wait);
   void wait_for_prefetch_page(std::uint32_t page_id);
-  bool prefetch_page(std::uint32_t page_id);
+  std::size_t prefetch_batch_limit() const;
+  bool queue_prefetch_request(
+      std::uint32_t page_id,
+      std::vector<AsyncPageReader::ReadRequest>& requests,
+      std::unordered_set<std::uint32_t>& queued_pages);
+  void flush_prefetch_requests(
+      std::vector<AsyncPageReader::ReadRequest>& requests);
+  void submit_prefetch_plan(const std::vector<std::uint32_t>& page_ids);
   void submit_prefetches();
   const Page* take_ready_prefetch_page(std::uint32_t page_id);
   void mark_prefetch_used(std::uint32_t page_id);

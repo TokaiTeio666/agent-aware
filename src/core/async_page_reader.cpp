@@ -452,13 +452,25 @@ struct AsyncPageReader::Impl {
       return submitted;
     }
 
+    const std::size_t batch_limit =
+        std::max<std::size_t>(1, std::min(status.batch_size,
+                                          std::max<std::size_t>(
+                                              1, max_pending_reads())));
+    std::size_t queued_in_batch = 0;
     for (const auto& request : read_requests) {
       const std::uint64_t token =
           start_async_read(request.offset, request.bytes, stats);
       submitted.push_back(AsyncPageReader::SubmittedRead{request.page_id,
                                                          token});
+      ++queued_in_batch;
+      if (queued_in_batch >= batch_limit) {
+        submit_async_reads(stats);
+        queued_in_batch = 0;
+      }
     }
-    submit_async_reads(stats);
+    if (queued_in_batch > 0) {
+      submit_async_reads(stats);
+    }
     return submitted;
   }
 

@@ -1,7 +1,9 @@
 #include "agent_aware/core/prefetch_planner.h"
 
 #include <algorithm>
+#include <cstddef>
 #include <unordered_map>
+#include <unordered_set>
 #include <utility>
 
 namespace agent_aware {
@@ -24,7 +26,11 @@ std::size_t PrefetchPlanner::width() const {
 }
 
 std::size_t PrefetchPlanner::depth() const {
-  return std::max<std::size_t>(1, config_.prefetch_depth);
+  return config_.prefetch_depth;
+}
+
+std::size_t PrefetchPlanner::fallback_width() const {
+  return config_.fallback_width;
 }
 
 PrefetchPlanner::Plan PrefetchPlanner::plan_next_hop(
@@ -65,11 +71,74 @@ PrefetchPlanner::Plan PrefetchPlanner::plan_frontier(
 
 PrefetchPlanner::Plan PrefetchPlanner::plan_candidates(
     std::vector<std::uint32_t> page_ids,
-    const PageAvailabilityFn& availability) {
+    const PageAvailabilityFn& availability, std::size_t max_pages) {
   Plan plan;
-  if (width() == 0 || depth() == 0) {
+  const std::size_t limit = max_pages == 0 ? width() : max_pages;
+  if (limit == 0 || depth() == 0) {
     return plan;
   }
+
+  if (!config_.coalesce_pages) {
+    return plan_ordered_candidates(std::move(page_ids), availability, limit);
+  }
+  return plan_coalesced_candidates(std::move(page_ids), availability, limit);
+}
+
+PrefetchPlanner::Plan PrefetchPlanner::plan_ordered_candidates(
+    std::vector<std::uint32_t> page_ids,
+    const PageAvailabilityFn& availability, std::size_t max_pages) {
+  Plan plan;
+  plan.pages.reserve(std::min(max_pages, page_ids.size()));
+  std::unordered_set<std::uint32_t> emitted;
+  emitted.reserve(std::min(max_pages, page_ids.size()));
+
+  for (const auto page_id : page_ids) {
+    ++plan.stats.page_requests_before_dedup;
+    ++plan.stats.dedup_requests;
+
+    const PageAvailability state = availability(page_id);
+    if (state.cached) {
+      ++plan.stats.dedup_hits;
+      ++plan.stats.skip_cached;
+      continue;
+    }
+    if (state.pending) {
+      ++plan.stats.dedup_hits;
+      ++plan.stats.skip_pending;
+      continue;
+    }
+    if (state.ready || state.materialized) {
+      ++plan.stats.dedup_hits;
+      ++plan.stats.skip_materialized;
+      continue;
+    }
+    if (!emitted.insert(page_id).second) {
+      ++plan.stats.dedup_hits;
+      ++plan.stats.skip_seen_before;
+      continue;
+    }
+    if (config_.dedup_pages &&
+        seen_pages_.find(page_id) != seen_pages_.end()) {
+      ++plan.stats.dedup_hits;
+      ++plan.stats.skip_seen_before;
+      continue;
+    }
+    if (plan.pages.size() >= max_pages) {
+      ++plan.stats.skip_budget_full;
+      continue;
+    }
+    plan.pages.push_back(page_id);
+    if (config_.dedup_pages) {
+      seen_pages_.insert(page_id);
+    }
+  }
+  return plan;
+}
+
+PrefetchPlanner::Plan PrefetchPlanner::plan_coalesced_candidates(
+    std::vector<std::uint32_t> page_ids,
+    const PageAvailabilityFn& availability, std::size_t max_pages) {
+  Plan plan;
 
   struct PageCandidate {
     std::size_t count = 0;
@@ -128,12 +197,12 @@ PrefetchPlanner::Plan PrefetchPlanner::plan_candidates(
 
   const std::size_t min_reuse =
       std::max<std::size_t>(1, config_.min_candidates_per_page);
-  plan.pages.reserve(std::min(width(), ranked.size()));
+  plan.pages.reserve(std::min(max_pages, ranked.size()));
   for (const auto& entry : ranked) {
     if (entry.second.count < min_reuse) {
       continue;
     }
-    if (plan.pages.size() >= width()) {
+    if (plan.pages.size() >= max_pages) {
       ++plan.stats.skip_budget_full;
       continue;
     }

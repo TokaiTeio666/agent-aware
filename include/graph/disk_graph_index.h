@@ -76,6 +76,7 @@ struct DiskGraphSearchConfig {
   std::size_t rerank_topk = 0;
   std::size_t prefetch_width = 1;
   std::size_t prefetch_depth = 1;
+  std::size_t prefetch_fallback_width = 0;
   std::size_t prefetch_min_candidates_per_page = 2;
   bool adaptive_prefetch = true;
   bool enable_progressive_frontier_prefetch = false;
@@ -325,6 +326,8 @@ class PackedDiskGraphIndex {
   std::unique_ptr<SearchState> initialize_search_state(
       const float* query, const DiskGraphSearchConfig& config,
       DiskGraphSearchResult& output);
+  std::vector<std::uint32_t> collect_frontier_pages(
+      const SearchState& state, std::size_t scan_width) const;
   void maybe_issue_prefetch(SearchState& state) const;
   bool update_frontier(SearchState& state) const;
   void expand_candidate(SearchState& state, const SearchResult& current);

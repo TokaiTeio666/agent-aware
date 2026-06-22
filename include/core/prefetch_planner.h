@@ -56,6 +56,7 @@ class PrefetchPlanner {
   bool next_hop_enabled() const;
   std::size_t width() const;
   std::size_t depth() const;
+  std::size_t fallback_width() const;
 
   Plan plan_next_hop(const std::vector<std::uint32_t>& node_ids,
                      std::size_t vector_count,
@@ -64,12 +65,19 @@ class PrefetchPlanner {
                      const PageAvailabilityFn& availability);
 
   Plan plan_candidates(std::vector<std::uint32_t> page_ids,
-                       const PageAvailabilityFn& availability);
+                       const PageAvailabilityFn& availability,
+                       std::size_t max_pages = 0);
 
   Plan plan_frontier(std::vector<std::uint32_t> page_ids,
                      const PageAvailabilityFn& availability);
 
  private:
+  Plan plan_ordered_candidates(std::vector<std::uint32_t> page_ids,
+                               const PageAvailabilityFn& availability,
+                               std::size_t max_pages);
+  Plan plan_coalesced_candidates(std::vector<std::uint32_t> page_ids,
+                                 const PageAvailabilityFn& availability,
+                                 std::size_t max_pages);
   bool accept_page(std::uint32_t page_id,
                    const PageAvailabilityFn& availability,
                    PlanStats& stats);
