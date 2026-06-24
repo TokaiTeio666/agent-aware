@@ -2,7 +2,7 @@
 
 agent-aware 是一个面向大模型 Agent 长期记忆场景的向量检索 I/O 优化原型。项目目标是在全精度向量常驻 SSD、内存预算约束为数据集大小 10%-20% 的条件下，提供可复现的 Top-K 近似最近邻检索、缓存/预取/I/O 统计，以及动态写入路径验证。
 
-当前主线实现围绕 `agent_aware_flow` benchmark 展开：SIFT 或合成数据加载后，系统训练 PQ ADC 模型、构建或复用 Vamana packed graph index，再通过 Graph-Aware 2Q BufferPool、O_DIRECT/io_uring/pread 读路径和拓扑预取完成查询，并输出 JSON 结果。动态写入由 `bench_mixed_rw` 和 `StorageEngine`/`DynamicWriteManager` 验证，覆盖 WAL、MemTable、SSTable、flush、compaction 和 base/delta Top-K merge。
+当前主线实现围绕 `agent_aware_flow` benchmark 展开：SIFT 或合成数据加载后，系统训练 PQ ADC 模型、构建或复用 Vamana packed graph index，再通过 Graph-Aware 2Q BufferPool、O_DIRECT/io_uring/pread 读路径和 XGBoost page-level 预取完成查询，并输出 JSON 结果。动态写入由 `bench_mixed_rw` 和 `StorageEngine`/`DynamicWriteManager` 验证，覆盖 WAL、MemTable、SSTable、flush、compaction 和 base/delta Top-K merge。
 
 核心结果：
 
@@ -16,7 +16,7 @@ agent-aware 是一个面向大模型 Agent 长期记忆场景的向量检索 I/O
 | effective search width / beam width |                              `350` / `16` |
 | entry strategy / seed count         |                     `single-medoid` / `1` |
 | I/O effective mode                  |                                `io_uring` |
-| prefetch                            | enabled, `next-hop`, width=`4`, depth=`1` |
+| prefetch                            | current route: `xgboost`, width=`4`, depth=`1` |
 | cache policy / pages                |                `graph-aware-2q` / `15186` |
 | cache hit rate                      |                                  `0.5024` |
 | page reads per query                |                                  `918.99` |
@@ -68,7 +68,7 @@ agent-aware 是一个面向大模型 Agent 长期记忆场景的向量检索 I/O
 │  ┌────────────────────────────────────────────────────────────────────────┐  │
 │  │ Query Runtime                                                          │  │
 │  │ EntrySelector -> beam search -> QueryPageSession -> PrefetchPlanner    │  │
-│  │ Async batch read + topology-aware next-hop prefetch                    │  │
+│  │ Async batch read + PQ+ADC page aggregation + XGBoost prefetch          │  │
 │  └────────────────────────────────────────────────────────────────────────┘  │
 │                                                                              │
 └──────────────────────────────────────────────────────────────────────────────┘
@@ -257,7 +257,8 @@ SIFT1M 推荐入口：
   --io-depth 32 \
   --cache-policy graph-aware-2q \
   --memory-budget-ratio 0.20 \
-  --prefetch-policy next-hop \
+  --prefetch-policy xgboost \
+  --prefetch-model build/prefetch_xgboost.txt \
   --prefetch-width 4 \
   --rebuild-index 1 \
   --index-path indexes/sift1m_vamana_pq100_p4096_sm.idx \
@@ -431,7 +432,7 @@ done
 
 | 参数 | 默认值 | 可选范围 | 说明 |
 | --- | --- | --- | --- |
-| `--enable-pq` | `1` | `0/1` | 是否训练 PQ 并在搜索中启用 ADC 候选评分 |
+| `--enable-pq` | `1` | `1` | 搜索主路径要求 PQ+ADC 候选生成；`0` 已不再支持 |
 | `--pq-subspaces` | `32` | `>=1`，有效值不超过向量维度 | PQ 子空间数；计划中常见调优范围为 `8-16`，当前 SIFT 默认用 `32` 提升近似精度 |
 | `--pq-centroids` | `256` | `2-256` | 每个子空间聚类中心数 |
 | `--pq-train-limit` | `100000` | `>=pq-centroids` | PQ 训练样本上限 |
@@ -444,11 +445,23 @@ done
 | --- | --- | --- | --- |
 | `--enable-prefetch` | `1` | `0/1` | 是否尝试启用异步预取 |
 | `--prefetch-depth` | `1` | `>=0` | `0` 等价关闭预取；正数会按 `prefetch_width * depth` 扩大查询级预取预算 |
-| `--prefetch-width` | `4` | `>=1` | 每次 frontier/next-hop 预取宽度 |
-| `--prefetch-fallback-width` | `0` | `>=0` | next-hop 无可提交页时，从 frontier 候选页补充的宽度 |
+| `--prefetch-width` | `1` | `>=1` | 每次 XGBoost 排序后最多提交的预取页宽度 |
+| `--prefetch-fallback-width` | `0` | `>=0` | 候选页不足时从聚合候选中补充的宽度 |
+| `--prefetch-min-candidates-per-page` | `2` | `>=1` | `page-coalesce=1` 时页复用门槛；低复用页不会被兜底提交 |
 | `--page-dedup` | `1` | `0/1` | 是否跨 query session 预取计划去重 |
 | `--page-coalesce` | `1` | `0/1` | 是否按候选页复用次数重排预取页；关闭时按候选顺序取页 |
-| `--prefetch-policy` | `next-hop` | `none`、`frontier`、`next-hop`、`frontier-next-hop` | 预取策略 |
+| `--prefetch-policy` | `xgboost` | `none`、`xgboost` | 预取路由/排序策略；`xgboost` 使用 PQ+ADC 候选页聚合、XGBoost 收益打分和限流提交 |
+| `--prefetch-model` | 空 | path | `xgboost` 策略必填；读取 XGBoost text-dump ranker 权重文件 |
+| `--prefetch-early-trigger` | `pre-beam` | `off`、`entry-warmup`、`pre-beam`、`rerank`、`all` | 提前触发开关；默认只在 beam 选择前用 frontier top window 触发，`entry-warmup` 只启用 P2/T0，`rerank` 只启用 P3/T3，`off` 保留 post-expand 对照，`all` 同时开启 |
+| `--prefetch-top-k` | `0` | `>=0` | ranking top-K 限流；`0` 使用 `--prefetch-width` |
+| `--prefetch-score-threshold` | `-inf` | float | 丢弃低于阈值的候选页 |
+| `--prefetch-max-inflight` | `0` | `>=0` | 预取 inflight/ready 上限；`0` 使用 query 预算 |
+| `--prefetch-trace` | 空 | path | 输出 group-wise page ranking CSV，用于离线训练/replay |
+| `--jit-frontier-prefetch` | `0` | `0/1` | legacy 兼容开关；等价强制启用 pre-beam 触发 |
+| `--jit-prefetch-interval-batches` | `1` | `>=1` | 每隔多少个 batch 触发一次 pre-beam frontier window |
+| `--jit-prefetch-max-pages-per-query` | `16` | `>=0` | 每个 query 最多提交多少个 pre-beam 预取页；`0` 表示不限制 |
+| `--next-hop-hints` | `0` | `0/1` | legacy hint table 开关，默认关闭 |
+| `--page-aware-beam` | `0` | `0/1` | beam 选择时在距离 slack 内偏向同页、cache/pending/ready 页 |
 | `--io-mode` | `io_uring` | `pread`、`odirect`、`io_uring` | 磁盘读模式；不满足条件时会 fallback 到 `pread` |
 | `--io-batch` | `16` | `>=1` | 每次 batch submit 的请求上限 |
 | `--io-depth` | `32` | `>=1`，计划推荐 `32-512` | io_uring queue depth |
@@ -457,6 +470,56 @@ done
 | `--memory-budget-ratio` | `0.20` | `(0,1]`，验收推荐 `0.10-0.20` | resident memory 预算占原始向量字节比例 |
 | `--protect-hot-pages` | `1` | `0/1` | 是否保护热页；graph-aware 策略会利用 hub 入度信息 |
 | `--hot-degree-threshold` | `0` | `>=0` | hub 热度阈值；`0` 表示由策略默认处理 |
+
+### 预取 trace / replay / A-B 闭环
+
+完整预取评估流程分四步：先用 PQ+ADC 路径在线跑出 page-level trace，再分析 trace 的 ready/pending/unused/lead-time，随后训练 XGBoost text-dump ranker 并离线 replay，最后跑 no-prefetch/xgboost 严格 A/B。
+
+```bash
+python3 scripts/analyze_prefetch_trace.py \
+  --trace logs/prefetch_trace.csv \
+  --json-out build/prefetch_trace_summary.json \
+  --md-out build/prefetch_trace_summary.md \
+  --group-by global
+```
+
+```bash
+python3 scripts/train_prefetch_ranker.py \
+  --trace logs/prefetch_trace.csv \
+  --model-out build/prefetch_xgboost.txt \
+  --metrics-out build/prefetch_xgboost_metrics.json \
+  --top-k 8 \
+  --max-inflight 8
+```
+
+```bash
+python3 scripts/replay_prefetch_policy.py \
+  --trace logs/prefetch_trace.csv \
+  --model build/prefetch_xgboost.txt \
+  --top-k 4 8 \
+  --out-json build/prefetch_replay.json \
+  --out-md build/prefetch_replay.md
+```
+
+```bash
+python3 scripts/run_prefetch_ab.py \
+  --binary ./build/agent_aware_flow \
+  --model build/prefetch_xgboost.txt \
+  --out-dir build/prefetch_ab \
+  --search-width 350 \
+  --beam-width 16 \
+  --entry-count 64 \
+  --prefetch-top-k 8 \
+  --prefetch-max-inflight 32 \
+  --query-limit 100 \
+  --base-limit 1000000
+```
+
+闭环 smoke 可直接覆盖 PQ+ADC trace -> train/replay -> xgboost 在线回灌：
+
+```bash
+scripts/run_prefetch_closed_loop_smoke.sh
+```
 
 ## `bench_mixed_rw` 参数说明
 
@@ -525,7 +588,8 @@ done
   --io-depth 32 \
   --cache-policy graph-aware-2q \
   --memory-budget-ratio 0.20 \
-  --prefetch-policy next-hop \
+  --prefetch-policy xgboost \
+  --prefetch-model build/prefetch_xgboost.txt \
   --prefetch-width 4 \
   --index-path indexes/sift1m_vamana_pq100_p4096_sm.idx \
   --output-json logs/sift_bench/sift1m_once_20260618-181128/result.json
@@ -610,7 +674,7 @@ CSV 字段含义：
 8. 每个 query 构造 `DiskGraphSearchConfig`，执行 graph beam search。
 9. 搜索时优先命中 BufferPool；miss 时通过 `pread`、`odirect` 或 `io_uring` 读取 4KB page。
 10. 命中 page 后直接从 page buffer 计算 L2 距离，并用 PQ/rerank 更新候选队列。
-11. 如果有效 I/O mode 为 `io_uring` 且预取策略非 `none`，按 frontier 或 next-hop 提交异步预取。
+11. 如果有效 I/O mode 为 `io_uring` 且预取策略为 `xgboost`，按 PQ+ADC 候选页聚合、XGBoost 打分和限流结果提交异步预取。
 12. 聚合所有 query 的 Recall、QPS、延迟、缓存、I/O、预取、内存预算统计，写入 JSON。
 
 ### 动态写入流程
@@ -736,5 +800,5 @@ manager.close();
 | 降低 I/O | 启用 PQ、提高缓存页、使用 `graph-aware-2q`、调整 packing | `node_reads/query`、`cache_hit_rate`、`distance_direct_calls` |
 | 控制内存 | 降低 `--cache-pages` 或 `--memory-budget-ratio`，降低 `pq_subspaces`/`graph_degree` | `estimated_resident_ratio`、`warnings` |
 | 观察 io_uring 收益 | 对比 `--io-mode pread` 与 `--io-mode io_uring` | `qps`、`latency_p95_ms`、`io_submit_syscalls` |
-| 评估预取 | 对比 `--prefetch-policy none`、`next-hop`、`frontier-next-hop` | `prefetch_useful_pages`、`prefetch_wasted_pages` |
+| 评估预取 | 对比 `--prefetch-policy none` 与 `--prefetch-policy xgboost --prefetch-model <path>` | `prefetch_ready_hit`、`prefetch_pending_hit`、`prefetch_unused` |
 | 验证动态写入 | 调整 `--read_ratio`、`--write_ratio`、`--memtable_flush_bytes` | `write_qps`、`flush_duration_ms`、`recovery_time_ms` |

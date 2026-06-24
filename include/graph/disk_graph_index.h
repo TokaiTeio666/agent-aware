@@ -3,6 +3,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <fstream>
+#include <limits>
 #include <memory>
 #include <mutex>
 #include <string>
@@ -80,10 +81,33 @@ struct DiskGraphSearchConfig {
   std::size_t prefetch_min_candidates_per_page = 2;
   bool adaptive_prefetch = true;
   bool enable_progressive_frontier_prefetch = false;
-  std::string prefetch_policy = "frontier-next-hop";
+  bool enable_jit_frontier_prefetch = false;
+  std::size_t jit_window_multiplier = 2;
+  std::size_t jit_prefetch_interval_batches = 2;
+  std::size_t jit_prefetch_max_pages_per_query = 16;
+  std::string prefetch_early_trigger = "pre-beam";
+  std::string prefetch_policy = "none";
+  std::string prefetch_ranker = "none";
+  std::string prefetch_model_path;
+  std::string prefetch_trace_path;
+  std::uint64_t query_id = 0;
+  std::size_t prefetch_top_k = 0;
+  double prefetch_score_threshold =
+      -std::numeric_limits<double>::infinity();
+  std::size_t prefetch_max_inflight = 0;
   bool page_dedup = true;
   bool same_page_reuse = true;
   bool page_coalesce = true;
+  bool page_aware_beam = false;
+  std::size_t beam_window_multiplier = 2;
+  std::size_t max_new_pages_per_batch = 0;
+  double page_aware_distance_slack_ratio = 0.01;
+  double page_aware_reuse_bonus = 0.25;
+  double page_aware_availability_bonus = 0.5;
+  bool next_hop_hints = false;
+  std::size_t next_hop_hint_min_reuse = 2;
+  std::size_t next_hop_hint_ttl_expansions = 32;
+  double next_hop_promote_slack_ratio = 0.02;
 };
 
 struct DiskGraphSearchStats {
@@ -97,6 +121,10 @@ struct DiskGraphSearchStats {
   std::uint64_t pending_hits = 0;
   std::uint64_t demand_reads = 0;
   std::uint64_t prefetch_reads = 0;
+  std::size_t unique_pages_touched = 0;
+  std::size_t unique_demand_pages = 0;
+  std::size_t unique_prefetch_pages = 0;
+  std::size_t prefetch_only_pages = 0;
   std::uint64_t duplicate_skipped = 0;
   std::uint64_t submitted_reads = 0;
   std::uint64_t completed_reads = 0;
@@ -138,6 +166,9 @@ struct DiskGraphSearchStats {
   std::size_t prefetch_skip_materialized = 0;
   std::size_t prefetch_skip_budget_full = 0;
   std::size_t prefetch_skip_low_page_reuse = 0;
+  std::size_t prefetch_skip_score_threshold = 0;
+  std::size_t prefetch_skip_inflight_full = 0;
+  std::size_t prefetch_evicted_before_use = 0;
   std::size_t demand_read_waits = 0;
   double demand_read_wait_us = 0.0;
   std::size_t page_dedup_requests = 0;
@@ -146,6 +177,17 @@ struct DiskGraphSearchStats {
   std::size_t batch_count = 0;
   std::size_t batch_expanded = 0;
   std::size_t max_batch_size = 0;
+  std::size_t beam_unique_pages = 0;
+  std::size_t beam_cached_or_pending_pages = 0;
+  std::size_t jit_prefetch_windows = 0;
+  std::size_t jit_prefetch_skipped_by_interval = 0;
+  std::size_t jit_prefetch_budget_exhausted = 0;
+  std::size_t jit_prefetch_candidates_capped = 0;
+  std::size_t page_aware_distance_fallbacks = 0;
+  std::size_t page_aware_candidate_skips = 0;
+  std::size_t page_aware_distance_slack_rejects = 0;
+  std::size_t next_hop_hints_recorded = 0;
+  std::size_t next_hop_hints_promoted = 0;
   std::size_t same_page_node_reuse = 0;
   double adc_table_build_us = 0.0;
   std::size_t rerank_reads = 0;
@@ -328,8 +370,22 @@ class PackedDiskGraphIndex {
       DiskGraphSearchResult& output);
   std::vector<std::uint32_t> collect_frontier_pages(
       const SearchState& state, std::size_t scan_width) const;
+  std::vector<std::uint32_t> collect_jit_frontier_pages(
+      SearchState& state, std::size_t effective_beam_width) const;
+  std::vector<std::uint32_t> collect_entry_warmup_pages(
+      const SearchState& state) const;
+  std::vector<std::uint32_t> collect_post_expand_lookahead_pages(
+      const SearchState& state, std::size_t effective_beam_width) const;
+  std::vector<std::uint32_t> collect_rerank_lookahead_pages(
+      const SearchState& state) const;
   void maybe_issue_prefetch(SearchState& state) const;
+  std::size_t maybe_issue_entry_warmup(SearchState& state) const;
+  std::size_t maybe_issue_jit_prefetch(
+      SearchState& state, std::size_t effective_beam_width) const;
+  std::size_t maybe_issue_rerank_prefetch(SearchState& state) const;
   bool update_frontier(SearchState& state) const;
+  std::vector<SearchResult> select_candidate_batch(
+      SearchState& state, std::size_t effective_beam_width) const;
   void expand_candidate(SearchState& state, const SearchResult& current);
   void expand_candidate_batch(SearchState& state,
                               const std::vector<SearchResult>& batch);

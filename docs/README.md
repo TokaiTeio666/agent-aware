@@ -29,8 +29,10 @@
 | --- | --- | --- | --- |
 | 10 | `docs/design/ssd-storage-path.md` | 已落地 | 4KB record、DiskIndexReader/Writer、packed graph 文件和基础测试 |
 | 11 | `docs/design/cache-zero-copy.md` | 已接入主路径 | Graph-Aware 2Q、同页复用、direct distance、缓存统计 |
-| 12 | `docs/design/async-prefetch.md` | 已接入主路径 | `AsyncPageReader`、`QueryPageSession`、io_uring fallback、frontier/next-hop prefetch |
+| 12 | `docs/design/async-prefetch.md` | 已接入主路径 | `AsyncPageReader`、`QueryPageSession`、io_uring fallback、PQ+ADC/XGBoost 预取提交底座 |
 | 13 | `docs/design/beam-width-io-uring.md` | 已进入 benchmark | beam batch、批量读取、I/O 统计字段和 fallback 语义 |
+| 14 | `docs/design/XGBOOST_PREFETCH_PLAN.md` | 已落地闭环 | PQ+ADC 候选生成、page-level 聚合、XGBoost 预取收益打分、top-K/threshold/io_depth 限流、ready/pending/unused 评估、offline replay 和 no-prefetch/xgboost online A/B |
+| 15 | `docs/design/07-prefetch-early-trigger-plan.md` | 待实施方案 | pre-beam / post-expand / entry warmup / rerank lookahead 提前触发点、trace 字段、限流和验收标准 |
 | 20 | `docs/design/dynamic-write.md` | 已落地最小闭环 | WAL/MemTable/SSTable/manifest/compaction/recovery 与 mixed RW benchmark |
 | 21 | `docs/roadmap/dynamic-write-task-breakdown.md` | T1-T5 已有实现 | 动态写入拆分任务和验收清单，异步 flush queue 仍可推进 |
 | 22 | `docs/experiments/high-concurrency-mixed-rw.md` | 已完成可展示版 | 高并发 mixed RW、动态 Recall、base/delta merge、一致性策略 |

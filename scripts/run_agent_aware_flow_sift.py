@@ -373,6 +373,8 @@ def build_command(binary, output_json, spec, rebuild_index_passed, extra_args, a
         command.extend(["--prefetch-depth", str(spec.prefetch_depth)])
         if args.prefetch_policy:
             command.extend(["--prefetch-policy", args.prefetch_policy])
+        if args.prefetch_model:
+            command.extend(["--prefetch-model", args.prefetch_model])
         if args.prefetch_width:
             command.extend(["--prefetch-width", str(args.prefetch_width)])
 
@@ -508,7 +510,8 @@ def main():
         default=int(os.getenv("IO_MODE_PREFETCH_DEPTH", "0")),
         help="Prefetch depth for staged m4 io_mode sweep; default 0 isolates I/O mode.",
     )
-    parser.add_argument("--prefetch-policy", default=os.getenv("PREFETCH_POLICY", "frontier-next-hop"))
+    parser.add_argument("--prefetch-policy", default=os.getenv("PREFETCH_POLICY", "xgboost"))
+    parser.add_argument("--prefetch-model", default=os.getenv("PREFETCH_MODEL", ""))
     parser.add_argument("--prefetch-width", type=int, default=int(os.getenv("PREFETCH_WIDTH", "4")))
     parser.add_argument("--cache-policy", default=os.getenv("CACHE_POLICY", "graph-aware-2q"))
     parser.add_argument("--final-search-width", type=int, default=int(os.getenv("FINAL_SEARCH_WIDTH", "256")))
@@ -552,6 +555,12 @@ def main():
             "contains an explicit cache-pages override"
         )
     specs = build_specs(args)
+    if args.prefetch_policy not in {"none", "xgboost"}:
+        raise SystemExit("--prefetch-policy must be none or xgboost")
+    prefetch_enabled = any(spec.prefetch_depth != 0 for spec in specs)
+    model_in_extra_args = has_explicit_option(extra_args, ["--prefetch-model", "--prefetch_model"])
+    if prefetch_enabled and args.prefetch_policy == "xgboost" and not args.prefetch_model and not model_in_extra_args:
+        raise SystemExit("--prefetch-model is required when --prefetch-policy xgboost is enabled")
     output_dir.mkdir(parents=True, exist_ok=True)
     write_plan_metadata(output_dir / "matrix_plan.json", args, specs, warnings)
 

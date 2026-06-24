@@ -9,6 +9,7 @@
 #include <filesystem>
 #include <fstream>
 #include <iostream>
+#include <limits>
 #include <optional>
 #include <sstream>
 #include <stdexcept>
@@ -81,10 +82,34 @@ struct Args {
   std::size_t prefetch_min_candidates_per_page = 2;
   bool adaptive_prefetch = true;
   std::size_t adaptive_prefetch_window = 32;
+  double adaptive_prefetch_target_useful_ratio = 0.30;
+  double adaptive_prefetch_max_waste_per_query = 1.0;
   bool enable_progressive_frontier_prefetch = false;
-  std::string prefetch_policy = "next-hop";
+  bool enable_jit_frontier_prefetch = false;
+  std::size_t jit_window_multiplier = 2;
+  std::size_t jit_prefetch_interval_batches = 1;
+  std::size_t jit_prefetch_max_pages_per_query = 16;
+  std::string prefetch_early_trigger = "pre-beam";
+  std::string prefetch_policy = "xgboost";
   bool page_dedup = true;
   bool page_coalesce = true;
+  bool page_aware_beam = false;
+  std::size_t beam_window_multiplier = 2;
+  std::size_t max_new_pages_per_batch = 0;
+  double page_aware_distance_slack_ratio = 0.01;
+  double page_aware_reuse_bonus = 0.25;
+  double page_aware_availability_bonus = 0.5;
+  bool next_hop_hints = false;
+  std::size_t next_hop_hint_min_reuse = 2;
+  std::size_t next_hop_hint_ttl_expansions = 32;
+  double next_hop_promote_slack_ratio = 0.02;
+  std::string prefetch_model_path;
+  fs::path prefetch_trace_path;
+  std::size_t prefetch_top_k = 0;
+  double prefetch_score_threshold =
+      -std::numeric_limits<double>::infinity();
+  std::size_t prefetch_max_inflight = 0;
+  bool prefetch_stats = false;
 
   std::string io_mode = "io_uring";
   std::size_t io_batch = 16;
@@ -192,7 +217,7 @@ void print_help() {
       << "  --beam_width N               Compatibility alias for --beam-width\n"
       << "  --num-search-threads N       Query workers, default 1\n"
       << "PQ/ADC:\n"
-      << "  --enable-pq 0|1              Use PQ ADC candidate scoring, default 1\n"
+      << "  --enable-pq 1                Required; non-PQ candidate generation was removed\n"
       << "  --pq-subspaces N             PQ subspaces, default 32\n"
       << "  --pq-centroids N             PQ centroids, 2-256, default 256\n"
       << "  --pq-train-limit N           PQ training vectors, default 100000\n"
@@ -200,16 +225,39 @@ void print_help() {
       << "  --rerank-topk N              Exact rerank pool after PQ, default 100\n"
       << "Prefetch/cache/I/O:\n"
       << "  --enable-prefetch 0|1        Disable/enable async prefetch\n"
-      << "  --prefetch-depth N           Next-hop prefetch depth; 0 disables prefetch, default 1\n"
-      << "  --prefetch-width N           Frontier/next-hop prefetch width, default 1\n"
-      << "  --prefetch-fallback-width N  Frontier pages to use when next-hop has no pages, default 0\n"
+      << "  --prefetch-depth N           XGBoost prefetch depth; 0 disables prefetch, default 1\n"
+      << "  --prefetch-width N           XGBoost ranked page submit width, default 1\n"
+      << "  --prefetch-fallback-width N  Ranked candidate fallback width, default 0\n"
       << "  --prefetch-min-candidates-per-page N Candidate page reuse threshold, default 2\n"
       << "  --page-dedup 0|1             Deduplicate prefetch pages across a query, default 1\n"
-      << "  --page-coalesce 0|1          Rank candidate pages by page reuse, default 1\n"
+      << "  --page-coalesce 0|1          Aggregate candidate nodes by page reuse, default 1\n"
       << "  --adaptive-prefetch 0|1      Adapt width by useful prefetch hit ratio, default 1\n"
       << "  --adaptive-prefetch-window N Query window for adaptive gate, default 32\n"
+      << "  --adaptive-prefetch-target-useful-ratio R Useful ratio target, default 0.30\n"
+      << "  --adaptive-prefetch-max-waste-per-query R Waste budget before reducing width, default 1.0\n"
       << "  --enable-progressive-frontier-prefetch 0|1 Experimental intra-beam frontier prefetch, default 0\n"
-      << "  --prefetch-policy NAME       none/frontier/next-hop/frontier-next-hop, default next-hop\n"
+      << "  --prefetch-early-trigger NAME off/entry-warmup/pre-beam/rerank/all, default pre-beam\n"
+      << "  --jit-frontier-prefetch 0|1  Compatibility alias for pre-beam trigger\n"
+      << "  --jit-window-multiplier N    Pre-beam frontier window = beam*N, default 2\n"
+      << "  --jit-prefetch-interval-batches N Issue pre-beam every N batches, default 1\n"
+      << "  --jit-prefetch-max-pages-per-query N Max pre-beam submissions per query, 0 disables cap, default 16\n"
+      << "  --page-aware-beam 0|1        Select beam with page reuse/availability bias, default 0\n"
+      << "  --beam-window-multiplier N   Candidate window = beam*N for page-aware beam, default 2\n"
+      << "  --max-new-pages-per-batch N  Page-aware per-batch new page cap, default ceil(beam/2)\n"
+      << "  --page-aware-distance-slack-ratio R Distance slack for page grouping, default 0.01\n"
+      << "  --page-aware-reuse-bonus R   Page reuse score bonus, default 0.25\n"
+      << "  --page-aware-availability-bonus R Cached/pending page score bonus, default 0.5\n"
+      << "  --next-hop-hints 0|1         Legacy hint table for JIT promotion, default 0\n"
+      << "  --next-hop-hint-min-reuse N  Hint reuse threshold for promotion, default 2\n"
+      << "  --next-hop-hint-ttl-expansions N Hint TTL in expansions, default 32\n"
+      << "  --next-hop-promote-slack-ratio R Hint promotion distance slack, default 0.02\n"
+      << "  --prefetch-policy NAME       none/xgboost, default xgboost\n"
+      << "  --prefetch-model PATH        Required XGBoost text-dump ranker for xgboost policy\n"
+      << "  --prefetch-top-k N           Ranking top-K cap, 0 uses --prefetch-width\n"
+      << "  --prefetch-score-threshold R Drop ranked pages below score threshold\n"
+      << "  --prefetch-max-inflight N    Max prefetch inflight/ready pages, 0 uses query budget\n"
+      << "  --prefetch-trace PATH        Write group-wise prefetch ranking CSV\n"
+      << "  --prefetch-stats 0|1         Keep detailed prefetch stats in JSON, default 0\n"
       << "  --cache-policy NAME          none/lru/2q/graph-aware-2q/agent, default graph-aware-2q\n"
       << "  --cache-pages N              Page cache capacity, default auto within memory budget\n"
       << "  --memory-budget-ratio R      Resident memory budget ratio, default 0.20\n"
@@ -362,14 +410,102 @@ Args parse_args(int argc, char** argv) {
                name == "--adaptive_prefetch_window") {
       args.adaptive_prefetch_window =
           parse_size_value(require_value(i, argc, argv, name), name, 1);
+    } else if (name == "--adaptive-prefetch-target-useful-ratio" ||
+               name == "--adaptive_prefetch_target_useful_ratio") {
+      args.adaptive_prefetch_target_useful_ratio =
+          std::stod(require_value(i, argc, argv, name));
+    } else if (name == "--adaptive-prefetch-max-waste-per-query" ||
+               name == "--adaptive_prefetch_max_waste_per_query") {
+      args.adaptive_prefetch_max_waste_per_query =
+          std::stod(require_value(i, argc, argv, name));
     } else if (name == "--enable-progressive-frontier-prefetch" ||
                name == "--enable_progressive_frontier_prefetch" ||
                name == "--progressive-frontier-prefetch" ||
                name == "--progressive_frontier_prefetch") {
       args.enable_progressive_frontier_prefetch =
           parse_bool_value(require_value(i, argc, argv, name), name);
+    } else if (name == "--jit-frontier-prefetch" ||
+               name == "--jit_frontier_prefetch") {
+      args.enable_jit_frontier_prefetch =
+          parse_bool_value(require_value(i, argc, argv, name), name);
+    } else if (name == "--jit-window-multiplier" ||
+               name == "--jit_window_multiplier") {
+      args.jit_window_multiplier =
+          parse_size_value(require_value(i, argc, argv, name), name, 1);
+    } else if (name == "--jit-prefetch-interval-batches" ||
+               name == "--jit_prefetch_interval_batches") {
+      args.jit_prefetch_interval_batches =
+          parse_size_value(require_value(i, argc, argv, name), name, 1);
+    } else if (name == "--jit-prefetch-max-pages-per-query" ||
+               name == "--jit_prefetch_max_pages_per_query") {
+      args.jit_prefetch_max_pages_per_query =
+          parse_size_value(require_value(i, argc, argv, name), name, 0);
+    } else if (name == "--prefetch-early-trigger" ||
+               name == "--prefetch_early_trigger") {
+      args.prefetch_early_trigger = require_value(i, argc, argv, name);
+    } else if (name == "--page-aware-beam" ||
+               name == "--page_aware_beam") {
+      args.page_aware_beam =
+          parse_bool_value(require_value(i, argc, argv, name), name);
+    } else if (name == "--beam-window-multiplier" ||
+               name == "--beam_window_multiplier") {
+      args.beam_window_multiplier =
+          parse_size_value(require_value(i, argc, argv, name), name, 1);
+    } else if (name == "--max-new-pages-per-batch" ||
+               name == "--max_new_pages_per_batch") {
+      args.max_new_pages_per_batch =
+          parse_size_value(require_value(i, argc, argv, name), name, 0);
+    } else if (name == "--page-aware-distance-slack-ratio" ||
+               name == "--page_aware_distance_slack_ratio") {
+      args.page_aware_distance_slack_ratio =
+          std::stod(require_value(i, argc, argv, name));
+    } else if (name == "--page-aware-reuse-bonus" ||
+               name == "--page_aware_reuse_bonus") {
+      args.page_aware_reuse_bonus =
+          std::stod(require_value(i, argc, argv, name));
+    } else if (name == "--page-aware-availability-bonus" ||
+               name == "--page_aware_availability_bonus") {
+      args.page_aware_availability_bonus =
+          std::stod(require_value(i, argc, argv, name));
+    } else if (name == "--next-hop-hints" ||
+               name == "--next_hop_hints") {
+      args.next_hop_hints =
+          parse_bool_value(require_value(i, argc, argv, name), name);
+    } else if (name == "--next-hop-hint-min-reuse" ||
+               name == "--next_hop_hint_min_reuse") {
+      args.next_hop_hint_min_reuse =
+          parse_size_value(require_value(i, argc, argv, name), name, 1);
+    } else if (name == "--next-hop-hint-ttl-expansions" ||
+               name == "--next_hop_hint_ttl_expansions") {
+      args.next_hop_hint_ttl_expansions =
+          parse_size_value(require_value(i, argc, argv, name), name, 0);
+    } else if (name == "--next-hop-promote-slack-ratio" ||
+               name == "--next_hop_promote_slack_ratio") {
+      args.next_hop_promote_slack_ratio =
+          std::stod(require_value(i, argc, argv, name));
     } else if (name == "--prefetch-policy" || name == "--prefetch_policy") {
       args.prefetch_policy = require_value(i, argc, argv, name);
+    } else if (name == "--prefetch-model" || name == "--prefetch_model") {
+      args.prefetch_model_path = require_value(i, argc, argv, name);
+    } else if (name == "--prefetch-top-k" ||
+               name == "--prefetch_top_k") {
+      args.prefetch_top_k =
+          parse_size_value(require_value(i, argc, argv, name), name, 0);
+    } else if (name == "--prefetch-score-threshold" ||
+               name == "--prefetch_score_threshold") {
+      args.prefetch_score_threshold =
+          std::stod(require_value(i, argc, argv, name));
+    } else if (name == "--prefetch-max-inflight" ||
+               name == "--prefetch_max_inflight") {
+      args.prefetch_max_inflight =
+          parse_size_value(require_value(i, argc, argv, name), name, 0);
+    } else if (name == "--prefetch-trace" ||
+               name == "--prefetch_trace") {
+      args.prefetch_trace_path = require_value(i, argc, argv, name);
+    } else if (name == "--prefetch-stats" ||
+               name == "--prefetch_stats") {
+      args.prefetch_stats =
+          parse_bool_value(require_value(i, argc, argv, name), name);
     } else if (name == "--io-mode" || name == "--io_mode") {
       args.io_mode = require_value(i, argc, argv, name);
     } else if (name == "--io-batch" || name == "--io_batch") {
@@ -429,11 +565,28 @@ void validate_and_finalize_args(Args& args) {
     args.effective_prefetch_depth.reset();
   }
 
-  if (args.prefetch_policy != "none" && args.prefetch_policy != "frontier" &&
-      args.prefetch_policy != "next-hop" &&
-      args.prefetch_policy != "frontier-next-hop") {
+  if (args.prefetch_policy != "none" && args.prefetch_policy != "xgboost") {
     throw std::runtime_error(
-        "Invalid --prefetch-policy: expected none, frontier, next-hop, or frontier-next-hop");
+        "Invalid --prefetch-policy: expected none or xgboost");
+  }
+  if (args.prefetch_early_trigger != "off" &&
+      args.prefetch_early_trigger != "entry-warmup" &&
+      args.prefetch_early_trigger != "pre-beam" &&
+      args.prefetch_early_trigger != "rerank" &&
+      args.prefetch_early_trigger != "all") {
+    throw std::runtime_error(
+        "Invalid --prefetch-early-trigger: expected off, entry-warmup, pre-beam, rerank, or all");
+  }
+
+  if (!args.enable_pq) {
+    throw std::runtime_error(
+        "--enable-pq=0 is no longer supported; search requires PQ+ADC candidate generation");
+  }
+
+  if (args.enable_prefetch && args.prefetch_policy == "xgboost" &&
+      args.prefetch_model_path.empty()) {
+    throw std::runtime_error(
+        "--prefetch-policy xgboost requires --prefetch-model");
   }
 
   if (args.enable_pq) {
@@ -461,6 +614,18 @@ void validate_and_finalize_args(Args& args) {
   if (args.memory_budget_ratio <= 0.0 || args.memory_budget_ratio > 1.0) {
     throw std::runtime_error(
         "Invalid --memory-budget-ratio: must be in (0, 1]");
+  }
+  if (args.adaptive_prefetch_target_useful_ratio < 0.0 ||
+      args.adaptive_prefetch_target_useful_ratio > 1.0) {
+    throw std::runtime_error(
+        "Invalid --adaptive-prefetch-target-useful-ratio: must be in [0, 1]");
+  }
+  if (args.adaptive_prefetch_max_waste_per_query < 0.0 ||
+      args.page_aware_distance_slack_ratio < 0.0 ||
+      args.page_aware_reuse_bonus < 0.0 ||
+      args.page_aware_availability_bonus < 0.0 ||
+      args.next_hop_promote_slack_ratio < 0.0) {
+    throw std::runtime_error("Adaptive/page-aware ratios must be non-negative");
   }
 }
 
@@ -610,6 +775,10 @@ void add_stats(SearchAggregate& aggregate,
   aggregate.stats.pending_hits += stats.pending_hits;
   aggregate.stats.demand_reads += stats.demand_reads;
   aggregate.stats.prefetch_reads += stats.prefetch_reads;
+  aggregate.stats.unique_pages_touched += stats.unique_pages_touched;
+  aggregate.stats.unique_demand_pages += stats.unique_demand_pages;
+  aggregate.stats.unique_prefetch_pages += stats.unique_prefetch_pages;
+  aggregate.stats.prefetch_only_pages += stats.prefetch_only_pages;
   aggregate.stats.duplicate_skipped += stats.duplicate_skipped;
   aggregate.stats.submitted_reads += stats.submitted_reads;
   aggregate.stats.completed_reads += stats.completed_reads;
@@ -655,6 +824,12 @@ void add_stats(SearchAggregate& aggregate,
       stats.prefetch_skip_budget_full;
   aggregate.stats.prefetch_skip_low_page_reuse +=
       stats.prefetch_skip_low_page_reuse;
+  aggregate.stats.prefetch_skip_score_threshold +=
+      stats.prefetch_skip_score_threshold;
+  aggregate.stats.prefetch_skip_inflight_full +=
+      stats.prefetch_skip_inflight_full;
+  aggregate.stats.prefetch_evicted_before_use +=
+      stats.prefetch_evicted_before_use;
   aggregate.stats.page_dedup_requests += stats.page_dedup_requests;
   aggregate.stats.page_dedup_hits += stats.page_dedup_hits;
   aggregate.stats.duplicate_pages_eliminated +=
@@ -663,6 +838,26 @@ void add_stats(SearchAggregate& aggregate,
   aggregate.stats.batch_expanded += stats.batch_expanded;
   aggregate.stats.max_batch_size =
       std::max(aggregate.stats.max_batch_size, stats.max_batch_size);
+  aggregate.stats.beam_unique_pages += stats.beam_unique_pages;
+  aggregate.stats.beam_cached_or_pending_pages +=
+      stats.beam_cached_or_pending_pages;
+  aggregate.stats.jit_prefetch_windows += stats.jit_prefetch_windows;
+  aggregate.stats.jit_prefetch_skipped_by_interval +=
+      stats.jit_prefetch_skipped_by_interval;
+  aggregate.stats.jit_prefetch_budget_exhausted +=
+      stats.jit_prefetch_budget_exhausted;
+  aggregate.stats.jit_prefetch_candidates_capped +=
+      stats.jit_prefetch_candidates_capped;
+  aggregate.stats.page_aware_distance_fallbacks +=
+      stats.page_aware_distance_fallbacks;
+  aggregate.stats.page_aware_candidate_skips +=
+      stats.page_aware_candidate_skips;
+  aggregate.stats.page_aware_distance_slack_rejects +=
+      stats.page_aware_distance_slack_rejects;
+  aggregate.stats.next_hop_hints_recorded +=
+      stats.next_hop_hints_recorded;
+  aggregate.stats.next_hop_hints_promoted +=
+      stats.next_hop_hints_promoted;
   aggregate.stats.same_page_node_reuse += stats.same_page_node_reuse;
   aggregate.stats.distance_direct_calls += stats.distance_direct_calls;
   aggregate.stats.adc_table_build_us += stats.adc_table_build_us;
@@ -825,7 +1020,20 @@ agent_aware::DiskGraphSearchConfig make_search_config(
                       pq_model->enabled();
   search.pq_model = search.adc_enable ? pq_model : nullptr;
   search.rerank_topk = search.adc_enable ? args.rerank_topk : 0;
-  search.prefetch_policy = args.enable_prefetch ? args.prefetch_policy : "none";
+  if (!args.enable_prefetch) {
+    search.prefetch_policy = "none";
+    search.prefetch_ranker = "none";
+  } else if (args.prefetch_policy == "xgboost") {
+    search.prefetch_policy = "xgboost";
+    search.prefetch_ranker = "xgboost";
+  } else {
+    search.prefetch_policy = "none";
+    search.prefetch_ranker = "none";
+  }
+  search.prefetch_model_path = args.prefetch_model_path;
+  search.prefetch_top_k = args.prefetch_top_k;
+  search.prefetch_score_threshold = args.prefetch_score_threshold;
+  search.prefetch_max_inflight = args.prefetch_max_inflight;
   search.prefetch_depth = args.effective_prefetch_depth.value_or(1);
   search.prefetch_width = prefetch_width_override;
   search.prefetch_fallback_width = args.prefetch_fallback_width;
@@ -834,8 +1042,28 @@ agent_aware::DiskGraphSearchConfig make_search_config(
   search.adaptive_prefetch = args.adaptive_prefetch;
   search.enable_progressive_frontier_prefetch =
       args.enable_progressive_frontier_prefetch;
+  search.enable_jit_frontier_prefetch = args.enable_jit_frontier_prefetch;
+  search.jit_window_multiplier = args.jit_window_multiplier;
+  search.jit_prefetch_interval_batches =
+      args.jit_prefetch_interval_batches;
+  search.jit_prefetch_max_pages_per_query =
+      args.jit_prefetch_max_pages_per_query;
+  search.prefetch_early_trigger = args.prefetch_early_trigger;
   search.page_dedup = args.page_dedup;
   search.page_coalesce = args.page_coalesce;
+  search.page_aware_beam = args.page_aware_beam;
+  search.beam_window_multiplier = args.beam_window_multiplier;
+  search.max_new_pages_per_batch = args.max_new_pages_per_batch;
+  search.page_aware_distance_slack_ratio =
+      args.page_aware_distance_slack_ratio;
+  search.page_aware_reuse_bonus = args.page_aware_reuse_bonus;
+  search.page_aware_availability_bonus = args.page_aware_availability_bonus;
+  search.next_hop_hints = args.next_hop_hints;
+  search.next_hop_hint_min_reuse = args.next_hop_hint_min_reuse;
+  search.next_hop_hint_ttl_expansions =
+      args.next_hop_hint_ttl_expansions;
+  search.next_hop_promote_slack_ratio =
+      args.next_hop_promote_slack_ratio;
   return search;
 }
 
@@ -850,13 +1078,16 @@ SearchAggregate run_search_worker(const Args& args,
   SearchAggregate aggregate;
   std::size_t adaptive_prefetch_width = args.prefetch_width;
   agent_aware::DiskGraphSearchStats window_stats;
+  std::size_t window_queries = 0;
   for (std::size_t i = first_query; i < dataset.queries.size();
        i += query_stride) {
-    const auto search =
+    auto search =
         make_search_config(args, pq_model, entry_seed_ids,
                            args.adaptive_prefetch
                                ? adaptive_prefetch_width
                                : args.prefetch_width);
+    search.query_id = static_cast<std::uint64_t>(i);
+    search.prefetch_trace_path = args.prefetch_trace_path.string();
     const auto query_start = Clock::now();
     const auto result = index.search_one(dataset.queries.row(i), search);
     const auto query_end = Clock::now();
@@ -864,27 +1095,44 @@ SearchAggregate run_search_worker(const Args& args,
         std::chrono::duration<double, std::milli>(query_end - query_start)
             .count());
     ++aggregate.queries;
+    ++window_queries;
     add_stats(aggregate, result.stats);
+    window_stats.submitted_reads += result.stats.submitted_reads;
+    window_stats.demand_reads += result.stats.demand_reads;
     window_stats.prefetch_submitted += result.stats.prefetch_submitted;
     window_stats.prefetch_ready_hit += result.stats.prefetch_ready_hit;
     window_stats.prefetch_pending_hit += result.stats.prefetch_pending_hit;
     window_stats.prefetch_useful_pages += result.stats.prefetch_useful_pages;
+    window_stats.prefetch_only_pages += result.stats.prefetch_only_pages;
     if (args.adaptive_prefetch &&
         aggregate.queries % args.adaptive_prefetch_window == 0) {
       if (window_stats.prefetch_submitted == 0) {
         adaptive_prefetch_width = args.prefetch_width;
         window_stats = agent_aware::DiskGraphSearchStats{};
+        window_queries = 0;
         continue;
       }
       const double useful_hit_ratio =
           static_cast<double>(window_stats.prefetch_useful_pages) /
           static_cast<double>(window_stats.prefetch_submitted);
-      if (useful_hit_ratio < 0.30) {
+      const std::size_t wasted_prefetches =
+          window_stats.prefetch_submitted >
+                  window_stats.prefetch_useful_pages
+              ? window_stats.prefetch_submitted -
+                    window_stats.prefetch_useful_pages
+              : 0;
+      const double waste_per_query =
+          static_cast<double>(wasted_prefetches) /
+          static_cast<double>(std::max<std::size_t>(1, window_queries));
+      if (useful_hit_ratio <
+              args.adaptive_prefetch_target_useful_ratio ||
+          waste_per_query > args.adaptive_prefetch_max_waste_per_query) {
         adaptive_prefetch_width = 0;
       } else {
         adaptive_prefetch_width = args.prefetch_width;
       }
       window_stats = agent_aware::DiskGraphSearchStats{};
+      window_queries = 0;
     }
     if (dataset.truth_from_file && i < dataset.truth.size()) {
       aggregate.recall_sum += recall_at_k(result.topk, dataset.truth[i],
@@ -1061,9 +1309,29 @@ std::string json_for_run(const Args& args,
   json << ",\n";
   json << "  \"prefetch_enabled\": " << runtime_prefetch_enabled << ",\n";
   json << "  \"prefetch_policy\": \"" << json_escape(args.enable_prefetch
-                                                        ? args.prefetch_policy
-                                                        : "none")
+                                                         ? args.prefetch_policy
+                                                         : "none")
        << "\",\n";
+  json << "  \"prefetch_ranker\": \""
+       << json_escape(args.enable_prefetch && args.prefetch_policy == "xgboost"
+                          ? "xgboost"
+                          : "none")
+       << "\",\n";
+  json << "  \"prefetch_model\": \""
+       << json_escape(args.prefetch_model_path) << "\",\n";
+  json << "  \"prefetch_top_k\": " << args.prefetch_top_k << ",\n";
+  json << "  \"prefetch_score_threshold\": ";
+  if (std::isfinite(args.prefetch_score_threshold)) {
+    json << args.prefetch_score_threshold;
+  } else {
+    json << "null";
+  }
+  json << ",\n";
+  json << "  \"prefetch_max_inflight\": "
+       << args.prefetch_max_inflight << ",\n";
+  json << "  \"prefetch_trace\": \""
+       << json_escape(args.prefetch_trace_path.string()) << "\",\n";
+  json << "  \"prefetch_stats\": " << args.prefetch_stats << ",\n";
   json << "  \"prefetch_width\": " << args.prefetch_width << ",\n";
   json << "  \"prefetch_fallback_width\": "
        << args.prefetch_fallback_width << ",\n";
@@ -1074,8 +1342,40 @@ std::string json_for_run(const Args& args,
   json << "  \"adaptive_prefetch\": " << args.adaptive_prefetch << ",\n";
   json << "  \"adaptive_prefetch_window\": "
        << args.adaptive_prefetch_window << ",\n";
+  json << "  \"adaptive_prefetch_target_useful_ratio\": "
+       << args.adaptive_prefetch_target_useful_ratio << ",\n";
+  json << "  \"adaptive_prefetch_max_waste_per_query\": "
+       << args.adaptive_prefetch_max_waste_per_query << ",\n";
   json << "  \"enable_progressive_frontier_prefetch\": "
        << args.enable_progressive_frontier_prefetch << ",\n";
+  json << "  \"prefetch_early_trigger\": \""
+       << json_escape(args.prefetch_early_trigger) << "\",\n";
+  json << "  \"enable_jit_frontier_prefetch\": "
+       << args.enable_jit_frontier_prefetch << ",\n";
+  json << "  \"jit_window_multiplier\": "
+       << args.jit_window_multiplier << ",\n";
+  json << "  \"jit_prefetch_interval_batches\": "
+       << args.jit_prefetch_interval_batches << ",\n";
+  json << "  \"jit_prefetch_max_pages_per_query\": "
+       << args.jit_prefetch_max_pages_per_query << ",\n";
+  json << "  \"page_aware_beam\": " << args.page_aware_beam << ",\n";
+  json << "  \"beam_window_multiplier\": "
+       << args.beam_window_multiplier << ",\n";
+  json << "  \"max_new_pages_per_batch\": "
+       << args.max_new_pages_per_batch << ",\n";
+  json << "  \"page_aware_distance_slack_ratio\": "
+       << args.page_aware_distance_slack_ratio << ",\n";
+  json << "  \"page_aware_reuse_bonus\": "
+       << args.page_aware_reuse_bonus << ",\n";
+  json << "  \"page_aware_availability_bonus\": "
+       << args.page_aware_availability_bonus << ",\n";
+  json << "  \"next_hop_hints\": " << args.next_hop_hints << ",\n";
+  json << "  \"next_hop_hint_min_reuse\": "
+       << args.next_hop_hint_min_reuse << ",\n";
+  json << "  \"next_hop_hint_ttl_expansions\": "
+       << args.next_hop_hint_ttl_expansions << ",\n";
+  json << "  \"next_hop_promote_slack_ratio\": "
+       << args.next_hop_promote_slack_ratio << ",\n";
   json << "  \"io_mode\": \"" << io_mode_summary << "\",\n";
   json << "  \"io_requested_mode\": \"" << json_escape(io_status.requested_mode)
        << "\",\n";
@@ -1213,6 +1513,14 @@ std::string json_for_run(const Args& args,
   json << "    \"demand_reads\": " << aggregate.stats.demand_reads << ",\n";
   json << "    \"prefetch_reads\": " << aggregate.stats.prefetch_reads
        << ",\n";
+  json << "    \"unique_pages_touched\": "
+       << aggregate.stats.unique_pages_touched << ",\n";
+  json << "    \"unique_demand_pages\": "
+       << aggregate.stats.unique_demand_pages << ",\n";
+  json << "    \"unique_prefetch_pages\": "
+       << aggregate.stats.unique_prefetch_pages << ",\n";
+  json << "    \"prefetch_only_pages\": "
+       << aggregate.stats.prefetch_only_pages << ",\n";
   json << "    \"duplicate_skipped\": "
        << aggregate.stats.duplicate_skipped << ",\n";
   json << "    \"submitted_reads\": " << aggregate.stats.submitted_reads
@@ -1251,6 +1559,28 @@ std::string json_for_run(const Args& args,
   json << "    \"avg_batch_size\": " << avg_batch_size << ",\n";
   json << "    \"max_batch_size\": " << aggregate.stats.max_batch_size
        << ",\n";
+  json << "    \"beam_unique_pages\": "
+       << aggregate.stats.beam_unique_pages << ",\n";
+  json << "    \"beam_cached_or_pending_pages\": "
+       << aggregate.stats.beam_cached_or_pending_pages << ",\n";
+  json << "    \"jit_prefetch_windows\": "
+       << aggregate.stats.jit_prefetch_windows << ",\n";
+  json << "    \"jit_prefetch_skipped_by_interval\": "
+       << aggregate.stats.jit_prefetch_skipped_by_interval << ",\n";
+  json << "    \"jit_prefetch_budget_exhausted\": "
+       << aggregate.stats.jit_prefetch_budget_exhausted << ",\n";
+  json << "    \"jit_prefetch_candidates_capped\": "
+       << aggregate.stats.jit_prefetch_candidates_capped << ",\n";
+  json << "    \"page_aware_distance_fallbacks\": "
+       << aggregate.stats.page_aware_distance_fallbacks << ",\n";
+  json << "    \"page_aware_candidate_skips\": "
+       << aggregate.stats.page_aware_candidate_skips << ",\n";
+  json << "    \"page_aware_distance_slack_rejects\": "
+       << aggregate.stats.page_aware_distance_slack_rejects << ",\n";
+  json << "    \"next_hop_hints_recorded\": "
+       << aggregate.stats.next_hop_hints_recorded << ",\n";
+  json << "    \"next_hop_hints_promoted\": "
+       << aggregate.stats.next_hop_hints_promoted << ",\n";
   json << "    \"page_dedup_requests\": "
        << aggregate.stats.page_dedup_requests << ",\n";
   json << "    \"page_dedup_hits\": " << aggregate.stats.page_dedup_hits
@@ -1294,6 +1624,14 @@ std::string json_for_run(const Args& args,
        << aggregate.stats.prefetch_skip_budget_full << ",\n";
   json << "    \"prefetch_skip_low_page_reuse\": "
        << aggregate.stats.prefetch_skip_low_page_reuse << ",\n";
+  json << "    \"prefetch_skip_score_threshold\": "
+       << aggregate.stats.prefetch_skip_score_threshold << ",\n";
+  json << "    \"prefetch_skip_inflight_full\": "
+       << aggregate.stats.prefetch_skip_inflight_full << ",\n";
+  json << "    \"prefetch_evicted_before_use\": "
+       << aggregate.stats.prefetch_evicted_before_use << ",\n";
+  json << "    \"prefetch_unused\": "
+       << aggregate.stats.prefetch_only_pages << ",\n";
   json << "    \"adc_table_build_us\": "
        << aggregate.stats.adc_table_build_us << ",\n";
   json << "    \"rerank_reads\": " << aggregate.stats.rerank_reads << ",\n";
@@ -1354,9 +1692,6 @@ int main(int argc, char** argv) {
         args.requested_beam_width > args.search_width) {
       warnings.push_back(
           "effective_beam_width=clamp(requested_beam_width, 1, search_width)");
-    }
-    if (!args.enable_pq && args.rerank_topk > 0) {
-      warnings.push_back("rerank_topk was requested but PQ is disabled");
     }
     if (args.enable_pq && args.rerank_topk == 0) {
       warnings.push_back(

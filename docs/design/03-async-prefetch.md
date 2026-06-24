@@ -2,15 +2,17 @@
 
 ## 当前实现状态（2026-06-22）
 
-核心能力已经进入 SSD 查询主路径：`AsyncPageReader` 提供同步读、异步读、按 `io_batch` 切分的批量提交和 io_uring fallback；`QueryPageSession` 负责 frontier/next-hop prefetch、pending/ready page 管理和 useful/wasted 统计；`PackedDiskGraphIndex` 在候选扩展后把真实邻居列表接入 next-hop 预取；`agent_aware_flow` 可通过 `--io-mode`、`--io-depth`、`--io-batch`、`--prefetch-policy`、`--prefetch-width`、`--prefetch-depth`、`--prefetch-fallback-width`、`--page-coalesce` 调整。
+核心能力已经进入 SSD 查询主路径：`AsyncPageReader` 提供同步读、异步读、按 `io_batch` 切分的批量提交和 io_uring fallback；`QueryPageSession` 负责 pending/ready page 管理和 ready/pending/unused 统计；`PackedDiskGraphIndex` 只保留 PQ+ADC 候选生成，`PrefetchPlanner` 做 page-level 聚合、XGBoost 收益打分、top-K/threshold/io_depth 限流后再提交；`agent_aware_flow` 可通过 `--io-mode`、`--io-depth`、`--io-batch`、`--prefetch-policy none|xgboost`、`--prefetch-model`、`--prefetch-top-k`、`--prefetch-score-threshold`、`--prefetch-max-inflight`、`--prefetch-trace` 调整。
 
 | 项目 | 状态 | 当前对应实现 |
 | --- | --- | --- |
 | io_uring 接入 | 已完成可回退 | `AsyncPageReader::configure/status` |
 | 批量提交 | 已完成 | `AsyncPageReader::batch_submit` |
-| 拓扑预取 | 已完成 | `PrefetchPlanner`、`QueryPageSession::submit_next_hop_prefetch` |
-| 预取指标 | 已完成 | `prefetch_submitted/useful/wasted`、`io_prefetch_*` |
+| XGBoost 预取 | 已完成 | `PrefetchPlanner`、`QueryPageSession::submit_next_hop_prefetch` 提交底座；外部只保留 `--prefetch-policy xgboost` |
+| 预取指标 | 已完成 | `prefetch_ready_hit/pending_hit/unused`、`io_prefetch_*` |
 | 大规模参数扫描 | 部分完成 | SIFT1M 主路径已跑通，完整矩阵见参数调优计划 |
+
+说明：在搜索扩展集合不变时，预取只能把未来 demand read 提前提交；`submitted_reads` 的理论下界等于无预取时的读页集合。要让 `submitted_reads/query` 低于 no-prefetch 基线，需要进一步改变搜索层的候选扩展页集合，例如页感知 beam/coalesced expansion，而不是只调整预取候选。
 
 ## 1. 实现定位
 
