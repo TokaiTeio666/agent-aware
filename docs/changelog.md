@@ -15,7 +15,7 @@
 | `docs/design/07-prefetch-early-trigger-plan.md` | 新增关联文档头和更新日期；P0 补充已落地代码位置表 |
 | `docs/roadmap/recall-to-io-tail-latency-plan.md` | 新增关联文档头和更新日期 |
 | `docs/roadmap/defense-gap-closure-plan.md` | 新增关联文档头和更新日期；更新当前背景反映 XGBoost/early trigger 已落地；优先级表增加说明 |
-| `docs/README.md` | 新增 recall-to-io-tail-latency-plan 和 defense-gap-closure-plan 索引条目；更新 early-trigger 状态为 P0 已落地 |
+| `docs/INDEX.md` | 新增 recall-to-io-tail-latency-plan 和 defense-gap-closure-plan 索引条目；更新 early-trigger 状态为 P0 已落地 |
 
 ## 2026-06-21：Plan/README 文档体系整理
 
@@ -29,7 +29,7 @@
 | --- | --- |
 | `README.md` | 新增文档导航，串联阶段计划、结果报告和后续优化计划 |
 | `PROJECT_PLAN.md` | 新增当前实现状态，标注 SIFT1M 版本已完成能力和后续重点 |
-| `docs/README.md` | 新增统一文档索引、阶段完成度、结果文件和后续优先级 |
+| `docs/INDEX.md` | 新增统一文档索引、阶段完成度、结果文件和后续优先级 |
 | `docs/competition/scoring-and-defense.md` | 新增 90 分评分映射、答辩顺序和提交前验收清单 |
 | `10_*` ~ `23_*` | 纳入阶段计划并补充当前实现状态 |
 | `docs/experiments/param-tuning-and-sift-scale-test.md` | 纳入参数调优与 SIFT 规模测试计划 |

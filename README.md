@@ -11,6 +11,8 @@ agent-aware 是一个面向大模型 Agent 长期记忆场景的向量检索 I/O
 | dataset | SIFT, base=1,000,000, query=1,000, dim=128 |
 | Recall@10 | `0.9917` |
 | avg latency | `168.03 ms` |
+| latency P95 | `202.83 ms` |
+| latency P99 | `216.63 ms` |
 | QPS | `5.95` |
 | search width / beam width | `350` / `16` |
 | I/O effective mode | `io_uring` |
@@ -112,7 +114,7 @@ agent-aware/
 │   ├── replay_prefetch_policy.py           # 离线策略回放
 │   └── plot_sift_matrix.py                 # 参数矩阵结果汇总与图表生成
 └── docs/
-    ├── README.md                          # 文档中心索引
+    ├── INDEX.md                           # 文档中心索引
     ├── changelog.md                       # 当前版本能力边界、验证命令、已知限制
     ├── competition/                       # 赛题要求、评分映射、答辩清单
     ├── design/                            # SSD 存储、缓存、异步预取、动态写入设计

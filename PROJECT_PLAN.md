@@ -23,7 +23,7 @@
 | I/O 尾延迟量化 | 待推进 | reads/query、bytes/query、候选放大等指标补全和分阶段优化（详见 `docs/roadmap/recall-to-io-tail-latency-plan.md`） |
 | 后续重点 | 待推进 | 异步 flush queue、Delta memory graph、周期性 rebuild packed graph、系统参数矩阵、真实 NVMe 复测（详见 `docs/roadmap/defense-gap-closure-plan.md`） |
 
-详细阶段计划和结果文档统一维护在 `docs/README.md`，评分映射和答辩材料组织见 `docs/competition/scoring-and-defense.md`。
+详细阶段计划和结果文档统一维护在 `docs/INDEX.md`，评分映射和答辩材料组织见 `docs/competition/scoring-and-defense.md`。
 
 ## 1. 项目概述
 
