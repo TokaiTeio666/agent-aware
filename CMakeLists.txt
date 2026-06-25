@@ -100,8 +100,8 @@ else()
   target_compile_definitions(agent_aware PRIVATE AGENT_AWARE_HAS_LIBURING=0)
 endif()
 
-add_executable(agent_aware_flow src/sift_search_benchmark.cpp)
-target_link_libraries(agent_aware_flow PRIVATE agent_aware::agent_aware)
+add_executable(agent-aware src/sift_search_benchmark.cpp)
+target_link_libraries(agent-aware PRIVATE agent_aware::agent_aware)
 
 add_executable(bench_mixed_rw src/mixed_rw_benchmark.cpp)
 target_link_libraries(bench_mixed_rw PRIVATE agent_aware::agent_aware)

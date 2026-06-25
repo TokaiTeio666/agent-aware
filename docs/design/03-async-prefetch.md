@@ -2,7 +2,7 @@
 
 ## 当前实现状态（2026-06-22）
 
-核心能力已经进入 SSD 查询主路径：`AsyncPageReader` 提供同步读、异步读、按 `io_batch` 切分的批量提交和 io_uring fallback；`QueryPageSession` 负责 pending/ready page 管理和 ready/pending/unused 统计；`PackedDiskGraphIndex` 只保留 PQ+ADC 候选生成，`PrefetchPlanner` 做 page-level 聚合、XGBoost 收益打分、top-K/threshold/io_depth 限流后再提交；`agent_aware_flow` 可通过 `--io-mode`、`--io-depth`、`--io-batch`、`--prefetch-policy none|xgboost`、`--prefetch-model`、`--prefetch-top-k`、`--prefetch-score-threshold`、`--prefetch-max-inflight`、`--prefetch-trace` 调整。
+核心能力已经进入 SSD 查询主路径：`AsyncPageReader` 提供同步读、异步读、按 `io_batch` 切分的批量提交和 io_uring fallback；`QueryPageSession` 负责 pending/ready page 管理和 ready/pending/unused 统计；`PackedDiskGraphIndex` 只保留 PQ+ADC 候选生成，`PrefetchPlanner` 做 page-level 聚合、XGBoost 收益打分、top-K/threshold/io_depth 限流后再提交；`agent-aware` 可通过 `--io-mode`、`--io-depth`、`--io-batch`、`--prefetch-policy none|xgboost`、`--prefetch-model`、`--prefetch-top-k`、`--prefetch-score-threshold`、`--prefetch-max-inflight`、`--prefetch-trace` 调整。
 
 | 项目 | 状态 | 当前对应实现 |
 | --- | --- | --- |

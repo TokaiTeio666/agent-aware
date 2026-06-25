@@ -20,6 +20,7 @@ struct DatasetLoadConfig {
   bool synthetic = true;
   DatasetPaths paths;
   std::size_t base_limit = 0;
+  std::size_t query_offset = 0;
   std::size_t query_limit = 0;
   SyntheticConfig synthetic_config;
 };
@@ -33,10 +34,12 @@ struct LoadedDataset {
   bool truth_from_file = false;
 };
 
-VectorSet load_fvecs(const std::string& path, std::size_t limit = 0);
+VectorSet load_fvecs(const std::string& path, std::size_t limit = 0,
+                     std::size_t offset = 0);
 
 std::vector<std::vector<std::uint32_t>> load_ivecs(const std::string& path,
-                                                   std::size_t limit = 0);
+                                                   std::size_t limit = 0,
+                                                   std::size_t offset = 0);
 
 SyntheticData generate_synthetic(const SyntheticConfig& config);
 

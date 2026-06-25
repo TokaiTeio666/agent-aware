@@ -444,7 +444,7 @@ python3 scripts/replay_prefetch_policy.py \
 
 ```bash
 python3 scripts/run_prefetch_ab.py \
-  --binary ./build/agent_aware_flow \
+  --binary ./build/agent-aware \
   --model build/prefetch_xgboost_early.txt \
   --out-dir build/prefetch_ab_early \
   --search-width 32 \

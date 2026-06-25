@@ -13,7 +13,7 @@ ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$ROOT"
 
 BUILD_DIR="${BUILD_DIR:-"$ROOT/build"}"
-BINARY="${BINARY:-"$BUILD_DIR/agent_aware_flow"}"
+BINARY="${BINARY:-"$BUILD_DIR/agent-aware"}"
 BUILD="${BUILD:-1}"
 JOBS="${JOBS:-$(nproc)}"
 TAG="${TAG:-sift1m_once_$(date +%Y%m%d-%H%M%S)}"
@@ -25,7 +25,7 @@ REBUILD_INDEX="${REBUILD_INDEX:-}"
 mkdir -p "$OUTPUT_DIR"
 
 if [[ "$BUILD" == "1" ]]; then
-  cmake --build "$BUILD_DIR" --target agent_aware_flow -j"$JOBS"
+  cmake --build "$BUILD_DIR" --target agent-aware -j"$JOBS"
 fi
 
 if [[ ! -x "$BINARY" ]]; then
@@ -70,7 +70,7 @@ wall_seconds=$((end_epoch - start_epoch))
 } > "$OUTPUT_DIR/time.txt"
 
 if [[ "$status" -ne 0 ]]; then
-  echo "agent_aware_flow failed with status $status" >&2
+  echo "agent-aware failed with status $status" >&2
   echo "logs: $OUTPUT_DIR" >&2
   exit "$status"
 fi
@@ -97,7 +97,9 @@ print(f"  result_json: {result_path}")
 print(f"  wall_seconds: {wall_seconds}")
 print(
     "  dataset: "
-    f"base={result.get('base_count')} query={result.get('query_count')} "
+    f"base={result.get('base_count')} "
+    f"query_offset={result.get('query_offset')} "
+    f"query={result.get('query_count')} "
     f"dim={result.get('dim')} k={result.get('top_k')}"
 )
 print(

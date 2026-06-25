@@ -57,16 +57,57 @@ def load_trace(path: Path) -> List[dict]:
     return rows
 
 
-def split_queries(rows: Sequence[dict]) -> Tuple[set, set, set]:
+def split_queries(
+    rows: Sequence[dict],
+    train_queries: int = 0,
+    valid_queries: int = 0,
+    test_queries: int = 0,
+    seed: int = 42,
+) -> Tuple[set, set, set]:
+    """Split query IDs into train/valid/test sets.
+
+    When absolute counts (train_queries, valid_queries, test_queries) are all
+    positive, they take precedence.  Otherwise a 60/20/20 ratio split is used.
+    The split is randomised (not chronological) and reproducible via *seed*.
+    """
+    import random as _random
+
     query_ids = sorted({row["query_id"] for row in rows})
-    if len(query_ids) < 3:
-        return set(query_ids), set(query_ids), set(query_ids)
-    train_end = max(1, int(len(query_ids) * 0.70))
-    valid_end = max(train_end + 1, int(len(query_ids) * 0.85))
+    n = len(query_ids)
+    if n < 3:
+        ids = set(query_ids)
+        return ids, ids, ids
+
+    rng = _random.Random(seed)
+    shuffled = list(query_ids)
+    rng.shuffle(shuffled)
+
+    if train_queries > 0 and valid_queries > 0 and test_queries > 0:
+        total = train_queries + valid_queries + test_queries
+        if n < total:
+            # Scale down proportionally if not enough queries
+            ratio = n / total
+            train_n = max(1, int(train_queries * ratio))
+            valid_n = max(1, int(valid_queries * ratio))
+            test_n = n - train_n - valid_n
+        else:
+            train_n = train_queries
+            valid_n = valid_queries
+            test_n = min(test_queries, n - train_n - valid_n)
+    else:
+        # 60/20/20 ratio split
+        train_n = max(1, int(n * 0.60))
+        valid_n = max(1, int(n * 0.20))
+        test_n = n - train_n - valid_n
+
+    test_n = max(1, test_n)
+    valid_n = max(1, valid_n)
+    train_n = n - valid_n - test_n
+
     return (
-        set(query_ids[:train_end]),
-        set(query_ids[train_end:valid_end]),
-        set(query_ids[valid_end:]),
+        set(shuffled[:train_n]),
+        set(shuffled[train_n:train_n + valid_n]),
+        set(shuffled[train_n + valid_n:]),
     )
 
 
@@ -79,12 +120,6 @@ def group_rows(rows: Iterable[dict]) -> Dict[str, List[dict]]:
     for row in rows:
         groups[row.get("group_id") or f"{row['query_id']}_{row.get('step_id', 0)}"].append(row)
     return groups
-
-
-def current_score(row: dict) -> float:
-    count = parse_float(row.get("num_candidates_on_page"))
-    rank = parse_float(row.get("min_pq_rank_on_page"))
-    return count * 1_000_000.0 - rank
 
 
 class Stump:
@@ -327,13 +362,22 @@ def main() -> None:
     parser.add_argument("--learning-rate", type=float, default=0.2)
     parser.add_argument("--max-depth", type=int, default=3)
     parser.add_argument("--seed", type=int, default=42)
+    parser.add_argument("--train-queries", type=int, default=3000,
+                        help="Number of queries for training set (default 3000)")
+    parser.add_argument("--valid-queries", type=int, default=1000,
+                        help="Number of queries for validation set (default 1000)")
+    parser.add_argument("--test-queries", type=int, default=1000,
+                        help="Number of queries for test set (default 1000)")
     parser.add_argument(
-        "--backend",
-        choices=("auto", "xgboost", "stumps"),
-        default="auto",
-        help="Training backend; auto uses xgboost when installed, else stumps.",
+        "--train-all",
+        action="store_true",
+        help=(
+            "Use every query in the input trace for training. Use this when "
+            "the train/valid/test split is done by separate benchmark runs."
+        ),
     )
-    # Kept as a compatibility no-op for older smoke commands.
+    # Kept as compatibility no-ops for older smoke commands.
+    parser.add_argument("--backend", type=str)
     parser.add_argument("--epochs", type=int)
     parser.add_argument("--l2", type=float)
     args = parser.parse_args()
@@ -344,48 +388,45 @@ def main() -> None:
         raise RuntimeError("--max-inflight must be >= 0")
 
     rows = load_trace(args.trace)
-    train_ids, valid_ids, test_ids = split_queries(rows)
-    splits = {
-        "train": [row for row in rows if row["query_id"] in train_ids],
-        "valid": [row for row in rows if row["query_id"] in valid_ids],
-        "test": [row for row in rows if row["query_id"] in test_ids],
-    }
-
-    backend = "stumps"
-    backend_note = ""
-    if args.backend in {"auto", "xgboost"}:
-        ok, note = train_real_xgboost(
-            splits["train"],
-            args.rounds,
-            args.learning_rate,
-            args.max_depth,
-            args.seed,
-            args.model_out,
-        )
-        if ok:
-            backend = "xgboost"
-            backend_note = note
-        elif args.backend == "xgboost":
-            raise RuntimeError(note)
-        else:
-            backend_note = note
-
-    if backend == "stumps":
-        base_score, stumps = train_stump_ensemble(
-            splits["train"], args.rounds, args.learning_rate, args.seed
-        )
-        write_xgboost_dump(args.model_out, base_score, stumps)
+    if args.train_all:
+        splits = {"train": rows}
+        split_mode = "train-all"
     else:
-        base_score, stumps = load_xgboost_dump(args.model_out)
+        train_ids, valid_ids, test_ids = split_queries(
+            rows,
+            train_queries=args.train_queries,
+            valid_queries=args.valid_queries,
+            test_queries=args.test_queries,
+            seed=args.seed,
+        )
+        splits = {
+            "train": [row for row in rows if row["query_id"] in train_ids],
+            "valid": [row for row in rows if row["query_id"] in valid_ids],
+            "test": [row for row in rows if row["query_id"] in test_ids],
+        }
+        split_mode = f"train{len(train_ids)}_valid{len(valid_ids)}_test{len(test_ids)}"
+
+    ok, note = train_real_xgboost(
+        splits["train"],
+        args.rounds,
+        args.learning_rate,
+        args.max_depth,
+        args.seed,
+        args.model_out,
+    )
+    if not ok:
+        raise RuntimeError(note)
+
+    base_score, stumps = load_xgboost_dump(args.model_out)
 
     metrics = {
         "trace": str(args.trace),
         "model_out": str(args.model_out),
-        "backend": backend,
-        "backend_note": backend_note,
+        "backend": "xgboost",
         "top_k": args.top_k,
         "score_threshold": args.score_threshold if math.isfinite(args.score_threshold) else None,
         "max_inflight": args.max_inflight,
+        "split_mode": split_mode,
         "features": [model_name for _, model_name in TRACE_FEATURES],
         "splits": {},
     }
@@ -397,25 +438,13 @@ def main() -> None:
             args.score_threshold,
             args.max_inflight,
         )
-        current_metrics = evaluate(
-            split_rows,
-            current_score,
-            args.top_k,
-            args.score_threshold,
-            args.max_inflight,
-        )
-        metrics["splits"][name] = {
-            "xgboost": xgboost_metrics,
-            "current_reference": current_metrics,
-        }
+        metrics["splits"][name] = {"xgboost": xgboost_metrics}
 
     payload = json.dumps(metrics, indent=2, sort_keys=True)
     if args.metrics_out:
         args.metrics_out.parent.mkdir(parents=True, exist_ok=True)
         args.metrics_out.write_text(payload + "\n", encoding="utf-8")
     print(payload)
-    if backend != "xgboost":
-        print(f"warning: {backend_note}; wrote compatible boosted-stump dump", file=sys.stderr)
 
 
 if __name__ == "__main__":

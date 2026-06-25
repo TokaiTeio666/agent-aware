@@ -28,7 +28,6 @@ class QueryPageSession {
 
   bool async_prefetch_enabled() const;
   bool frontier_prefetch_enabled() const;
-  bool next_hop_prefetch_enabled() const;
   bool candidate_prefetch_enabled() const;
   std::size_t prefetch_width() const;
 
@@ -50,10 +49,6 @@ class QueryPageSession {
       const std::vector<std::uint32_t>& page_ids,
       const std::string& trigger = "pre_beam",
       std::size_t min_candidates_per_page = 0);
-  void submit_next_hop_prefetch(
-      const std::vector<std::uint32_t>& node_ids,
-      const std::unordered_set<std::uint32_t>& excluded_nodes,
-      const std::vector<std::uint32_t>& fallback_page_ids = {});
   void drain_ready_pages();
 
   bool page_available_for_scheduling(std::uint32_t page_id) const;

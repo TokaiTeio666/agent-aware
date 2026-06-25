@@ -192,7 +192,7 @@ def enrich_success_json(path, root, binary, spec, rebuild_index_passed, extra_ar
             root,
             binary,
             spec,
-            f"agent_aware_flow did not write valid JSON: {error}",
+            f"agent-aware did not write valid JSON: {error}",
             extra_args,
         )
     payload.update(binary_metadata(root, binary))
@@ -446,9 +446,9 @@ def visualize(root, matrix_output_dir, visualize_output_dir):
 def main():
     root = Path(__file__).resolve().parents[1]
     parser = argparse.ArgumentParser(
-        description="Run staged agent_aware_flow SIFT parameter matrix experiments."
+        description="Run staged agent-aware SIFT parameter matrix experiments."
     )
-    parser.add_argument("--binary", default=str(root / "build" / "agent_aware_flow"))
+    parser.add_argument("--binary", default=str(root / "build" / "agent-aware"))
     parser.add_argument("--output-dir", default=str(root / "logs" / "sift_bench"))
     parser.add_argument(
         "--date-tag", default=os.getenv("DATE_TAG", time.strftime("%Y%m%d-%H%M%S"))
@@ -545,7 +545,7 @@ def main():
 
     help_code, help_text = run_help(binary)
     if help_code != 0:
-        raise SystemExit("agent_aware_flow --help failed")
+        raise SystemExit("agent-aware --help failed")
     beam_supported = "--beam-width" in help_text
 
     warnings = []
@@ -587,7 +587,7 @@ def main():
             continue
 
         if not beam_supported:
-            reason = "--beam-width is not supported by this agent_aware_flow"
+            reason = "--beam-width is not supported by this agent-aware"
             write_command_file(command_path, root, [str(binary), "--help"], spec, False, extra_args)
             payload = skip_payload(root, binary, spec, reason, extra_args)
             payload["beam_width_supported"] = False
@@ -615,7 +615,7 @@ def main():
 
         if completed.returncode != 0:
             failures += 1
-            reason = f"agent_aware_flow failed with exit code {completed.returncode}"
+            reason = f"agent-aware failed with exit code {completed.returncode}"
             payload = skip_payload(
                 root,
                 binary,
@@ -649,7 +649,7 @@ def main():
             print(f"matrix visualization failed with exit code {viz_code}", file=sys.stderr)
 
     if failures:
-        raise SystemExit(f"{failures} agent_aware_flow runs failed")
+        raise SystemExit(f"{failures} agent-aware runs failed")
     if viz_code:
         raise SystemExit(viz_code)
     return 0

@@ -77,17 +77,12 @@ struct DiskGraphSearchConfig {
   std::size_t rerank_topk = 0;
   std::size_t prefetch_width = 1;
   std::size_t prefetch_depth = 1;
-  std::size_t prefetch_fallback_width = 0;
   std::size_t prefetch_min_candidates_per_page = 2;
-  bool adaptive_prefetch = true;
-  bool enable_progressive_frontier_prefetch = false;
-  bool enable_jit_frontier_prefetch = false;
   std::size_t jit_window_multiplier = 2;
   std::size_t jit_prefetch_interval_batches = 2;
   std::size_t jit_prefetch_max_pages_per_query = 16;
   std::string prefetch_early_trigger = "pre-beam";
   std::string prefetch_policy = "none";
-  std::string prefetch_ranker = "none";
   std::string prefetch_model_path;
   std::string prefetch_trace_path;
   std::uint64_t query_id = 0;
@@ -95,19 +90,7 @@ struct DiskGraphSearchConfig {
   double prefetch_score_threshold =
       -std::numeric_limits<double>::infinity();
   std::size_t prefetch_max_inflight = 0;
-  bool page_dedup = true;
   bool same_page_reuse = true;
-  bool page_coalesce = true;
-  bool page_aware_beam = false;
-  std::size_t beam_window_multiplier = 2;
-  std::size_t max_new_pages_per_batch = 0;
-  double page_aware_distance_slack_ratio = 0.01;
-  double page_aware_reuse_bonus = 0.25;
-  double page_aware_availability_bonus = 0.5;
-  bool next_hop_hints = false;
-  std::size_t next_hop_hint_min_reuse = 2;
-  std::size_t next_hop_hint_ttl_expansions = 32;
-  double next_hop_promote_slack_ratio = 0.02;
 };
 
 struct DiskGraphSearchStats {
@@ -183,11 +166,6 @@ struct DiskGraphSearchStats {
   std::size_t jit_prefetch_skipped_by_interval = 0;
   std::size_t jit_prefetch_budget_exhausted = 0;
   std::size_t jit_prefetch_candidates_capped = 0;
-  std::size_t page_aware_distance_fallbacks = 0;
-  std::size_t page_aware_candidate_skips = 0;
-  std::size_t page_aware_distance_slack_rejects = 0;
-  std::size_t next_hop_hints_recorded = 0;
-  std::size_t next_hop_hints_promoted = 0;
   std::size_t same_page_node_reuse = 0;
   double adc_table_build_us = 0.0;
   std::size_t rerank_reads = 0;
@@ -368,8 +346,6 @@ class PackedDiskGraphIndex {
   std::unique_ptr<SearchState> initialize_search_state(
       const float* query, const DiskGraphSearchConfig& config,
       DiskGraphSearchResult& output);
-  std::vector<std::uint32_t> collect_frontier_pages(
-      const SearchState& state, std::size_t scan_width) const;
   std::vector<std::uint32_t> collect_jit_frontier_pages(
       SearchState& state, std::size_t effective_beam_width) const;
   std::vector<std::uint32_t> collect_entry_warmup_pages(

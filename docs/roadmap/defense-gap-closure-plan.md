@@ -46,7 +46,7 @@
 
 ### 主路径命令模板
 
-`agent_aware_flow` 支持 `--search-width`、`--beam-width`、`--memory-budget-ratio`、`--io-mode`、`--cache-policy` 和 `--output-json`。复用已有 packed index 时保持 `REBUILD_INDEX=0` 或不设置。
+`agent-aware` 支持 `--search-width`、`--beam-width`、`--memory-budget-ratio`、`--io-mode`、`--cache-policy` 和 `--output-json`。复用已有 packed index 时保持 `REBUILD_INDEX=0` 或不设置。
 
 ```bash
 for sw in 128 192 256 350 512; do

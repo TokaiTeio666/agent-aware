@@ -24,26 +24,78 @@ void validate_positive_dim(std::int32_t dim, const std::string& path) {
   }
 }
 
+void validate_consistent_dim(std::size_t& expected_dim, std::size_t dim,
+                             const std::string& path) {
+  if (expected_dim == 0) {
+    expected_dim = dim;
+  } else if (expected_dim != dim) {
+    throw std::runtime_error("Inconsistent vector dimension in " + path);
+  }
+}
+
+void skip_payload(std::ifstream& input, std::size_t bytes,
+                  const std::string& path) {
+  input.seekg(static_cast<std::streamoff>(bytes), std::ios::cur);
+  if (!input) {
+    throw std::runtime_error("Truncated vector payload in " + path);
+  }
+}
+
+VectorSet slice_vectors(VectorSet input, std::size_t offset,
+                        std::size_t limit) {
+  const std::size_t total = input.size();
+  if (offset == 0 && (limit == 0 || limit >= total)) {
+    return input;
+  }
+  if (offset > total) {
+    throw std::runtime_error("Query offset exceeds available synthetic queries");
+  }
+
+  const std::size_t available = total - offset;
+  const std::size_t count = limit == 0 ? available : std::min(limit, available);
+  VectorSet output(count, input.dim);
+  const auto first = input.values.begin() +
+                     static_cast<std::ptrdiff_t>(offset * input.dim);
+  const auto last = first + static_cast<std::ptrdiff_t>(count * input.dim);
+  std::copy(first, last, output.values.begin());
+  return output;
+}
+
 }  // namespace
 
-VectorSet load_fvecs(const std::string& path, std::size_t limit) {
+VectorSet load_fvecs(const std::string& path, std::size_t limit,
+                     std::size_t offset) {
   std::ifstream input(path, std::ios::binary);
   if (!input) {
     throw std::runtime_error("Cannot open fvecs file: " + path);
   }
 
   VectorSet output;
+  std::size_t expected_dim = 0;
+  std::size_t skipped = 0;
+  while (skipped < offset) {
+    if (input.peek() == EOF) {
+      throw std::runtime_error("Query offset exceeds fvecs record count: " +
+                               path);
+    }
+    const std::int32_t dim_i32 = read_i32(input, path);
+    validate_positive_dim(dim_i32, path);
+    const std::size_t dim = static_cast<std::size_t>(dim_i32);
+    validate_consistent_dim(expected_dim, dim, path);
+    skip_payload(input, dim * sizeof(float), path);
+    ++skipped;
+  }
+
   std::size_t count = 0;
 
   while (input.peek() != EOF && (limit == 0 || count < limit)) {
     const std::int32_t dim_i32 = read_i32(input, path);
     validate_positive_dim(dim_i32, path);
     const std::size_t dim = static_cast<std::size_t>(dim_i32);
+    validate_consistent_dim(expected_dim, dim, path);
 
     if (output.dim == 0) {
       output.dim = dim;
-    } else if (output.dim != dim) {
-      throw std::runtime_error("Inconsistent vector dimension in " + path);
     }
 
     const std::size_t old_size = output.values.size();  // VectorSet 按行连续存储。
@@ -60,13 +112,26 @@ VectorSet load_fvecs(const std::string& path, std::size_t limit) {
 }
 
 std::vector<std::vector<std::uint32_t>> load_ivecs(const std::string& path,
-                                                   std::size_t limit) {
+                                                   std::size_t limit,
+                                                   std::size_t offset) {
   std::ifstream input(path, std::ios::binary);
   if (!input) {
     throw std::runtime_error("Cannot open ivecs file: " + path);
   }
 
   std::vector<std::vector<std::uint32_t>> output;
+  std::size_t skipped = 0;
+  while (skipped < offset) {
+    if (input.peek() == EOF) {
+      throw std::runtime_error("Query offset exceeds ivecs record count: " +
+                               path);
+    }
+    const std::int32_t dim_i32 = read_i32(input, path);
+    validate_positive_dim(dim_i32, path);
+    const std::size_t dim = static_cast<std::size_t>(dim_i32);
+    skip_payload(input, dim * sizeof(std::uint32_t), path);
+    ++skipped;
+  }
 
   while (input.peek() != EOF && (limit == 0 || output.size() < limit)) {
     const std::int32_t dim_i32 = read_i32(input, path);
@@ -158,9 +223,17 @@ LoadedDataset load_dataset(const DatasetLoadConfig& config) {
   LoadedDataset loaded;
 
   if (config.synthetic) {
-    auto data = generate_synthetic(config.synthetic_config);
+    auto synthetic_config = config.synthetic_config;
+    if (config.query_limit > 0) {
+      synthetic_config.query_count =
+          std::max(synthetic_config.query_count,
+                   config.query_offset + config.query_limit);
+    }
+    auto data = generate_synthetic(synthetic_config);
     loaded.base = std::move(data.base);
-    loaded.queries = std::move(data.queries);
+    loaded.queries =
+        slice_vectors(std::move(data.queries), config.query_offset,
+                      config.query_limit);
     loaded.mode = "synthetic";
     loaded.truth_source = "none";
     return loaded;
@@ -186,7 +259,8 @@ LoadedDataset load_dataset(const DatasetLoadConfig& config) {
   }
 
   loaded.base = load_fvecs(paths.base, config.base_limit);
-  loaded.queries = load_fvecs(paths.query, config.query_limit);
+  loaded.queries =
+      load_fvecs(paths.query, config.query_limit, config.query_offset);
   if (loaded.base.empty()) {
     throw std::runtime_error("Loaded base dataset is empty: " + paths.base);
   }
@@ -200,7 +274,8 @@ LoadedDataset load_dataset(const DatasetLoadConfig& config) {
   loaded.mode = paths.sift_dir.empty() ? "fvecs" : "sift";
   loaded.truth_source = "none";
   if (!paths.truth.empty()) {
-    loaded.truth = load_ivecs(paths.truth, loaded.queries.size());
+    loaded.truth =
+        load_ivecs(paths.truth, loaded.queries.size(), config.query_offset);
     if (loaded.truth.size() != loaded.queries.size()) {
       throw std::runtime_error(
           "Ground-truth query count does not match loaded queries");

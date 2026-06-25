@@ -17,11 +17,7 @@ class PrefetchPlanner {
     std::string policy = "none";
     std::size_t prefetch_width = 0;
     std::size_t prefetch_depth = 1;
-    std::size_t fallback_width = 0;
     std::size_t min_candidates_per_page = 2;
-    bool dedup_pages = true;
-    bool coalesce_pages = true;
-    std::string ranker = "none";
     std::string model_path;
     std::size_t prefetch_top_k = 0;
     double score_threshold = -std::numeric_limits<double>::infinity();
@@ -101,26 +97,15 @@ class PrefetchPlanner {
     PlanStats stats;
   };
 
-  using PageForNode = std::function<std::uint32_t(std::uint32_t)>;
-  using SkipNode = std::function<bool(std::uint32_t)>;
   using PageAvailabilityFn =
       std::function<PageAvailability(std::uint32_t)>;
 
   explicit PrefetchPlanner(Config config);
 
   bool frontier_enabled() const;
-  bool next_hop_enabled() const;
   std::size_t width() const;
   std::size_t depth() const;
-  std::size_t fallback_width() const;
   std::size_t top_k() const;
-
-  Plan plan_next_hop(const std::vector<std::uint32_t>& node_ids,
-                     std::size_t vector_count,
-                     const PageForNode& page_for_node,
-                     const SkipNode& skip_node,
-                     const PageAvailabilityFn& availability,
-                     PlanningContext context);
 
   Plan plan_candidates(std::vector<std::uint32_t> page_ids,
                        const PageAvailabilityFn& availability,
@@ -135,10 +120,6 @@ class PrefetchPlanner {
  private:
   struct PageCandidate;
 
-  Plan plan_ordered_candidates(std::vector<std::uint32_t> page_ids,
-                               const PageAvailabilityFn& availability,
-                               std::size_t max_pages,
-                               PlanningContext context);
   Plan plan_coalesced_candidates(std::vector<std::uint32_t> page_ids,
                                  const PageAvailabilityFn& availability,
                                  std::size_t max_pages,
@@ -152,9 +133,6 @@ class PrefetchPlanner {
   double score_candidate(const PrefetchFeature& feature) const;
   void load_xgboost_model(const std::string& path);
   double score_xgboost_model(const PrefetchFeature& feature) const;
-  bool accept_page(std::uint32_t page_id,
-                   const PageAvailabilityFn& availability,
-                   PlanStats& stats);
 
   Config config_;
   struct XGBoostNode {

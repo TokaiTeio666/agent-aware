@@ -334,7 +334,7 @@ cmake --build build -j
 ## SIFT 小规模 smoke test
 
 ```bash
-./build/agent_aware_flow \
+./build/agent-aware \
   --sift-dir data/sift \
   --search-width 64 \
   --beam-width 8 \
@@ -344,13 +344,13 @@ cmake --build build -j
 ## 不同 beam_width 对比
 
 ```bash
-./build/agent_aware_flow --sift-dir data/sift --search-width 64  --beam-width 1  --top-k 10
-./build/agent_aware_flow --sift-dir data/sift --search-width 64  --beam-width 4  --top-k 10
-./build/agent_aware_flow --sift-dir data/sift --search-width 64  --beam-width 8  --top-k 10
-./build/agent_aware_flow --sift-dir data/sift --search-width 64  --beam-width 16 --top-k 10
-./build/agent_aware_flow --sift-dir data/sift --search-width 128 --beam-width 8  --top-k 10
-./build/agent_aware_flow --sift-dir data/sift --search-width 128 --beam-width 16 --top-k 10
-./build/agent_aware_flow --sift-dir data/sift --search-width 256 --beam-width 16 --top-k 10
+./build/agent-aware --sift-dir data/sift --search-width 64  --beam-width 1  --top-k 10
+./build/agent-aware --sift-dir data/sift --search-width 64  --beam-width 4  --top-k 10
+./build/agent-aware --sift-dir data/sift --search-width 64  --beam-width 8  --top-k 10
+./build/agent-aware --sift-dir data/sift --search-width 64  --beam-width 16 --top-k 10
+./build/agent-aware --sift-dir data/sift --search-width 128 --beam-width 8  --top-k 10
+./build/agent-aware --sift-dir data/sift --search-width 128 --beam-width 16 --top-k 10
+./build/agent-aware --sift-dir data/sift --search-width 256 --beam-width 16 --top-k 10
 ```
 
 ## 需要对比的输出指标

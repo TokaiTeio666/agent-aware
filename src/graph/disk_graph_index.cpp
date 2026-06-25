@@ -63,18 +63,10 @@ std::vector<SearchResult> sorted_results(
   return results;
 }
 
-double distance_slack_limit(double best_distance, double slack_ratio) {
-  if (slack_ratio <= 0.0) {
-    return best_distance;
-  }
-  return best_distance + std::max(1.0, std::abs(best_distance)) * slack_ratio;
-}
-
 bool pre_beam_prefetch_enabled(const DiskGraphSearchConfig& config) {
   return config.prefetch_policy == "xgboost" &&
          (config.prefetch_early_trigger == "pre-beam" ||
-          config.prefetch_early_trigger == "all" ||
-          config.enable_jit_frontier_prefetch);
+          config.prefetch_early_trigger == "all");
 }
 
 bool entry_warmup_prefetch_enabled(const DiskGraphSearchConfig& config) {
@@ -137,52 +129,6 @@ struct PackedDiskGraphIndex::SearchState {
     return ranked;
   }
 
-  struct NextHopHint {
-    std::size_t count = 0;
-    float best_distance = std::numeric_limits<float>::infinity();
-    std::size_t first_seen_expansion = 0;
-  };
-
-  void record_next_hop_hints(const std::vector<SearchResult>& hints) {
-    for (const auto& hint : hints) {
-      const std::uint32_t page_id = session.page_for_node(hint.id);
-      auto& entry = next_hop_hints[page_id];
-      if (entry.count == 0) {
-        entry.first_seen_expansion = output.stats.expanded;
-      }
-      ++entry.count;
-      entry.best_distance = std::min(entry.best_distance, hint.distance);
-      ++output.stats.next_hop_hints_recorded;
-    }
-  }
-
-  void record_next_hop_hints(const std::vector<std::uint32_t>& node_ids) {
-    for (const auto node_id : node_ids) {
-      const std::uint32_t page_id = session.page_for_node(node_id);
-      auto& entry = next_hop_hints[page_id];
-      if (entry.count == 0) {
-        entry.first_seen_expansion = output.stats.expanded;
-      }
-      ++entry.count;
-      ++output.stats.next_hop_hints_recorded;
-    }
-  }
-
-  void prune_next_hop_hints() {
-    if (config.next_hop_hint_ttl_expansions == 0) {
-      return;
-    }
-    for (auto it = next_hop_hints.begin(); it != next_hop_hints.end();) {
-      if (output.stats.expanded > it->second.first_seen_expansion &&
-          output.stats.expanded - it->second.first_seen_expansion >
-              config.next_hop_hint_ttl_expansions) {
-        it = next_hop_hints.erase(it);
-      } else {
-        ++it;
-      }
-    }
-  }
-
   void add_best(const SearchResult& result) {
     if (best.size() < result_capacity) {
       best.push(result);
@@ -234,7 +180,6 @@ struct PackedDiskGraphIndex::SearchState {
   std::priority_queue<SearchResult, std::vector<SearchResult>, WorseResultFirst>
       best;
   std::vector<std::uint32_t> entry_seed_ids;
-  std::unordered_map<std::uint32_t, NextHopHint> next_hop_hints;
   std::vector<float> adc_table;
   std::size_t effective_k = 0;
   std::size_t result_capacity = 0;
@@ -779,21 +724,6 @@ PackedDiskGraphIndex::initialize_search_state(
   return state;
 }
 
-std::vector<std::uint32_t> PackedDiskGraphIndex::collect_frontier_pages(
-    const SearchState& state, std::size_t scan_width) const {
-  auto frontier = state.candidates;
-  std::vector<std::uint32_t> page_ids;
-  page_ids.reserve(scan_width);
-  while (!frontier.empty() && page_ids.size() < scan_width) {
-    const auto next = frontier.top();
-    frontier.pop();
-    if (!state.session.is_node_materialized(next.id)) {
-      page_ids.push_back(state.session.page_for_node(next.id));
-    }
-  }
-  return page_ids;
-}
-
 std::vector<std::uint32_t> PackedDiskGraphIndex::collect_jit_frontier_pages(
     SearchState& state, std::size_t effective_beam_width) const {
   const std::size_t window_multiplier =
@@ -813,42 +743,8 @@ std::vector<std::uint32_t> PackedDiskGraphIndex::collect_jit_frontier_pages(
 
   std::vector<std::uint32_t> page_ids;
   page_ids.reserve(window.size());
-  if (window.empty()) {
-    return page_ids;
-  }
-
-  const double slack_limit = distance_slack_limit(
-      static_cast<double>(window.front().distance),
-      state.config.next_hop_promote_slack_ratio);
-  state.prune_next_hop_hints();
-  std::unordered_set<std::uint32_t> promoted_pages;
-  promoted_pages.reserve(window.size());
-
   for (const auto& candidate : window) {
-    const std::uint32_t page_id = state.session.page_for_node(candidate.id);
-    page_ids.push_back(page_id);
-    if (!state.config.next_hop_hints) {
-      continue;
-    }
-    const auto hint = state.next_hop_hints.find(page_id);
-    if (hint == state.next_hop_hints.end()) {
-      continue;
-    }
-    const bool enough_reuse =
-        hint->second.count >= state.config.next_hop_hint_min_reuse;
-    const bool close_enough =
-        !std::isfinite(hint->second.best_distance) ||
-        static_cast<double>(hint->second.best_distance) <= slack_limit;
-    const bool already_available =
-        state.session.page_available_for_scheduling(page_id);
-    if ((enough_reuse && close_enough) || already_available) {
-      for (std::size_t i = 1; i < hint->second.count; ++i) {
-        page_ids.push_back(page_id);
-      }
-      if (promoted_pages.insert(page_id).second) {
-        ++state.output.stats.next_hop_hints_promoted;
-      }
-    }
+    page_ids.push_back(state.session.page_for_node(candidate.id));
   }
   return page_ids;
 }
@@ -1092,15 +988,8 @@ std::vector<SearchResult> PackedDiskGraphIndex::select_candidate_batch(
     return window;
   }
 
-  const std::size_t window_limit =
-      state.config.page_aware_beam
-          ? std::max(batch_limit,
-                     batch_limit *
-                         std::max<std::size_t>(
-                             1, state.config.beam_window_multiplier))
-          : batch_limit;
-  window.reserve(window_limit);
-  while (!state.candidates.empty() && window.size() < window_limit) {
+  window.reserve(batch_limit);
+  while (!state.candidates.empty() && window.size() < batch_limit) {
     if (update_frontier(state)) {
       break;
     }
@@ -1108,152 +997,20 @@ std::vector<SearchResult> PackedDiskGraphIndex::select_candidate_batch(
     state.candidates.pop();
   }
 
-  if (!state.config.page_aware_beam || window.size() <= batch_limit) {
-    if (window.size() > batch_limit) {
-      for (std::size_t i = batch_limit; i < window.size(); ++i) {
-        state.candidates.push(window[i]);
-      }
-      window.resize(batch_limit);
-    }
-    std::unordered_set<std::uint32_t> batch_pages;
-    std::unordered_set<std::uint32_t> available_pages;
-    batch_pages.reserve(window.size());
-    available_pages.reserve(window.size());
-    for (const auto& candidate : window) {
-      const std::uint32_t page_id = state.session.page_for_node(candidate.id);
-      batch_pages.insert(page_id);
-      if (state.session.page_available_for_scheduling(page_id)) {
-        available_pages.insert(page_id);
-      }
-    }
-    state.output.stats.beam_unique_pages += batch_pages.size();
-    state.output.stats.beam_cached_or_pending_pages += available_pages.size();
-    return window;
-  }
-
-  const double slack_limit =
-      distance_slack_limit(static_cast<double>(window.front().distance),
-                           state.config.page_aware_distance_slack_ratio);
-  std::vector<std::uint32_t> window_pages;
-  std::vector<bool> window_available;
-  window_pages.reserve(window.size());
-  window_available.reserve(window.size());
+  std::unordered_set<std::uint32_t> batch_pages;
+  std::unordered_set<std::uint32_t> available_pages;
+  batch_pages.reserve(window.size());
+  available_pages.reserve(window.size());
   for (const auto& candidate : window) {
     const std::uint32_t page_id = state.session.page_for_node(candidate.id);
-    window_pages.push_back(page_id);
-    window_available.push_back(
-        state.session.page_available_for_scheduling(page_id));
-  }
-  std::size_t selected_new_pages = 0;
-  const std::size_t max_new_pages =
-      std::max<std::size_t>(
-          1, state.config.max_new_pages_per_batch == 0
-                 ? (batch_limit + 1) / 2
-                 : state.config.max_new_pages_per_batch);
-
-  std::vector<SearchResult> batch;
-  batch.reserve(batch_limit);
-  std::vector<bool> selected_index(window.size(), false);
-  std::unordered_set<std::uint32_t> selected_pages;
-  std::unordered_set<std::uint32_t> available_pages;
-  selected_pages.reserve(batch_limit);
-  available_pages.reserve(batch_limit);
-  const std::size_t skips_before =
-      state.output.stats.page_aware_candidate_skips;
-  const std::size_t slack_rejects_before =
-      state.output.stats.page_aware_distance_slack_rejects;
-
-  auto select_index = [&](std::size_t index, bool require_slack,
-                          bool allow_new_page_overflow) {
-    if (selected_index[index] || batch.size() >= batch_limit) {
-      return false;
-    }
-    const auto& candidate = window[index];
-    if (require_slack &&
-        static_cast<double>(candidate.distance) > slack_limit) {
-      ++state.output.stats.page_aware_distance_slack_rejects;
-      return false;
-    }
-    const std::uint32_t page_id = window_pages[index];
-    const bool already_selected =
-        selected_pages.find(page_id) != selected_pages.end();
-    const bool available = window_available[index];
-    if (!already_selected && !available &&
-        selected_new_pages >= max_new_pages && !allow_new_page_overflow) {
-      ++state.output.stats.page_aware_candidate_skips;
-      return false;
-    }
-
-    selected_index[index] = true;
-    batch.push_back(candidate);
-    if (selected_pages.insert(page_id).second) {
-      if (available) {
-        available_pages.insert(page_id);
-      } else {
-        ++selected_new_pages;
-      }
-    }
-    return true;
-  };
-
-  (void)select_index(0, false, true);
-  for (std::size_t i = 1; i < window.size() && batch.size() < batch_limit; ++i) {
-    const std::uint32_t page_id = window_pages[i];
-    if (selected_pages.find(page_id) != selected_pages.end() ||
-        window_available[i]) {
-      (void)select_index(i, true, false);
+    batch_pages.insert(page_id);
+    if (state.session.page_available_for_scheduling(page_id)) {
+      available_pages.insert(page_id);
     }
   }
-  for (std::size_t i = 1; i < window.size() && batch.size() < batch_limit; ++i) {
-    (void)select_index(i, true, false);
-  }
-  for (std::size_t i = 1; i < window.size() && batch.size() < batch_limit; ++i) {
-    (void)select_index(i, false, true);
-  }
-
-  std::unordered_set<std::uint32_t> distance_pages;
-  std::unordered_set<std::uint32_t> distance_available_pages;
-  distance_pages.reserve(batch_limit);
-  distance_available_pages.reserve(batch_limit);
-  for (std::size_t i = 0; i < batch_limit; ++i) {
-    const std::uint32_t page_id = window_pages[i];
-    distance_pages.insert(page_id);
-    if (window_available[i]) {
-      distance_available_pages.insert(page_id);
-    }
-  }
-  if (selected_pages.size() >= distance_pages.size()) {
-    state.output.stats.page_aware_candidate_skips = skips_before;
-    state.output.stats.page_aware_distance_slack_rejects =
-        slack_rejects_before;
-    ++state.output.stats.page_aware_distance_fallbacks;
-    state.output.stats.beam_unique_pages += distance_pages.size();
-    state.output.stats.beam_cached_or_pending_pages +=
-        distance_available_pages.size();
-    for (std::size_t i = batch_limit; i < window.size(); ++i) {
-      state.candidates.push(window[i]);
-    }
-    window.resize(batch_limit);
-    return window;
-  }
-
-  std::sort(batch.begin(), batch.end(),
-            [](const SearchResult& lhs, const SearchResult& rhs) {
-              if (lhs.distance == rhs.distance) {
-                return lhs.id < rhs.id;
-              }
-              return lhs.distance < rhs.distance;
-            });
-
-  state.output.stats.beam_unique_pages += selected_pages.size();
+  state.output.stats.beam_unique_pages += batch_pages.size();
   state.output.stats.beam_cached_or_pending_pages += available_pages.size();
-
-  for (std::size_t i = 0; i < window.size(); ++i) {
-    if (!selected_index[i]) {
-      state.candidates.push(window[i]);
-    }
-  }
-  return batch;
+  return window;
 }
 
 void PackedDiskGraphIndex::expand_candidate(SearchState& state,
@@ -1280,14 +1037,6 @@ void PackedDiskGraphIndex::expand_candidate(SearchState& state,
     new_neighbors.push_back(neighbor.id);
   }
 
-  if (state.config.next_hop_hints) {
-    if (!ranked_neighbors.empty()) {
-      state.record_next_hop_hints(ranked_neighbors);
-    } else {
-      state.record_next_hop_hints(new_neighbors);
-    }
-  }
-
   for (const auto& candidate : ranked_neighbors) {
     state.candidates.push(candidate);
     state.add_best(candidate);
@@ -1297,48 +1046,6 @@ void PackedDiskGraphIndex::expand_candidate(SearchState& state,
 
 void PackedDiskGraphIndex::expand_candidate_batch(
     SearchState& state, const std::vector<SearchResult>& batch) {
-  if (state.config.enable_progressive_frontier_prefetch) {
-    for (const auto& current : batch) {
-      const DiskNode& node = state.load_node(current.id);
-      (void)state.session.pin_page(state.session.page_for_node(current.id));
-      ++state.output.stats.expanded;
-
-      std::vector<std::uint32_t> new_neighbors;
-      new_neighbors.reserve(node.neighbors.size());
-      for (const auto neighbor_id : node.neighbors) {
-        if (neighbor_id >= metadata_.vector_count ||
-            !state.visited.insert(neighbor_id).second) {
-          continue;
-        }
-        new_neighbors.push_back(neighbor_id);
-      }
-      std::vector<SearchResult> ranked_neighbors =
-          state.rank_neighbors_by_distance(new_neighbors);
-      new_neighbors.clear();
-      new_neighbors.reserve(ranked_neighbors.size());
-      for (const auto& neighbor : ranked_neighbors) {
-        new_neighbors.push_back(neighbor.id);
-      }
-      if (state.config.next_hop_hints) {
-        if (!ranked_neighbors.empty()) {
-          state.record_next_hop_hints(ranked_neighbors);
-        } else {
-          state.record_next_hop_hints(new_neighbors);
-        }
-      }
-      for (const auto& candidate : ranked_neighbors) {
-        state.candidates.push(candidate);
-        state.add_best(candidate);
-      }
-      state.update_adaptive_stop();
-      if (state.output.stats.expanded < state.config.search_width &&
-          !state.candidates.empty() && !update_frontier(state)) {
-        maybe_issue_prefetch(state);
-      }
-    }
-    return;
-  }
-
   std::vector<std::vector<SearchResult>> ranked_neighbors_by_candidate;
   ranked_neighbors_by_candidate.reserve(batch.size());
 
@@ -1362,13 +1069,6 @@ void PackedDiskGraphIndex::expand_candidate_batch(
     new_neighbors.reserve(ranked_neighbors.size());
     for (const auto& neighbor : ranked_neighbors) {
       new_neighbors.push_back(neighbor.id);
-    }
-    if (state.config.next_hop_hints) {
-      if (!ranked_neighbors.empty()) {
-        state.record_next_hop_hints(ranked_neighbors);
-      } else {
-        state.record_next_hop_hints(new_neighbors);
-      }
     }
     ranked_neighbors_by_candidate.push_back(std::move(ranked_neighbors));
   }
@@ -1455,8 +1155,7 @@ DiskGraphSearchResult PackedDiskGraphIndex::search_one(
         std::max(output.stats.max_batch_size, batch.size());
 
     expand_candidate_batch(*state, batch);
-    if (!state->config.enable_progressive_frontier_prefetch &&
-        (!pre_beam_prefetch_enabled(state->config) || pre_beam_submitted == 0) &&
+    if ((!pre_beam_prefetch_enabled(state->config) || pre_beam_submitted == 0) &&
         output.stats.expanded < config.search_width &&
         !state->candidates.empty() && !update_frontier(*state)) {
       maybe_issue_prefetch(*state);

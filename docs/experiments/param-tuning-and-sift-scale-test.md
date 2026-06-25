@@ -39,7 +39,7 @@ docs/experiments/figures/parameter-matrix-sift1m/parameter_matrix_audit.md
 
 ```bash
 EXTRA_ARGS="--query-limit 100" \
-python3 scripts/linux/run_agent_aware_flow_sift.py \
+python3 scripts/run_agent_aware_sift.py \
   --date-tag matrix_sift1m_20260621 \
   --visualize-output-dir docs/experiments/figures/parameter-matrix-sift1m
 ```

@@ -2,7 +2,7 @@
 
 agent-aware 是一个面向大模型 Agent 长期记忆场景的向量检索 I/O 优化原型。项目目标是在全精度向量常驻 SSD、内存预算约束为数据集大小 10%-20% 的条件下，提供可复现的 Top-K 近似最近邻检索、缓存/预取/I/O 统计，以及动态写入路径验证。
 
-当前主线实现围绕 `agent_aware_flow` benchmark 展开：SIFT 或合成数据加载后，系统训练 PQ ADC 模型、构建或复用 Vamana packed graph index，再通过 Graph-Aware 2Q BufferPool、O_DIRECT/io_uring/pread 读路径和 XGBoost page-level 预取完成查询，并输出 JSON 结果。动态写入由 `bench_mixed_rw` 和 `StorageEngine`/`DynamicWriteManager` 验证，覆盖 WAL、MemTable、SSTable、flush、compaction 和 base/delta Top-K merge。
+当前主线实现围绕 `agent-aware` benchmark 展开：SIFT 或合成数据加载后，系统训练 PQ ADC 模型、构建或复用 Vamana packed graph index，再通过 Graph-Aware 2Q BufferPool、O_DIRECT/io_uring/pread 读路径和 XGBoost page-level 预取完成查询，并输出 JSON 结果。动态写入由 `bench_mixed_rw` 和 `StorageEngine`/`DynamicWriteManager` 验证，覆盖 WAL、MemTable、SSTable、flush、compaction 和 base/delta Top-K merge。
 
 核心结果：
 
@@ -33,7 +33,7 @@ agent-aware 是一个面向大模型 Agent 长期记忆场景的向量检索 I/O
 ├──────────────────────────────────────────────────────────────────────────────┤
 │                                                                              │
 │  Benchmark / Agent API                                                       │
-│  agent_aware_flow, bench_mixed_rw, StorageEngine                             │
+│  agent-aware, bench_mixed_rw, StorageEngine                                  │
 │                                │                                             │
 │                                ▼                                             │
 │  ┌────────────────────────────────────────────────────────────────────────┐  │
@@ -102,11 +102,11 @@ agent-aware/
 │   ├── storage/                           # 磁盘 record 与索引读写实现
 │   ├── dynamic/                           # 动态写入、flush、recovery、compaction
 │   ├── engine/                            # base graph + delta merge 查询引擎
-│   ├── sift_search_benchmark.cpp          # 构建为 agent_aware_flow，输出 SSD 检索 JSON
+│   ├── sift_search_benchmark.cpp          # 构建为 agent-aware，输出 SSD 检索 JSON
 │   └── mixed_rw_benchmark.cpp             # 构建为 bench_mixed_rw，输出混合读写 CSV/JSON
 ├── scripts/
 │   ├── run_sift1m_once.sh                 # SIFT1M 一键构建/运行/归档
-│   ├── run_agent_aware_flow_sift.py       # 参数矩阵实验运行器
+│   ├── run_agent_aware_sift.py            # 参数矩阵实验运行器
 │   └── plot_sift_matrix.py                # 参数矩阵结果汇总与图表生成
 └── docs/
     ├── README.md                          # 文档中心索引
@@ -163,7 +163,7 @@ cmake --build build -j"$(nproc)"
 构建验证：
 
 ```bash
-./build/agent_aware_flow --help
+./build/agent-aware --help
 ./build/bench_mixed_rw --help
 ```
 
@@ -182,7 +182,7 @@ cmake --build build -j"$(nproc)"
 开发和 CI 可使用 synthetic 数据：
 
 ```bash
-./build/agent_aware_flow \
+./build/agent-aware \
   --synthetic 1 \
   --base-limit 10000 \
   --query-limit 20 \
@@ -199,7 +199,7 @@ cmake --build build -j"$(nproc)"
 
 ###  SIFT 运行
 
-`scripts/run_sift1m_once.sh` 会构建 `agent_aware_flow`、执行 benchmark，并保存命令、stdout JSON、结果 JSON 和耗时信息。
+`scripts/run_sift1m_once.sh` 会构建 `agent-aware`、执行 benchmark，并保存命令、stdout JSON、结果 JSON 和耗时信息。
 
 第一次建图：
 
@@ -235,7 +235,7 @@ EXTRA_ARGS="--search-width 512 --beam-width 32 --io-depth 64" \
 SIFT1M 推荐入口：
 
 ```bash
-./build/agent_aware_flow \
+./build/agent-aware \
   --sift-dir data/sift \
   --base-limit 1000000 \
   --query-limit 100 \
@@ -382,7 +382,7 @@ done
   --output build/sift1m_dynamic_recall_immutable_view.json
 ```
 
-## `agent_aware_flow` 参数说明
+## `agent-aware` 参数说明
 
 布尔参数接受 `1/0`、`true/false`、`on/off`、`yes/no`。多数参数同时支持连字符和下划线别名，例如 `--search-width` 与 `--search_width` 等价。下表的默认值按当前 `Args` 结构体和实际 JSON 输出整理。
 
@@ -503,7 +503,7 @@ python3 scripts/replay_prefetch_policy.py \
 
 ```bash
 python3 scripts/run_prefetch_ab.py \
-  --binary ./build/agent_aware_flow \
+  --binary ./build/agent-aware \
   --model build/prefetch_xgboost.txt \
   --out-dir build/prefetch_ab \
   --search-width 350 \
@@ -565,7 +565,7 @@ scripts/run_prefetch_closed_loop_smoke.sh
 示例结果来自 `logs/sift_bench/sift1m_once_20260618-181128/result.json`。运行参数如下：
 
 ```bash
-./build/agent_aware_flow \
+./build/agent-aware \
   --sift-dir data/sift \
   --base-limit 1000000 \
   --query-limit 100 \

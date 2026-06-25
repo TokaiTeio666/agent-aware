@@ -14,7 +14,6 @@ namespace agent_aware {
 namespace {
 
 constexpr std::size_t kTopCandidateCutoff = 4;
-constexpr double kLargeRankBonus = 1000000.0;
 
 double finite_or_zero(double value) {
   return std::isfinite(value) ? value : 0.0;
@@ -148,7 +147,7 @@ struct PrefetchPlanner::PageCandidate {
 
 PrefetchPlanner::PrefetchPlanner(Config config)
     : config_(std::move(config)) {
-  if (config_.ranker == "xgboost" && config_.policy != "none") {
+  if (config_.policy == "xgboost") {
     if (config_.model_path.empty()) {
       throw std::runtime_error(
           "XGBoost prefetch policy requires --prefetch-model");
@@ -161,10 +160,6 @@ bool PrefetchPlanner::frontier_enabled() const {
   return config_.policy == "xgboost";
 }
 
-bool PrefetchPlanner::next_hop_enabled() const {
-  return config_.policy == "xgboost";
-}
-
 std::size_t PrefetchPlanner::width() const {
   return config_.prefetch_width;
 }
@@ -173,33 +168,8 @@ std::size_t PrefetchPlanner::depth() const {
   return config_.prefetch_depth;
 }
 
-std::size_t PrefetchPlanner::fallback_width() const {
-  return config_.fallback_width;
-}
-
 std::size_t PrefetchPlanner::top_k() const {
   return config_.prefetch_top_k == 0 ? width() : config_.prefetch_top_k;
-}
-
-PrefetchPlanner::Plan PrefetchPlanner::plan_next_hop(
-    const std::vector<std::uint32_t>& node_ids, std::size_t vector_count,
-    const PageForNode& page_for_node, const SkipNode& skip_node,
-    const PageAvailabilityFn& availability, PlanningContext context) {
-  Plan plan;
-  if (!next_hop_enabled() || top_k() == 0 || depth() == 0) {
-    return plan;
-  }
-
-  std::vector<std::uint32_t> page_ids;
-  page_ids.reserve(node_ids.size());
-  for (const auto node_id : node_ids) {
-    if (node_id >= vector_count || skip_node(node_id)) {
-      continue;
-    }
-    page_ids.push_back(page_for_node(node_id));
-  }
-  return plan_candidates(std::move(page_ids), availability, top_k(), false,
-                         context);
 }
 
 PrefetchPlanner::Plan PrefetchPlanner::plan_frontier(
@@ -222,87 +192,8 @@ PrefetchPlanner::Plan PrefetchPlanner::plan_candidates(
     return plan;
   }
 
-  if (!config_.coalesce_pages) {
-    return plan_ordered_candidates(std::move(page_ids), availability, limit,
-                                   context);
-  }
   return plan_coalesced_candidates(std::move(page_ids), availability, limit,
                                    allow_low_reuse_fallback, context);
-}
-
-PrefetchPlanner::Plan PrefetchPlanner::plan_ordered_candidates(
-    std::vector<std::uint32_t> page_ids,
-    const PageAvailabilityFn& availability, std::size_t max_pages,
-    PlanningContext context) {
-  PlanStats stats;
-  std::vector<PageCandidate> candidates;
-  candidates.reserve(page_ids.size());
-  std::unordered_set<std::uint32_t> emitted;
-  emitted.reserve(page_ids.size());
-
-  for (std::size_t rank = 0; rank < page_ids.size(); ++rank) {
-    const std::uint32_t page_id = page_ids[rank];
-    ++stats.page_requests_before_dedup;
-    ++stats.dedup_requests;
-
-    PageCandidate candidate;
-    candidate.feature.page_id = page_id;
-    candidate.feature.num_candidates_on_page = 1;
-    candidate.feature.min_pq_rank_on_page = rank;
-    candidate.feature.avg_pq_rank_on_page = static_cast<double>(rank);
-    candidate.feature.contains_top1_candidate = rank == 0;
-    candidate.feature.contains_topk_candidate = rank < kTopCandidateCutoff;
-    candidate.feature.search_step = context.search_step;
-    candidate.feature.visited_count = context.visited_count;
-    candidate.feature.frontier_size = context.frontier_size;
-    candidate.feature.result_size = context.result_size;
-    candidate.feature.current_candidate_distance =
-        context.current_candidate_distance;
-    candidate.feature.worst_result_distance = context.worst_result_distance;
-    candidate.feature.ef_search = context.ef_search;
-    candidate.feature.beam_width = context.beam_width;
-    candidate.feature.io_queue_depth = context.io_queue_depth;
-    candidate.feature.max_prefetch_inflight =
-        context.max_prefetch_inflight == 0
-            ? config_.max_prefetch_inflight
-            : context.max_prefetch_inflight;
-    candidate.feature.cache_pressure = context.cache_pressure;
-
-    const PageAvailability state = availability(page_id);
-    candidate.feature.is_cached = state.cached;
-    candidate.feature.is_inflight = state.pending;
-    candidate.feature.is_ready = state.ready;
-    candidate.feature.is_materialized = state.materialized;
-    if (state.cached || state.pending || state.ready || state.materialized) {
-      candidate.eligible = false;
-      ++stats.dedup_hits;
-      if (state.cached) {
-        ++stats.skip_cached;
-        candidate.feature.skip_reason = "cached";
-      } else if (state.pending) {
-        ++stats.skip_pending;
-        candidate.feature.skip_reason = "pending";
-      } else {
-        ++stats.skip_materialized;
-        candidate.feature.skip_reason = "materialized";
-      }
-    } else if (!emitted.insert(page_id).second) {
-      candidate.eligible = false;
-      ++stats.dedup_hits;
-      ++stats.skip_seen_before;
-      candidate.feature.skip_reason = "duplicate";
-    } else if (config_.dedup_pages &&
-               seen_pages_.find(page_id) != seen_pages_.end()) {
-      candidate.eligible = false;
-      ++stats.dedup_hits;
-      ++stats.skip_seen_before;
-      candidate.feature.skip_reason = "seen_before";
-    }
-    candidates.push_back(std::move(candidate));
-  }
-
-  return rank_and_throttle(std::move(candidates), max_pages, true, context,
-                           stats);
 }
 
 PrefetchPlanner::Plan PrefetchPlanner::plan_coalesced_candidates(
@@ -369,8 +260,7 @@ PrefetchPlanner::Plan PrefetchPlanner::plan_coalesced_candidates(
           ++stats.skip_materialized;
           aggregate.feature.skip_reason = "materialized";
         }
-      } else if (config_.dedup_pages &&
-                 seen_pages_.find(page_id) != seen_pages_.end()) {
+      } else if (seen_pages_.find(page_id) != seen_pages_.end()) {
         aggregate.eligible = false;
         ++stats.dedup_hits;
         ++stats.skip_seen_before;
@@ -420,13 +310,10 @@ PrefetchPlanner::Plan PrefetchPlanner::rank_and_throttle(
   }
 
   const std::size_t limit = max_pages == 0 ? top_k() : max_pages;
-  const std::size_t configured_min_reuse =
-      context.min_candidates_per_page == 0
-          ? config_.min_candidates_per_page
-          : context.min_candidates_per_page;
   const std::size_t min_reuse =
-      config_.coalesce_pages ? std::max<std::size_t>(1, configured_min_reuse)
-                             : std::size_t{1};
+      context.min_candidates_per_page == 0
+          ? std::max<std::size_t>(1, config_.min_candidates_per_page)
+          : std::max<std::size_t>(1, context.min_candidates_per_page);
   const std::size_t inflight_limit =
       context.max_prefetch_inflight == 0
           ? config_.max_prefetch_inflight
@@ -498,9 +385,7 @@ PrefetchPlanner::Plan PrefetchPlanner::rank_and_throttle(
 
     candidate.feature.selected = true;
     plan.pages.push_back(candidate.feature.page_id);
-    if (config_.dedup_pages) {
-      seen_pages_.insert(candidate.feature.page_id);
-    }
+    seen_pages_.insert(candidate.feature.page_id);
     plan.candidates.push_back(candidate.feature);
   }
 
@@ -520,9 +405,7 @@ PrefetchPlanner::Plan PrefetchPlanner::rank_and_throttle(
       if (stats.skip_low_page_reuse > 0) {
         --stats.skip_low_page_reuse;
       }
-      if (config_.dedup_pages) {
-        seen_pages_.insert(feature.page_id);
-      }
+      seen_pages_.insert(feature.page_id);
       break;
     }
   }
@@ -533,16 +416,7 @@ PrefetchPlanner::Plan PrefetchPlanner::rank_and_throttle(
 
 double PrefetchPlanner::score_candidate(
     const PrefetchFeature& feature) const {
-  if (config_.ranker == "xgboost") {
-    return score_xgboost_model(feature);
-  }
-
-  if (!config_.coalesce_pages) {
-    return -static_cast<double>(feature.min_pq_rank_on_page);
-  }
-  return static_cast<double>(feature.num_candidates_on_page) *
-             kLargeRankBonus -
-         static_cast<double>(feature.min_pq_rank_on_page);
+  return score_xgboost_model(feature);
 }
 
 void PrefetchPlanner::load_xgboost_model(const std::string& path) {
@@ -639,34 +513,6 @@ double PrefetchPlanner::score_xgboost_model(
     }
   }
   return score;
-}
-
-bool PrefetchPlanner::accept_page(std::uint32_t page_id,
-                                  const PageAvailabilityFn& availability,
-                                  PlanStats& stats) {
-  const PageAvailability state = availability(page_id);
-  const bool already_available =
-      state.cached || state.ready || state.pending || state.materialized;
-  if (!config_.dedup_pages) {
-    return !already_available;
-  }
-
-  ++stats.dedup_requests;
-  const bool seen_before = !seen_pages_.insert(page_id).second;
-  if (seen_before || already_available) {
-    ++stats.dedup_hits;
-    if (seen_before) {
-      ++stats.skip_seen_before;
-    } else if (state.cached) {
-      ++stats.skip_cached;
-    } else if (state.pending) {
-      ++stats.skip_pending;
-    } else {
-      ++stats.skip_materialized;
-    }
-    return false;
-  }
-  return true;
 }
 
 }  // namespace agent_aware

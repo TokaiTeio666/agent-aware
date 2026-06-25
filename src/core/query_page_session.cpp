@@ -24,7 +24,6 @@ bool session_async_prefetch_enabled(const PackedDiskGraphIndex& index,
   return status.io_uring_enabled && status.depth > 0 &&
          config.prefetch_depth > 0 &&
          (config.prefetch_width > 0 ||
-          config.prefetch_fallback_width > 0 ||
           config.prefetch_top_k > 0) &&
          config.prefetch_policy != "none";
 }
@@ -58,9 +57,7 @@ std::size_t session_prefetch_budget(const PackedDiskGraphIndex& index,
     return 0;
   }
   const std::size_t width =
-      std::max(std::max(config.prefetch_width,
-                        config.prefetch_fallback_width),
-               config.prefetch_top_k);
+      std::max(config.prefetch_width, config.prefetch_top_k);
   const std::size_t requested =
       width * std::max<std::size_t>(1, config.prefetch_depth);
   return std::min(requested, io_depth - demand_reserve);
@@ -73,12 +70,8 @@ PrefetchPlanner::Config session_prefetch_config(
   planner.policy = config.prefetch_policy;
   planner.prefetch_width = config.prefetch_width;
   planner.prefetch_depth = config.prefetch_depth;
-  planner.fallback_width = config.prefetch_fallback_width;
   planner.min_candidates_per_page =
       config.prefetch_min_candidates_per_page;
-  planner.dedup_pages = config.page_dedup;
-  planner.coalesce_pages = config.page_coalesce;
-  planner.ranker = config.prefetch_ranker;
   planner.model_path = config.prefetch_model_path;
   planner.prefetch_top_k = config.prefetch_top_k;
   planner.score_threshold = config.prefetch_score_threshold;
@@ -117,10 +110,6 @@ bool QueryPageSession::async_prefetch_enabled() const {
 
 bool QueryPageSession::frontier_prefetch_enabled() const {
   return async_prefetch_ && prefetch_planner_.frontier_enabled();
-}
-
-bool QueryPageSession::next_hop_prefetch_enabled() const {
-  return async_prefetch_ && prefetch_planner_.next_hop_enabled();
 }
 
 bool QueryPageSession::candidate_prefetch_enabled() const {
@@ -474,51 +463,6 @@ std::size_t QueryPageSession::submit_jit_prefetch(
   apply_prefetch_plan_stats(plan.stats);
   submit_prefetch_plan(plan.pages);
   return stats_.prefetch_submitted - submitted_before;
-}
-
-void QueryPageSession::submit_next_hop_prefetch(
-    const std::vector<std::uint32_t>& node_ids,
-    const std::unordered_set<std::uint32_t>& excluded_nodes,
-    const std::vector<std::uint32_t>& fallback_page_ids) {
-  if (!next_hop_prefetch_enabled() ||
-      (node_ids.empty() && fallback_page_ids.empty())) {
-    return;
-  }
-
-  auto context = prefetch_context();
-  context.search_step = prefetch_step_++;
-  const auto plan = prefetch_planner_.plan_next_hop(
-      node_ids, index_.metadata_.vector_count,
-      [this](std::uint32_t node_id) { return page_for_node(node_id); },
-      [this, &excluded_nodes](std::uint32_t node_id) {
-        return excluded_nodes.find(node_id) != excluded_nodes.end() ||
-               is_node_materialized(node_id);
-      },
-      [this](std::uint32_t page_id) {
-        return page_availability(page_id);
-      },
-      context);
-  record_prefetch_plan(plan, "post_expand");
-  apply_prefetch_plan_stats(plan.stats);
-  submit_prefetch_plan(plan.pages);
-
-  const std::size_t fallback_width = prefetch_planner_.fallback_width();
-  if (plan.pages.empty() && fallback_width > 0 &&
-      !fallback_page_ids.empty()) {
-    auto fallback_context = prefetch_context();
-    fallback_context.search_step = prefetch_step_++;
-    const auto fallback_plan = prefetch_planner_.plan_candidates(
-        fallback_page_ids,
-        [this](std::uint32_t page_id) {
-          return page_availability(page_id);
-        },
-        fallback_width,
-        false,
-        fallback_context);
-    record_prefetch_plan(fallback_plan, "post_expand_fallback");
-    apply_prefetch_plan_stats(fallback_plan.stats);
-    submit_prefetch_plan(fallback_plan.pages);
-  }
 }
 
 bool QueryPageSession::page_available_for_scheduling(

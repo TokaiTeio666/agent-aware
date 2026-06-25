@@ -506,7 +506,7 @@ xgboost + throttle
 
 1. `PrefetchPlanner` 已重写为 PQ+ADC page-level ranking pipeline：候选聚合、特征构造、XGBoost text-dump ranker 打分、top-K / score threshold / max inflight throttle、再提交 async prefetch。
 2. `QueryPageSession` 已记录 `prefetch_ready_hit`、`prefetch_pending_hit`、`prefetch_unused`（JSON 中同时保留 `prefetch_only_pages`）、`prefetch_evicted_before_use`、threshold / inflight skip 等预取统计。
-3. `agent_aware_flow` 已收敛到 `--prefetch-policy none|xgboost`，并支持 `--prefetch-model`、`--prefetch-top-k`、`--prefetch-score-threshold`、`--prefetch-max-inflight`、`--prefetch-trace`。
+3. `agent-aware` 已收敛到 `--prefetch-policy none|xgboost`，并支持 `--prefetch-model`、`--prefetch-top-k`、`--prefetch-score-threshold`、`--prefetch-max-inflight`、`--prefetch-trace`。
 4. `--prefetch-trace <path>` 已输出 group-wise CSV，并在 query 结束时补齐 `was_prefetched`、`prefetch_submit_time`、`prefetch_ready_time`、`demand_time`、`was_ready_before_demand`、`label`。
 
 补充说明：
