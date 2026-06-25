@@ -1,5 +1,9 @@
 # XGBoost 预取提前触发点方案
 
+> 关联文档：主计划 `PROJECT_PLAN.md` §6.8、预取排序 `docs/design/XGBOOST_PREFETCH_PLAN.md`、I/O 尾延迟 `docs/roadmap/recall-to-io-tail-latency-plan.md`
+>
+> 最后更新：2026-06-25
+
 ## 1. 背景
 
 当前预取链路已经收敛到单路线：
@@ -343,7 +347,7 @@ lead_steps
 
 ## 9. 实施阶段
 
-### P0：只做 T1 pre-beam 触发（已完成）
+### P0：只做 T1 pre-beam 触发（✅ 已完成，2026-06-25）
 
 改动：
 
@@ -369,6 +373,14 @@ trace trigger = pre_beam
 top_k=1/max_inflight=1 时 ready_hit_rate > pending_hit_rate
 top_k=2/max_inflight=2 会重新拉高 pending 和尾延迟
 ```
+
+已落地代码位置：
+
+| 文件 | 内容 |
+|---|---|
+| `src/graph/disk_graph_index.cpp` | `pre_beam_prefetch_enabled()`、pre-beam 触发逻辑、`submit_jit_prefetch` 调用 |
+| `include/core/query_page_session.h` | `submit_jit_prefetch(candidate_pages, "pre_beam")` 接口 |
+| `src/sift_search_benchmark.cpp` | `--prefetch-early-trigger` CLI 参数解析、校验、JSON 输出 |
 
 ### P1：加入 T2 post-expand lookahead
 

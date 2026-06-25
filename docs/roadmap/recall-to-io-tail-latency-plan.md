@@ -1,5 +1,9 @@
 # Recall 达标后转向 I/O 放大与尾延迟优化计划
 
+> 关联文档：主计划 `PROJECT_PLAN.md` §8.1 P8、预取排序 `docs/design/XGBOOST_PREFETCH_PLAN.md`、提前触发 `docs/design/07-prefetch-early-trigger-plan.md`、答辩补强 `docs/roadmap/defense-gap-closure-plan.md`
+>
+> 最后更新：2026-06-25
+
 ## 0. 背景与目标
 
 当前项目已经具备 SIFT1M SSD packed graph 查询、混合读写、动态 delta、读路径 breakdown、cache / prefetch / io_uring 等基础能力。下一阶段的目标不再是单纯继续拉高 Recall，而是在固定 Recall 下限的前提下，系统性降低：

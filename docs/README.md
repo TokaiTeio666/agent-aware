@@ -32,12 +32,13 @@
 | 12 | `docs/design/async-prefetch.md` | 已接入主路径 | `AsyncPageReader`、`QueryPageSession`、io_uring fallback、PQ+ADC/XGBoost 预取提交底座 |
 | 13 | `docs/design/beam-width-io-uring.md` | 已进入 benchmark | beam batch、批量读取、I/O 统计字段和 fallback 语义 |
 | 14 | `docs/design/XGBOOST_PREFETCH_PLAN.md` | 已落地闭环 | PQ+ADC 候选生成、page-level 聚合、XGBoost 预取收益打分、top-K/threshold/io_depth 限流、ready/pending/unused 评估、offline replay 和 no-prefetch/xgboost online A/B |
-| 15 | `docs/design/07-prefetch-early-trigger-plan.md` | 待实施方案 | pre-beam / post-expand / entry warmup / rerank lookahead 提前触发点、trace 字段、限流和验收标准 |
+| 15 | `docs/design/07-prefetch-early-trigger-plan.md` | P0（pre-beam）已落地 | pre-beam / post-expand / entry warmup / rerank lookahead 提前触发点、trace 字段、限流和验收标准 |
+| 16 | `docs/roadmap/recall-to-io-tail-latency-plan.md` | 待推进 | I/O 放大与尾延迟分阶段优化：候选裁剪、数据布局、缓存治理、自适应预算、P99/P999 治理 |
+| 17 | `docs/roadmap/defense-gap-closure-plan.md` | 待推进 | 答辩前三项补强：参数矩阵曲线、真实 NVMe 复测、delta 退化治理 |
 | 20 | `docs/design/dynamic-write.md` | 已落地最小闭环 | WAL/MemTable/SSTable/manifest/compaction/recovery 与 mixed RW benchmark |
 | 21 | `docs/roadmap/dynamic-write-task-breakdown.md` | T1-T5 已有实现 | 动态写入拆分任务和验收清单，异步 flush queue 仍可推进 |
 | 22 | `docs/experiments/high-concurrency-mixed-rw.md` | 已完成可展示版 | 高并发 mixed RW、动态 Recall、base/delta merge、一致性策略 |
 | 23 | `docs/roadmap/next-sift1m-mixed-rw-optimization.md` | 下一阶段计划 | SIFT1M mixed RW 后续优化项、对照实验和验收标准 |
-| 24 | `docs/roadmap/defense-gap-closure-plan.md` | 答辩前补强计划 | 参数矩阵、真实 NVMe/比赛环境复测、delta 查询退化优化 |
 | 30 | `docs/experiments/param-tuning-and-sift-scale-test.md` | 已完成关键 evidence | 参数调优、SIFT 规模化测试矩阵和可复现实验计划 |
 | 31 | `docs/design/fresh-streaming-ann.md` | 创新路线归档 | LSM delta + immutable read view 已完成，Delta memory graph 和周期性 rebuild 为后续路线 |
 
@@ -57,8 +58,10 @@
 | --- | --- | --- |
 | P0 | 保持当前 immutable read view mixed RW baseline 可复现，答辩时先展示 SIFT1M 证据 | `docs/experiments/sift1m-mixed-rw-immutable-view.md` |
 | P0 | 用评分矩阵组织答辩，避免只讲实现不讲得分点 | `docs/competition/scoring-and-defense.md` |
+| P0 | XGBoost 预取排序 + early trigger 作为创新亮点展示 | `docs/design/XGBOOST_PREFETCH_PLAN.md`、`docs/design/07-prefetch-early-trigger-plan.md` |
 | P1 | 扩展参数矩阵，输出 Recall/QPS/延迟/I/O 的稳定曲线 | `docs/experiments/param-tuning-and-sift-scale-test.md` |
 | P1 | 按答辩前三项缺口补强：参数曲线、真实 NVMe 复测、delta 退化治理 | `docs/roadmap/defense-gap-closure-plan.md` |
 | P1 | 将 flush 拆成真正后台队列，降低写路径同步停顿 | `docs/experiments/high-concurrency-mixed-rw.md` |
+| P2 | I/O 放大与尾延迟系统优化：候选裁剪、缓存治理、自适应预算 | `docs/roadmap/recall-to-io-tail-latency-plan.md` |
 | P2 | 实现 Delta memory graph，提高新写入向量检索质量 | `docs/design/fresh-streaming-ann.md` |
 | P2 | 周期性 rebuild packed graph，将 delta 批量吸收到 base | `docs/roadmap/next-sift1m-mixed-rw-optimization.md` |

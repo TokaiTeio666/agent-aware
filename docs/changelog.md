@@ -1,5 +1,22 @@
 # Version Notes
 
+## 2026-06-25：Plan 文档体系完善
+
+### 目标
+
+统一五份 plan 文档的交叉引用、更新实现状态标记、补充新落地能力（XGBoost 预取排序、early trigger）到主计划。
+
+### 文档变化
+
+| 文档 | 变化 |
+| --- | --- |
+| `PROJECT_PLAN.md` | 更新实现状态至 2026-06-25；新增 XGBoost 预取排序（§6.7）和 early trigger（§6.8）模块方案；阶段划分增加 P7/P8/P9 并标注完成状态；创新点新增 Immutable Read View、XGBoost ranking、early trigger；风险新增 ML 相关项；新增 §16 专项计划文档索引 |
+| `docs/design/XGBOOST_PREFETCH_PLAN.md` | 新增关联文档头；更新落地状态至 2026-06-25；P0-P3 标注已完成、P4 标注进行中 |
+| `docs/design/07-prefetch-early-trigger-plan.md` | 新增关联文档头和更新日期；P0 补充已落地代码位置表 |
+| `docs/roadmap/recall-to-io-tail-latency-plan.md` | 新增关联文档头和更新日期 |
+| `docs/roadmap/defense-gap-closure-plan.md` | 新增关联文档头和更新日期；更新当前背景反映 XGBoost/early trigger 已落地；优先级表增加说明 |
+| `docs/README.md` | 新增 recall-to-io-tail-latency-plan 和 defense-gap-closure-plan 索引条目；更新 early-trigger 状态为 P0 已落地 |
+
 ## 2026-06-21：Plan/README 文档体系整理
 
 ### 目标

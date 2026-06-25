@@ -1,5 +1,7 @@
 # 学习型预取排序路线计划
 
+> 关联文档：主计划 `PROJECT_PLAN.md` §6.7、提前触发 `docs/design/07-prefetch-early-trigger-plan.md`、I/O 尾延迟 `docs/roadmap/recall-to-io-tail-latency-plan.md`
+
 ---
 
 ## 1. 核心路线
@@ -500,7 +502,7 @@ xgboost + throttle
 
 ## 16. 实施阶段
 
-### 当前落地状态（2026-06）
+### 当前落地状态（2026-06-25）
 
 已完成：
 
@@ -508,6 +510,7 @@ xgboost + throttle
 2. `QueryPageSession` 已记录 `prefetch_ready_hit`、`prefetch_pending_hit`、`prefetch_unused`（JSON 中同时保留 `prefetch_only_pages`）、`prefetch_evicted_before_use`、threshold / inflight skip 等预取统计。
 3. `agent-aware` 已收敛到 `--prefetch-policy none|xgboost`，并支持 `--prefetch-model`、`--prefetch-top-k`、`--prefetch-score-threshold`、`--prefetch-max-inflight`、`--prefetch-trace`。
 4. `--prefetch-trace <path>` 已输出 group-wise CSV，并在 query 结束时补齐 `was_prefetched`、`prefetch_submit_time`、`prefetch_ready_time`、`demand_time`、`was_ready_before_demand`、`label`。
+5. Early trigger 已落地 P0（pre-beam），通过 `--prefetch-early-trigger pre-beam` 在 beam selection 前提前触发预取，显著提升 `ready_before_demand` 比例（详见 `docs/design/07-prefetch-early-trigger-plan.md`）。
 
 补充说明：
 
@@ -516,7 +519,7 @@ xgboost + throttle
 3. `scripts/run_prefetch_closed_loop_smoke.sh` 已提供 PQ+ADC trace -> replay/train -> xgboost online 的闭环 smoke。
 4. `candidate_node_id` 在当前 trace 中保持空列，训练第一版以 page-level 特征为主。
 
-### P0：补齐观测指标
+### P0：补齐观测指标 ✅ 已完成
 
 目标：
 
@@ -539,7 +542,7 @@ xgboost + throttle
 benchmark 能输出完整 prefetch stats。
 ```
 
-### P1：Trace 数据集
+### P1：Trace 数据集 ✅ 已完成
 
 目标：
 
@@ -560,7 +563,7 @@ benchmark 能输出完整 prefetch stats。
 能生成可训练的 ranking dataset。
 ```
 
-### P2：离线 Ranking 模型
+### P2：离线 Ranking 模型 ✅ 已完成
 
 目标：
 
@@ -582,7 +585,7 @@ xgboost replay 与 oracle gap 可解释；
 predicted unused_rate / pending_rate 不高于 no-throttle 版本。
 ```
 
-### P3：C++ 在线接入
+### P3：C++ 在线接入 ✅ 已完成
 
 目标：
 
@@ -607,7 +610,7 @@ predicted unused_rate / pending_rate 不高于 no-throttle 版本。
 Recall@10 不下降。
 ```
 
-### P4：在线 A/B
+### P4：在线 A/B 🔄 进行中
 
 目标：
 

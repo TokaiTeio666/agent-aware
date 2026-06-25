@@ -1,8 +1,12 @@
 # 答辩前关键缺口补强计划
 
+> 关联文档：主计划 `PROJECT_PLAN.md` §8.1 P9、I/O 尾延迟 `docs/roadmap/recall-to-io-tail-latency-plan.md`、预取排序 `docs/design/XGBOOST_PREFETCH_PLAN.md`
+>
+> 最后更新：2026-06-25
+
 ## 当前背景
 
-截至 2026-06-21，项目已经具备 SIFT1M SSD packed Vamana 主路径、Graph-Aware 2Q cache、io_uring fallback、WAL/MemTable/SSTable 动态写入、immutable read view、mixed RW benchmark 和动态 Recall evidence。当前最需要补强的不是再铺很多新功能，而是把结果从“单点可展示”推进到“曲线可解释、环境可信、大 delta 不退化”。
+截至 2026-06-25，项目已经具备 SIFT1M SSD packed Vamana 主路径、Graph-Aware 2Q cache、io_uring fallback、WAL/MemTable/SSTable 动态写入、immutable read view、XGBoost 学习型预取排序、early trigger 提前触发、mixed RW benchmark 和动态 Recall evidence。当前最需要补强的不是再铺很多新功能，而是把结果从”单点可展示”推进到”曲线可解释、环境可信、大 delta 不退化”。
 
 本计划聚焦三件最需要补的事：
 
@@ -18,6 +22,8 @@
 | P0 | 真实 NVMe/比赛环境复测 | 证明结果不依赖 WSL 或虚拟化 | 环境记录、三轮复现实验、主路径和 mixed RW JSON |
 | P1 | delta 增长压力测试 | 找到 linear scan 的退化阈值 | delta 1k/10k/50k/100k 对照表 |
 | P1/P2 | delta memory graph 或分块 immutable delta | 降低大 delta 下 `delta_search_ms` 和 read P95 | 新增实现、单测、mixed RW 对照实验 |
+
+> 注：XGBoost 预取排序和 early trigger 提前触发已落地闭环（详见 `docs/design/XGBOOST_PREFETCH_PLAN.md` 和 `docs/design/07-prefetch-early-trigger-plan.md`），本计划不再重复覆盖预取路线。
 
 ## Phase 1：参数矩阵与曲线
 
