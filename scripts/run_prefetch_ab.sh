@@ -8,7 +8,9 @@ cd "$ROOT"
 # Config — 按需修改
 # ============================================================
 INDEX="${1:-indexes/sift.idx}"
-MODEL="${2:-build/prefetch_closed_loop_xgboost.txt}"
+MODEL="${2:-build/xgboost_model.txt}"
+QUERY_OFFSET="${3:-0}"
+QUERY_LIMIT="${4:-1000}"
 BASELINE_JSON="build/prefetch_ab_baseline.json"
 XGBOOST_JSON="build/prefetch_ab_xgboost.json"
 TRACE="build/prefetch_ab_trace.csv"
@@ -28,18 +30,18 @@ PQ_ITERATIONS=8
 
 # ---------- I/O ----------
 IO_MODE=io_uring
-IO_DEPTH=32
+IO_DEPTH=64
 IO_BATCH=16
 
 # ---------- Cache ----------
-CACHE_PAGES=0          # 0 = auto from memory budget
+CACHE_PAGES=15000      # ~60MB / 4096B pages ≈ 15K pages
 MEMORY_BUDGET=0.20
 
 # ---------- Prefetch ----------
-PREFETCH_WIDTH=4
-PREFETCH_TOPK=4
-PREFETCH_MAX_INFLIGHT=0
-PREFETCH_EARLY_TRIGGER=pre-beam
+PREFETCH_WIDTH=16
+PREFETCH_TOPK=16
+PREFETCH_MAX_INFLIGHT=8
+PREFETCH_EARLY_TRIGGER=rerank
 
 # ============================================================
 rm -f "$BASELINE_JSON" "$XGBOOST_JSON"
@@ -63,6 +65,8 @@ COMMON_ARGS=(
   --io-batch "$IO_BATCH"
   --cache-pages "$CACHE_PAGES"
   --memory-budget-ratio "$MEMORY_BUDGET"
+  --query-offset "$QUERY_OFFSET"
+  --query-limit "$QUERY_LIMIT"
 )
 
 echo "=== [1/2] BASELINE (zero prefetch) ==="
@@ -96,8 +100,10 @@ echo "=== COMPARISON ==="
 python3 - <<'PY'
 import json
 
-baseline = json.loads(open("build/prefetch_ab_baseline.json"))
-xgboost  = json.loads(open("build/prefetch_ab_xgboost.json"))
+with open("build/prefetch_ab_baseline.json") as f:
+    baseline = json.load(f)
+with open("build/prefetch_ab_xgboost.json") as f:
+    xgboost = json.load(f)
 
 bs = baseline["stats"]
 xg = xgboost["stats"]
@@ -116,25 +122,23 @@ def row(label, key, unit=""):
 
 print(f"\n{'Metric':<35} {'baseline':>14} {'xgboost':>14}")
 print("-" * 70)
-row("avg_latency_ms",     "avg_latency_ms",       "ms")
-row("p50_latency_ms",     "p50_latency_ms",       "ms")
-row("p99_latency_ms",     "p99_latency_ms",       "ms")
+row("avg_latency_ms",     "avg_query_latency_ms",       "ms")
 row("qps",                "qps")
-row("recall@10",           "recall_at_10")
-row("page_reads",          "page_reads")
-row("demand_reads",        "demand_reads")
-row("prefetch_submitted",  "prefetch_submitted")
-row("prefetch_ready_hit",  "prefetch_ready_hit")
-row("prefetch_useful",     "prefetch_useful_pages")
-row("prefetch_wasted",     "prefetch_wasted_pages")
+row("recall@10",           "recall_at_k")
+row("page_reads",          "page_reads",   " (stats)")
+row("demand_reads",        "demand_reads", " (stats)")
+row("prefetch_submitted",  "prefetch_submitted", " (stats)")
+row("prefetch_ready_hit",  "prefetch_ready_hit",  " (stats)")
+row("prefetch_useful",     "prefetch_useful_pages", " (stats)")
+row("prefetch_wasted",     "prefetch_wasted_pages", " (stats)")
 row("cache_hit_rate",      "cache_hit_rate")
 print()
 
 # 关键结论
-lat_b = baseline.get("avg_latency_ms", 0)
-lat_x = xgboost.get("avg_latency_ms", 0)
-recall_b = baseline.get("recall_at_10", 0)
-recall_x = xgboost.get("recall_at_10", 0)
+lat_b = baseline.get("avg_query_latency_ms", 0)
+lat_x = xgboost.get("avg_query_latency_ms", 0)
+recall_b = baseline.get("recall_at_k", 0)
+recall_x = xgboost.get("recall_at_k", 0)
 
 print("Summary:")
 if lat_b > 0:

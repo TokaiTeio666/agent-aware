@@ -147,11 +147,8 @@ struct PrefetchPlanner::PageCandidate {
 
 PrefetchPlanner::PrefetchPlanner(Config config)
     : config_(std::move(config)) {
-  if (config_.policy == "xgboost") {
-    if (config_.model_path.empty()) {
-      throw std::runtime_error(
-          "XGBoost prefetch policy requires --prefetch-model");
-    }
+  // Agent-Mem-IO 风格：模型可选，submit_pages_direct 绕过 planner
+  if (config_.policy == "xgboost" && !config_.model_path.empty()) {
     load_xgboost_model(config_.model_path);
   }
 }

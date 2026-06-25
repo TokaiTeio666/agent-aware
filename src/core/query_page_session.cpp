@@ -21,10 +21,9 @@ std::mutex& prefetch_trace_mutex() {
 bool session_async_prefetch_enabled(const PackedDiskGraphIndex& index,
                                     const DiskGraphSearchConfig& config) {
   const DiskGraphIoStatus& status = index.io_status();
+  // Agent-Mem-IO 风格：policy=xgboost 表示启用预取，不依赖 width/top_k
   return status.io_uring_enabled && status.depth > 0 &&
          config.prefetch_depth > 0 &&
-         (config.prefetch_width > 0 ||
-          config.prefetch_top_k > 0) &&
          config.prefetch_policy != "none";
 }
 
@@ -56,8 +55,11 @@ std::size_t session_prefetch_budget(const PackedDiskGraphIndex& index,
   if (io_depth <= demand_reserve) {
     return 0;
   }
-  const std::size_t width =
-      std::max(config.prefetch_width, config.prefetch_top_k);
+  // Agent-Mem-IO 风格：width/top_k=0 时用 io_depth/4 作为默认预算
+  std::size_t width = std::max(config.prefetch_width, config.prefetch_top_k);
+  if (width == 0) {
+    width = std::max<std::size_t>(1, io_depth / 4);
+  }
   const std::size_t requested =
       width * std::max<std::size_t>(1, config.prefetch_depth);
   return std::min(requested, io_depth - demand_reserve);
@@ -421,6 +423,16 @@ void QueryPageSession::submit_prefetch(
   record_prefetch_plan(plan, "manual");
   apply_prefetch_plan_stats(plan.stats);
   submit_prefetch_plan(plan.pages);
+}
+
+void QueryPageSession::submit_pages_direct(
+    const std::vector<std::uint32_t>& page_ids) {
+  // Agent-Mem-IO 风格：直接提交，不做 XGBoost 评分
+  // 调用侧已用 PQ 距离排好序 + 去重 + 去已缓存
+  if (!async_prefetch_ || page_ids.empty()) {
+    return;
+  }
+  submit_prefetch_plan(page_ids);
 }
 
 void QueryPageSession::submit_candidate_prefetch(

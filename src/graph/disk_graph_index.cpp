@@ -720,7 +720,6 @@ PackedDiskGraphIndex::initialize_search_state(
     state->candidates.push(result);
     state->add_best(result);
   }
-  (void)maybe_issue_entry_warmup(*state);
   return state;
 }
 
@@ -1049,6 +1048,13 @@ void PackedDiskGraphIndex::expand_candidate_batch(
   std::vector<std::vector<SearchResult>> ranked_neighbors_by_candidate;
   ranked_neighbors_by_candidate.reserve(batch.size());
 
+  // Agent-Mem-IO: 每批预取 beam_width*2 个 PQ-top 邻居页面
+  const std::size_t beam =
+      state.config.beam_width == 0 ? state.config.search_width
+                                   : state.config.beam_width;
+  const std::size_t prefetch_count = std::max<std::size_t>(1, beam * 2);
+  std::unordered_set<std::uint32_t> prefetch_pages;
+
   for (const auto& current : batch) {
     const DiskNode& node = state.load_node(current.id);
     (void)state.session.pin_page(state.session.page_for_node(current.id));
@@ -1063,16 +1069,36 @@ void PackedDiskGraphIndex::expand_candidate_batch(
       }
       new_neighbors.push_back(neighbor_id);
     }
+
     std::vector<SearchResult> ranked_neighbors =
         state.rank_neighbors_by_distance(new_neighbors);
-    new_neighbors.clear();
-    new_neighbors.reserve(ranked_neighbors.size());
-    for (const auto& neighbor : ranked_neighbors) {
-      new_neighbors.push_back(neighbor.id);
+
+    for (std::size_t j = 0;
+         j < ranked_neighbors.size() && prefetch_pages.size() < prefetch_count;
+         ++j) {
+      const std::uint32_t page_id =
+          state.session.page_for_node(ranked_neighbors[j].id);
+      if (!state.session.page_available_for_scheduling(page_id)) {
+        prefetch_pages.insert(page_id);
+      }
     }
+
     ranked_neighbors_by_candidate.push_back(std::move(ranked_neighbors));
   }
 
+  if (state.session.async_prefetch_enabled() && !prefetch_pages.empty()) {
+    std::vector<std::uint32_t> pages(prefetch_pages.begin(),
+                                     prefetch_pages.end());
+    if (state.session.has_prefetch_model()) {
+      // ML 路径：XGBoost 二次精选（页面聚合 + 特征打分 + 限流）
+      state.session.submit_candidate_prefetch(std::move(pages), "neighbor_xgb");
+    } else {
+      // 纯 PQ 路径：直接提交（Agent-Mem-IO 风格，已验证超过 baseline）
+      state.session.submit_pages_direct(std::move(pages));
+    }
+  }
+
+  // 将 PQ 排序后的邻居推入候选堆（CPU 计算已在 rank_neighbors_by_distance 中完成）
   for (const auto& ranked_neighbors : ranked_neighbors_by_candidate) {
     for (const auto& candidate : ranked_neighbors) {
       state.candidates.push(candidate);
@@ -1131,11 +1157,10 @@ DiskGraphSearchResult PackedDiskGraphIndex::search_one(
   auto state = initialize_search_state(query, config, output);
   while (!state->candidates.empty() &&
          output.stats.expanded < config.search_width) {
+    // 收割上一轮 expand 期间完成的预取
     if (state->session.async_prefetch_enabled()) {
       state->session.drain_ready_pages();
     }
-    const std::size_t pre_beam_submitted =
-        maybe_issue_jit_prefetch(*state, effective_beam_width);
     std::vector<SearchResult> batch =
         select_candidate_batch(*state, effective_beam_width);
     if (batch.empty()) {
@@ -1147,6 +1172,7 @@ DiskGraphSearchResult PackedDiskGraphIndex::search_one(
     for (const auto& candidate : batch) {
       page_ids.push_back(state->session.page_for_node(candidate.id));
     }
+    // 加载当前 batch：上一轮 expand 结束时提交的预取 I/O 在此完成 → ready_hit
     state->session.ensure_pages_loaded_batch(page_ids);
 
     ++output.stats.batch_count;
@@ -1154,12 +1180,9 @@ DiskGraphSearchResult PackedDiskGraphIndex::search_one(
     output.stats.max_batch_size =
         std::max(output.stats.max_batch_size, batch.size());
 
+    // expand：加载邻居 → PQ ADC 排序 → 收集 top beam_width*2 页面 → 提交预取
+    // 滚动流水线：下一轮 load_pages 时 I/O 已完成
     expand_candidate_batch(*state, batch);
-    if ((!pre_beam_prefetch_enabled(state->config) || pre_beam_submitted == 0) &&
-        output.stats.expanded < config.search_width &&
-        !state->candidates.empty() && !update_frontier(*state)) {
-      maybe_issue_prefetch(*state);
-    }
   }
   finalize_topk(*state);
   return output;

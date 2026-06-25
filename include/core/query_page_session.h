@@ -49,6 +49,9 @@ class QueryPageSession {
       const std::vector<std::uint32_t>& page_ids,
       const std::string& trigger = "pre_beam",
       std::size_t min_candidates_per_page = 0);
+  // 直接提交页面预取，绕过 XGBoost planner（Agent-Mem-IO 风格）
+  void submit_pages_direct(const std::vector<std::uint32_t>& page_ids);
+  bool has_prefetch_model() const { return prefetch_planner_.has_model(); }
   void drain_ready_pages();
 
   bool page_available_for_scheduling(std::uint32_t page_id) const;

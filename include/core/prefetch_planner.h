@@ -103,6 +103,7 @@ class PrefetchPlanner {
   explicit PrefetchPlanner(Config config);
 
   bool frontier_enabled() const;
+  bool has_model() const { return !xgboost_trees_.empty(); }
   std::size_t width() const;
   std::size_t depth() const;
   std::size_t top_k() const;
