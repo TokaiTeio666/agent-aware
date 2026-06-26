@@ -1,6 +1,8 @@
-# agent-aware
+# Agent-aware
 
-agent-aware 是一个面向大模型 Agent 长期记忆场景的向量检索 I/O 优化原型。项目目标是在全精度向量常驻 SSD、内存预算约束为数据集大小 10%-20% 的条件下，提供可复现的 Top-K 近似最近邻检索、缓存/预取/I/O 统计，以及动态写入路径验证。
+通过网盘分享的文件：项目汇报.mp4 链接: https://pan.baidu.com/s/1rGpnNQwH75amCfqMsjau5g?pwd=rrxe 提取码: rrxe
+
+Agent-aware 是一个面向大模型 Agent 长期记忆场景的向量检索 I/O 优化原型。项目目标是在全精度向量常驻 SSD、内存预算约束为数据集大小 10%-20% 的条件下，提供可复现的 Top-K 近似最近邻检索、缓存/预取/I/O 统计，以及动态写入路径验证。
 
 当前主线实现围绕 `agent-aware` benchmark 展开：SIFT 或合成数据加载后，系统训练 PQ ADC 模型、构建或复用 Vamana packed graph index，再通过 Graph-Aware 2Q BufferPool、io_uring 异步 I/O 和**图邻居 + 滚动流水线预取**（参考 Agent-Mem-IO 架构）完成查询，并输出 JSON 结果。预取支持两条路径：纯 PQ 直接提交（已验证超过 baseline），以及可选的 XGBoost 二次精排（需训练模型）。动态写入由 `bench_mixed_rw` 和 `StorageEngine`/`DynamicWriteManager` 验证，覆盖 WAL、MemTable、SSTable、flush、compaction 和 base/delta Top-K merge。
 
