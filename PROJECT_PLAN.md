@@ -1,13 +1,12 @@
-# agent-aware 项目计划书
+# Agent-aware 项目计划书
 
-> 项目名称：agent-aware  
 > 项目说明：面向 Agent 记忆的向量检索系统 I/O 优化  
 > 英文说明：I/O Optimization of Vector Retrieval Systems for Agent Memory  
 > 适用赛题：2026 年全国大学生计算机系统能力大赛操作系统设计赛 OS 功能挑战赛道  
-> 编写日期：2026-06-21  
-> 最后更新：2026-06-25
+> 编写日期：2026-05-21  
+> 最后更新：2026-06-29
 
-## 当前实现状态（2026-06-25）
+## 当前实现状态（2026-06-29）
 
 项目已从最初计划推进到 SIFT1M 全链路可展示版本：SSD packed Vamana 主路径、PQ/ADC、Graph-Aware cache 统计、io_uring/pread fallback、XGBoost 学习型预取排序、early trigger 提前触发、LSM 动态写入、manifest/compaction/recovery、真实并发 mixed RW benchmark 和动态 Recall 抽样均已形成闭环。
 
@@ -18,16 +17,14 @@
 | 混合读写 | 已完成最小闭环 | 4 reader + 1 writer 下 `23.50~28.86 read_qps`，`217~221 write_qps` |
 | 动态写入一致性 | 已完成基础版 | WAL/MemTable/SSTable/manifest/compaction/recovery 均有测试覆盖 |
 | 读侧锁优化 | 已完成 | `DynamicWriteManager` 使用 immutable read view 发布，`latest_record_lookup` P95 从秒级降至约 0.07ms |
-| XGBoost 预取排序 | 已完成闭环 | PQ+ADC 候选聚合、page-level 特征构造、XGBoost text-dump 推理、top-K/threshold/inflight 限流、trace 采集、离线 replay、在线 A/B（详见 `docs/design/XGBOOST_PREFETCH_PLAN.md`） |
+| XGBoost 预取排序 | 已完成闭环 | PQ+ADC 候选聚合、page-level 特征构造、XGBoost text-dump 推理、top-K/threshold/inflight 限流、trace 采集、离线 replay、在线 A/B（详见 `docs/design/09-XGBOOST_PREFETCH_PLAN.md`） |
 | Early trigger 提前触发 | 已完成 P0（pre-beam） | `--prefetch-early-trigger pre-beam` 在 beam selection 前触发预取，ready_hit_rate 提升、pending_hit_rate 下降（详见 `docs/design/07-prefetch-early-trigger-plan.md`） |
-| I/O 尾延迟量化 | 待推进 | reads/query、bytes/query、候选放大等指标补全和分阶段优化（详见 `docs/roadmap/recall-to-io-tail-latency-plan.md`） |
-| 后续重点 | 待推进 | 异步 flush queue、Delta memory graph、周期性 rebuild packed graph、系统参数矩阵、真实 NVMe 复测（详见 `docs/roadmap/defense-gap-closure-plan.md`） |
-
-详细阶段计划和结果文档统一维护在 `docs/INDEX.md`，评分映射和答辩材料组织见 `docs/competition/scoring-and-defense.md`。
+| I/O 尾延迟量化 | 待推进 | reads/query、bytes/query、候选放大等指标补全和分阶段优化（详见 `docs/roadmap in future/recall-to-io-tail-latency-plan.md`） |
+| 后续重点 | 待推进 | 异步 flush queue、Delta memory graph、周期性 rebuild packed graph、系统参数矩阵、真实 NVMe 复测（详见 `docs/roadmap in future/defense-gap-closure-plan.md`） |
 
 ## 1. 项目概述
 
-agent-aware 面向大模型 Agent 的长期记忆场景，设计一套在内存受限环境下运行的动态向量检索底层 I/O 存储引擎。项目目标不是单纯把所有向量加载到内存获得高 QPS，而是在数据规模远大于物理内存、读写请求持续并发的条件下，通过用户态缓存、图拓扑感知预取、异步 I/O 和日志结构写入路径，降低随机 SSD 访问带来的性能损耗。
+Agent-aware 面向大模型 Agent 的长期记忆场景，设计一套在内存受限环境下运行的动态向量检索底层 I/O 存储引擎。项目目标不是单纯把所有向量加载到内存获得高 QPS，而是在数据规模远大于物理内存、读写请求持续并发的条件下，通过用户态缓存、图拓扑感知预取、异步 I/O 和日志结构写入路径，降低随机 SSD 访问带来的性能损耗。
 
 系统以 DiskANN/Vamana 图索引为检索骨架，以 Product Quantization 压缩编码作为内存常驻的近似过滤层，将全精度向量下沉到 SSD，通过 O_DIRECT 绕过操作系统 Page Cache，并由 Graph-Aware 2Q BufferPool 接管缓存淘汰策略。读路径使用 io_uring 批量异步读取和下一跳预取来隐藏 I/O 延迟；写路径借鉴 LSM-Tree，将实时随机写转化为 WAL 与 SSTable 的顺序追加写，并通过后台 Compaction 保持读写混合负载下的延迟稳定性。
 
@@ -175,12 +172,9 @@ agent-aware/
 │   ├── run_agent_aware_sift.py            # 参数矩阵实验运行器
 │   └── plot_sift_matrix.py                # 参数矩阵结果汇总与图表生成
 └── docs/
-    ├── README.md                          # 文档中心索引
-    ├── changelog.md                       # 当前版本能力边界、验证命令、已知限制
-    ├── competition/                       # 赛题要求、评分映射、答辩清单
-    ├── design/                            # SSD 存储、缓存、异步预取、动态写入设计
-    ├── experiments/                       # SIFT1M、混合读写、参数调优实验报告
-    └── roadmap/                           # 后续优化计划、任务拆分和冲刺路线
+    ├── design/                            # 01-09 编号设计文档，覆盖 SSD、缓存、预取、动态写入
+    ├── problem/                           # 赛题要求、问题背景和约束说明
+    └── roadmap in future/                 # 后续优化计划、答辩补强和冲刺路线
 ```
 
 ## 5. 系统架构设计
@@ -323,13 +317,13 @@ PQ+ADC 候选生成 → page-level 候选聚合 → 构造排序特征 → XGBoo
 
 `PrefetchPlanner` 负责候选页聚合、特征构造、XGBoost text-dump 推理打分和限流提交。支持 `--prefetch-policy none|xgboost`、`--prefetch-model`、`--prefetch-top-k`、`--prefetch-score-threshold`、`--prefetch-max-inflight`、`--prefetch-trace` 等命令行开关。离线 replay 脚本可对比 XGBoost 策略与 oracle 上界的差距。
 
-详见专项计划：`docs/design/XGBOOST_PREFETCH_PLAN.md`
+详见专项计划：`docs/design/09-XGBOOST_PREFETCH_PLAN.md`
 
 ### 6.8 Early Trigger 提前触发
 
 针对预取提交太晚导致 `pending_hit` 偏高的问题，引入 pre-beam frontier window 提前触发点。在 beam selection 前从 candidate heap 取 top window 候选进行 XGBoost 打分和预取提交，使高置信 page 在 demand 前至少提前一个搜索批次被提交。
 
-支持 `--prefetch-early-trigger off|entry-warmup|pre-beam|rerank|all`，默认 `pre-beam`。
+支持 `--prefetch-early-trigger off|pre-beam|all`，默认 `pre-beam`。entry warmup、post-expand 和 rerank lookahead 保留为后续触发点扩展方向。
 
 详见专项计划：`docs/design/07-prefetch-early-trigger-plan.md`
 
@@ -376,15 +370,15 @@ PQ+ADC 候选生成 → page-level 候选聚合 → 构造排序特征 → XGBoo
 | P4 异步预取 | 第 4-5 周 | 接入 io_uring，完成 batch submit 和拓扑预取 | SSD 主路径 QPS、延迟统计 | ✅ 已完成 |
 | P5 动态写入 | 第 5-6 周 | 完成 MemTable、WAL、SSTable、Compaction 和增量插入 | 混合读写 benchmark | ✅ 已完成 |
 | P6 调优与文档 | 第 6-7 周 | 参数调优、SIFT 大规模测试、报告和答辩材料 | README、架构文档、实验报告、演示脚本 | 🔄 进行中 |
-| P7 学习型预取 | 第 7+ 周 | XGBoost 预取排序、early trigger、离线 replay、在线 A/B | `PrefetchPlanner`、trace、模型训练脚本、预取统计（详见 `docs/design/XGBOOST_PREFETCH_PLAN.md` 和 `docs/design/07-prefetch-early-trigger-plan.md`） | ✅ 已完成闭环 |
-| P8 I/O 尾延迟优化 | 后续 | 量化各阶段 I/O 放大、候选裁剪、布局与缓存治理、自适应预算 | reads/query、bytes/query、P99 降低（详见 `docs/roadmap/recall-to-io-tail-latency-plan.md`） | 🔜 待推进 |
-| P9 答辩补强 | 答辩前 | 参数矩阵曲线、真实 NVMe 复测、delta 退化治理 | 矩阵实验、环境报告、delta 优化（详见 `docs/roadmap/defense-gap-closure-plan.md`） | 🔜 待推进 |
+| P7 学习型预取 | 第 7+ 周 | XGBoost 预取排序、early trigger、离线 replay、在线 A/B | `PrefetchPlanner`、trace、模型训练脚本、预取统计（详见 `docs/design/09-XGBOOST_PREFETCH_PLAN.md` 和 `docs/design/07-prefetch-early-trigger-plan.md`） | ✅ 已完成闭环 |
+| P8 I/O 尾延迟优化 | 后续 | 量化各阶段 I/O 放大、候选裁剪、布局与缓存治理、自适应预算 | reads/query、bytes/query、P99 降低（详见 `docs/roadmap in future/recall-to-io-tail-latency-plan.md`） | 🔜 待推进 |
+| P9 答辩补强 | 答辩前 | 参数矩阵曲线、真实 NVMe 复测、delta 退化治理 | 矩阵实验、环境报告、delta 优化（详见 `docs/roadmap in future/defense-gap-closure-plan.md`） | 🔜 待推进 |
 
 ### 8.2 任务分解
 
 | 任务 | 负责人建议 | 输入 | 输出 | 验收 |
 | --- | --- | --- | --- | --- |
-| 赛题与竞品分析 | 文档/算法成员 | `docs/competition/problem.md`、DiskANN、Milvus 资料 | 背景与创新点说明 | 评审指标映射完整 |
+| 赛题与竞品分析 | 文档/算法成员 | `docs/problem/`、DiskANN、Milvus 资料 | 背景与创新点说明 | 评审指标映射完整 |
 | PQ 编码器 | 算法成员 | 训练向量、维度配置 | PQ codes、codebooks、ADC 表 | Recall 不因过滤低于目标 |
 | Vamana 图索引 | 算法成员 | 全精度向量 | 图邻接表、entry point | 构建成功，搜索可达 |
 | SSD 布局 | 系统成员 | 向量、图、PQ codes | 4KB 对齐记录文件 | O_DIRECT 读写成功 |
@@ -536,23 +530,42 @@ bash scripts/linux/run_sift1m_once.sh
 
 ## 15. 结论
 
-agent-aware 的计划重点是围绕赛题的真实约束构建系统，而不是绕开内存限制追求纯内存性能。通过“PQ 压缩导航 + SSD 全精度向量 + 用户态图感知缓存 + io_uring 异步预取 + LSM 顺序写入”的组合，系统能够在 10%-20% 内存预算下保持高召回率，并对高并发读写混合负载提供可解释、可复现、可调优的 I/O 优化能力。
+Agent-aware 的计划重点是围绕赛题的真实约束构建系统，而不是绕开内存限制追求纯内存性能。通过“PQ 压缩导航 + SSD 全精度向量 + 用户态图感知缓存 + io_uring 异步预取 + LSM 顺序写入”的组合，系统能够在 10%-20% 内存预算下保持高召回率，并对高并发读写混合负载提供可解释、可复现、可调优的 I/O 优化能力。
 
 后续工作应集中在三点：一是扩大 SIFT1M 与真实 NVMe 环境测试，二是完善 Compaction 与图连通性的一致性验证，三是将实验结果整理为图表化报告和答辩演示材料。
 
-## 16. 专项计划文档索引
+## 16. 文档指引与专项计划索引
 
-本项目的详细设计和路线图分散在以下专项计划文档中，与本文档形成"总-分"关系：
+本文档是项目总览，`docs/design/` 下的 01-09 编号文档是各模块的详细设计归档，`docs/roadmap in future/` 下的文档是后续优化和答辩补强路线。阅读时优先按照当前目录中的编号文件名引用，避免继续使用未编号的旧路径。
+
+### 16.1 推荐阅读路径
+
+| 阅读目标 | 建议顺序 |
+| --- | --- |
+| 快速理解整体方案 | `PROJECT_PLAN.md` -> `docs/problem/` -> `docs/design/01-ssd-storage-path.md` -> `docs/design/03-async-prefetch.md` -> `docs/design/05-dynamic-write.md` |
+| SSD 检索主路径 | `01-ssd-storage-path.md` -> `02-cache-zero-copy.md` -> `03-async-prefetch.md` -> `04-beam-width-io-uring.md` |
+| 预取与尾延迟路线 | `03-async-prefetch.md` -> `08-prefetch_timing.md` -> `09-XGBOOST_PREFETCH_PLAN.md` -> `07-prefetch-early-trigger-plan.md` -> `docs/roadmap in future/recall-to-io-tail-latency-plan.md` |
+| 动态写入与流式更新 | `05-dynamic-write.md` -> `06-fresh-streaming-ann.md` -> `docs/roadmap in future/next-sift1m-mixed-rw-optimization.md` |
+| 答辩前补强 | `docs/roadmap in future/defense-gap-closure-plan.md` -> 参数矩阵结果 -> 真实 NVMe/比赛环境复测记录 |
+
+### 16.2 设计文档索引
 
 | 文档 | 主题 | 状态 |
 | --- | --- | --- |
-| `docs/design/XGBOOST_PREFETCH_PLAN.md` | 学习型预取排序：PQ+ADC 候选聚合、page-level 特征、XGBoost ranking、trace 采集、离线 replay、在线 A/B、评价体系 | 已落地闭环 |
-| `docs/design/07-prefetch-early-trigger-plan.md` | 预取提前触发点：pre-beam / post-expand / entry warmup / rerank lookahead、两阶段预取、trace 字段、限流规则 | P0（pre-beam）已落地 |
-| `docs/roadmap/recall-to-io-tail-latency-plan.md` | I/O 放大与尾延迟优化：候选裁剪、数据布局、缓存治理、自适应预算、P99/P999 治理、分阶段排期 | 待推进 |
-| `docs/roadmap/defense-gap-closure-plan.md` | 答辩前补强：参数矩阵曲线、真实 NVMe/比赛环境复测、delta 增长压力测试、delta 查询优化路线 | 待推进 |
-| `docs/design/ssd-storage-path.md` | SSD 4KB record 布局、DiskIndexReader/Writer、O_DIRECT、packed graph 文件格式 | 已落地 |
-| `docs/design/cache-zero-copy.md` | Graph-Aware 2Q BufferPool、同页复用、compute_distance_direct | 已落地 |
-| `docs/design/async-prefetch.md` | AsyncPageReader、QueryPageSession、io_uring fallback、PQ+ADC/XGBoost 预取底座 | 已落地 |
-| `docs/design/dynamic-write.md` | LSM 写入路径：WAL/MemTable/SSTable/manifest/compaction/recovery | 已落地 |
-| `docs/roadmap/dynamic-write-task-breakdown.md` | 动态写入任务拆分与验收清单 | 大部分已完成 |
-| `docs/design/fresh-streaming-ann.md` | Streaming ANN 创新路线：LSM delta + immutable read view、Delta memory graph、周期性 rebuild | 部分已完成 |
+| `docs/design/01-ssd-storage-path.md` | SSD 4KB record 布局、DiskIndexReader/Writer、O_DIRECT、packed graph 文件格式 | 已落地 |
+| `docs/design/02-cache-zero-copy.md` | Graph-Aware 2Q BufferPool、同页复用、pin/unpin、compute_distance_direct | 已落地 |
+| `docs/design/03-async-prefetch.md` | AsyncPageReader、QueryPageSession、io_uring fallback、PQ+ADC/XGBoost 预取底座 | 已落地 |
+| `docs/design/04-beam-width-io-uring.md` | beam_width 语义、beam batch 收集、io_uring 批量读取、page 去重 | 已落地 |
+| `docs/design/05-dynamic-write.md` | LSM 写入路径：WAL/MemTable/SSTable/manifest/compaction/recovery | 已落地 |
+| `docs/design/06-fresh-streaming-ann.md` | Streaming ANN 创新路线：LSM delta + immutable read view、Delta memory graph、周期性 rebuild | 部分已完成 |
+| `docs/design/07-prefetch-early-trigger-plan.md` | 预取提前触发点：pre-beam、post-expand、entry warmup、rerank lookahead、trace 字段、限流规则 | P0（pre-beam）已落地 |
+| `docs/design/08-prefetch_timing.md` | 预取启用条件、当前节点邻居预取、batch 滚动窗口预取、CPU/I/O 重叠时机 | 已归档 |
+| `docs/design/09-XGBOOST_PREFETCH_PLAN.md` | 学习型预取排序：PQ+ADC 候选聚合、page-level 特征、XGBoost ranking、trace 采集、离线 replay、在线 A/B、评价体系 | 已落地闭环 |
+
+### 16.3 后续路线图索引
+
+| 文档 | 主题 | 状态 |
+| --- | --- | --- |
+| `docs/roadmap in future/recall-to-io-tail-latency-plan.md` | I/O 放大与尾延迟优化：候选裁剪、数据布局、缓存治理、自适应预算、P99/P999 治理、分阶段排期 | 待推进 |
+| `docs/roadmap in future/defense-gap-closure-plan.md` | 答辩前补强：参数矩阵曲线、真实 NVMe/比赛环境复测、delta 增长压力测试、delta 查询优化路线 | 待推进 |
+| `docs/roadmap in future/next-sift1m-mixed-rw-optimization.md` | SIFT1M mixed RW 后续优化：动态层查询、读写隔离、flush/compaction 延迟治理 | 待推进 |

@@ -1,10 +1,20 @@
-# XGBoost 预取提前触发点方案
+# 07 XGBoost 预取提前触发点方案
 
-> 关联文档：主计划 `PROJECT_PLAN.md` §6.8、预取排序 `docs/design/XGBOOST_PREFETCH_PLAN.md`、I/O 尾延迟 `docs/roadmap/recall-to-io-tail-latency-plan.md`
->
-> 最后更新：2026-06-25
+## 当前实现状态（2026-06-25）
 
-## 1. 背景
+该文档作为 XGBoost 预取提前触发点的设计归档。当前 P0 已落地 pre-beam 触发：在 beam selection 前对 frontier top window 做 XGBoost page-level 预取决策，trace 中记录 `trigger=pre_beam`，并通过 `--prefetch-early-trigger` 保留 `off/pre-beam/all` 对照入口。
+
+| 项目 | 状态 | 当前对应实现 |
+| --- | --- | --- |
+| T1 pre-beam 触发 | 已完成 | `src/graph/disk_graph_index.cpp` 中 beam selection 前触发 |
+| 统一提交入口 | 已完成可运行版 | `QueryPageSession::submit_jit_prefetch(candidate_pages, "pre_beam")` |
+| CLI 入口 | 已完成 | `--prefetch-early-trigger off/pre-beam/all` |
+| trace trigger 字段 | 已完成 | 预取 trace 中记录 `trigger=pre_beam` |
+| T0/T2/T3 | 未完成 | 作为后续 warmup、post-expand、rerank lookahead 扩展 |
+
+## 设计背景
+
+关联文档包括主计划 `PROJECT_PLAN.md` §6.8、预取排序 `docs/design/09-XGBOOST_PREFETCH_PLAN.md`、I/O 尾延迟 `docs/roadmap/recall-to-io-tail-latency-plan.md`。
 
 当前预取链路已经收敛到单路线：
 
@@ -26,11 +36,9 @@ PQ+ADC 候选生成
 
 不重新引入非 PQ 路线，不恢复 `current/learned/frontier/next-hop` 策略入口。
 
----
+## 核心目标
 
-## 2. 目标与非目标
-
-### 目标
+本方案的目标：
 
 1. 提高 `was_ready_before_demand` 和在线 `prefetch_ready_hit`。
 2. 降低 `prefetch_pending_hit / prefetch_submitted`。
@@ -38,16 +46,37 @@ PQ+ADC 候选生成
 4. 保持 `--prefetch-policy none|xgboost` 的外部接口不变。
 5. 所有提前触发仍使用 XGBoost page-level score 和统一限流器。
 
-### 非目标
+非目标：
 
 1. 不恢复非 PQ exact neighbor candidate 路线。
 2. 不新增 `current`、`learned`、`frontier`、`next-hop` 公开策略。
 3. 不把预取改成无界背景扫描。
 4. 不为了 ready hit 牺牲 recall 或大幅放大 I/O。
 
----
+## 相关实现文件
 
-## 3. 现状触发点
+相关源码入口如下：
+
+```text
+src/graph/disk_graph_index.cpp
+include/core/query_page_session.h
+src/core/query_page_session.cpp
+include/core/prefetch_planner.h
+src/core/prefetch_planner.cpp
+src/sift_search_benchmark.cpp
+```
+
+相关设计文档：
+
+```text
+docs/design/03-async-prefetch.md
+docs/design/09-XGBOOST_PREFETCH_PLAN.md
+docs/roadmap/recall-to-io-tail-latency-plan.md
+```
+
+## 具体设计要求
+
+## 一、现状触发点与问题
 
 当前主要触发位置在 `PackedDiskGraphIndex` 扩展 candidate 后：
 
@@ -62,7 +91,7 @@ expand current node
 对应代码入口：
 
 | 位置 | 当前作用 |
-|---|---|
+| --- | --- |
 | `src/graph/disk_graph_index.cpp` | 在 candidate expansion 后调用 `QueryPageSession::submit_next_hop_prefetch` |
 | `src/core/query_page_session.cpp` | 收集 page candidates、调用 `PrefetchPlanner`、提交 async read |
 | `src/core/prefetch_planner.cpp` | page-level 聚合、XGBoost 打分、限流 |
@@ -76,11 +105,7 @@ ready_time 通常晚于 demand_time
 
 所以必须把触发点前移到“页即将成为 demand 的前一阶段”。
 
----
-
-## 4. 核心设计
-
-### 4.1 两阶段预取
+## 二、两阶段预取
 
 把预取拆成两个阶段：
 
@@ -98,7 +123,7 @@ ready_time 通常晚于 demand_time
 
 也就是说，不新增一套启发式预取策略，而是把更多“早期可见的 PQ+ADC page candidates”交给现有 `PrefetchPlanner`。
 
-### 4.2 统一触发接口
+## 三、统一触发接口
 
 建议把当前语义较窄的提交入口抽象成通用接口：
 
@@ -119,42 +144,17 @@ void submit_ranked_prefetch(
 
 短期可以保留 `submit_next_hop_prefetch` 作为兼容包装，但 trace 和统计里应该记录真实 `trigger`。
 
----
+## 四、提前触发点
 
-## 5. 提前触发点
+T0：entry warmup 触发。
 
-### T0：entry warmup 触发
+1. 位置：entry seeds 确定、ADC table 建好之后，正式 beam search 前。
+2. 输入候选：entry seed pages、entry seed 的 PQ 可见邻居页。
+3. 目的：为第一批 expansion 预热，避免 query 开头全部同步 demand。
+4. 限流建议：`top_k = min(prefetch_top_k, entry_count)`，`max_inflight = min(configured_max_inflight, io_depth / 4)`，`reuse threshold >= 1`。
+5. 风险：entry seeds 分散时可能产生 unused，所以只在 `cache_pages` 较小、entry_count 较高或历史 trace 显示首批 pending 多时启用。
 
-**位置：** entry seeds 确定、ADC table 建好之后，正式 beam search 前。
-
-**输入候选：**
-
-```text
-entry seed pages
-entry seed 的 PQ 可见邻居页
-```
-
-**目的：**
-
-为第一批 expansion 预热，避免 query 开头全部同步 demand。
-
-**限流建议：**
-
-```text
-top_k = min(prefetch_top_k, entry_count)
-max_inflight = min(configured_max_inflight, io_depth / 4)
-reuse threshold >= 1
-```
-
-**风险：**
-
-entry seeds 分散时可能产生 unused，所以只在 `cache_pages` 较小、entry_count 较高或历史 trace 显示首批 pending 多时启用。
-
----
-
-### T1：pre-beam frontier window 触发
-
-**位置：** 每轮 beam 选择前。
+T1：pre-beam frontier window 触发。
 
 当前流程一般是先从 frontier/candidate heap 选出下一批 beam，然后 demand 读取这些 beam page。新的触发点应插在：
 
@@ -166,13 +166,13 @@ candidate heap 已有 PQ+ADC 分数
   -> 再进入 demand batch load / expansion
 ```
 
-**输入候选：**
+输入候选：
 
 ```text
 candidate heap top (beam_width * window_multiplier)
 ```
 
-**推荐默认：**
+推荐默认：
 
 ```text
 window_multiplier = 2
@@ -181,76 +181,31 @@ top_k = 1 或 2
 max_inflight = 1 到 2 起步
 ```
 
-**为什么最重要：**
+T1 最重要，因为这些 page 已经进入 PQ+ADC frontier，但还没有被 demand 读取。它们比 expansion 后的 next-hop 更早，并且比 entry warmup 更准。
 
-这些 page 已经进入 PQ+ADC frontier，但还没有被 demand 读取。它们比 expansion 后的 next-hop 更早，并且比 entry warmup 更准。
-
-**验收重点：**
+T1 验收重点：
 
 ```text
 T1 的 ready_hit_rate > PostExpandLookahead
 T1 的 unused_rate 不高于 0.30
 ```
 
----
+T2：post-expand lookahead 触发。
 
-### T2：post-expand lookahead 触发
+1. 位置：当前 expansion 完成后、下一轮 batch load 前。
+2. 输入候选：`new_neighbors + updated frontier top window - current batch pages - already materialized pages`。
+3. 限流建议：只提交 `earliest_demand_step_estimate >= current_step + 1` 的 page；如果 estimate == current_step，则不提交，因为已经太晚。
+4. 目的：补充 T1 漏掉的二跳或聚合后高复用 page。
 
-**位置：** 当前 expansion 完成后、下一轮 batch load 前。
+T3：rerank lookahead 触发。
 
-这接近当前实现，但要调整目标：不是预取刚刚发现的所有邻居，而是预取“已经进入 frontier 且预计下一轮之后才 demand”的 page。
+1. 位置：PQ search 即将结束、exact rerank pool 已经形成但 full vector page 还未全部 materialize 时。
+2. 输入候选：`rerank_topk candidate pages`。
+3. 目的：把最终 exact rerank 的同步读变成异步读。
+4. 限流建议：`top_k = min(prefetch_top_k, rerank_topk page count)`，score threshold 可以低一些，max inflight 不能抢占 demand I/O。
+5. 注意：如果 rerank pool 页面基本已经被搜索过程读过，T3 收益会很小。它只作为低风险补充，不作为 P0。
 
-**输入候选：**
-
-```text
-new_neighbors
-+ updated frontier top window
-- current batch pages
-- already materialized pages
-```
-
-**限流建议：**
-
-```text
-只提交 earliest_demand_step_estimate >= current_step + 1 的 page
-如果 estimate == current_step，则不提交，因为已经太晚
-```
-
-**目的：**
-
-补充 T1 漏掉的二跳或聚合后高复用 page。
-
----
-
-### T3：rerank lookahead 触发
-
-**位置：** PQ search 即将结束、exact rerank pool 已经形成但 full vector page 还未全部 materialize 时。
-
-**输入候选：**
-
-```text
-rerank_topk candidate pages
-```
-
-**目的：**
-
-把最终 exact rerank 的同步读变成异步读。
-
-**限流建议：**
-
-```text
-top_k = min(prefetch_top_k, rerank_topk page count)
-score threshold 可以低一些
-max_inflight 不能抢占 demand I/O
-```
-
-**注意：**
-
-如果 rerank pool 页面基本已经被搜索过程读过，T3 收益会很小。它只作为低风险补充，不作为 P0。
-
----
-
-## 6. 调度与限流规则
+## 五、调度与限流规则
 
 所有触发点共用一个 scheduler，不允许各自绕过限流：
 
@@ -275,7 +230,7 @@ submit_async(page)
 建议新增两个保护参数：
 
 | 参数 | 默认 | 说明 |
-|---|---:|---|
+| --- | ---: | --- |
 | `--prefetch-early-trigger` | `pre-beam` | `off/pre-beam/all` |
 | `--prefetch-io-depth-guard-ratio` | `0.5` | 预取最多占用 `io_depth * ratio` |
 
@@ -287,14 +242,12 @@ T0/T2/T3 disabled
 io_depth_guard_ratio = 0.5
 ```
 
----
-
-## 7. Trace 字段补强
+## 六、Trace 字段补强
 
 为了判断“提前触发是否真的提前”，trace 需要新增字段：
 
 | 字段 | 含义 |
-|---|---|
+| --- | --- |
 | `trigger` | `warmup_entry/pre_beam/post_expand/rerank` |
 | `first_seen_step` | page 第一次成为候选的搜索步 |
 | `submit_step` | page 被提交预取的搜索步 |
@@ -305,7 +258,7 @@ io_depth_guard_ratio = 0.5
 | `ready_before_demand_us` | demand_time - ready_time，正数代表真正提前 |
 | `skip_reason` | 未提交原因 |
 
-核心验收不要只看 JSON 的 ready hit，而要以 trace 的：
+核心验收不要只看 JSON 的 ready hit，而要以 trace 的以下字段为准：
 
 ```text
 was_ready_before_demand
@@ -314,16 +267,12 @@ ready_before_demand_us
 lead_steps
 ```
 
-为准。
-
----
-
-## 8. XGBoost 特征补强
+## 七、XGBoost 特征补强
 
 提前触发后，模型需要知道“现在提交是否来得及”。建议补充以下 page-level 特征：
 
 | 特征 | 含义 |
-|---|---|
+| --- | --- |
 | `first_seen_step_delta` | 当前 step - page 第一次出现 step |
 | `estimated_demand_step_delta` | 预计 demand step - 当前 step |
 | `frontier_rank_min` | page 内候选在 frontier 中的最佳 rank |
@@ -343,11 +292,9 @@ lead_steps
 0 = unused / evicted before use / duplicate
 ```
 
----
+## 八、实施阶段
 
-## 9. 实施阶段
-
-### P0：只做 T1 pre-beam 触发（✅ 已完成，2026-06-25）
+P0：只做 T1 pre-beam 触发，已完成。
 
 改动：
 
@@ -377,14 +324,12 @@ top_k=2/max_inflight=2 会重新拉高 pending 和尾延迟
 已落地代码位置：
 
 | 文件 | 内容 |
-|---|---|
+| --- | --- |
 | `src/graph/disk_graph_index.cpp` | `pre_beam_prefetch_enabled()`、pre-beam 触发逻辑、`submit_jit_prefetch` 调用 |
 | `include/core/query_page_session.h` | `submit_jit_prefetch(candidate_pages, "pre_beam")` 接口 |
 | `src/sift_search_benchmark.cpp` | `--prefetch-early-trigger` CLI 参数解析、校验、JSON 输出 |
 
-### P1：加入 T2 post-expand lookahead
-
-改动：
+P1：加入 T2 post-expand lookahead。
 
 1. 当前 expansion 后保留 lookahead，但排除本轮马上 demand 的 page。
 2. 引入 `estimated_demand_step_delta >= 1` 过滤。
@@ -397,9 +342,7 @@ post_expand 不能拉高 overall waste_rate
 pre_beam 仍是 ready hit 主来源
 ```
 
-### P2：加入 T0 entry warmup
-
-改动：
+P2：加入 T0 entry warmup。
 
 1. 在 ADC table 建好后，对 entry seed 相关 page 做极小预算 warmup。
 2. 只对 query 开头 pending 明显的 case 打开。
@@ -411,9 +354,7 @@ pre_beam 仍是 ready hit 主来源
 unused_rate 不明显上升
 ```
 
-### P3：加入 T3 rerank lookahead
-
-改动：
+P3：加入 T3 rerank lookahead。
 
 1. rerank pool 形成后预取尚未 materialized 的 page。
 2. 预取优先级低于 demand 和 T1。
@@ -425,63 +366,17 @@ rerank_reads 同步等待下降
 总体 io_submit_syscalls 不明显上升
 ```
 
----
-
-## 10. 实验命令
-
-### 训练真实 XGBoost
-
-```bash
-python3 scripts/train_prefetch_ranker.py \
-  --trace build/prefetch_closed_loop_trace.csv \
-  --model-out build/prefetch_xgboost_early.txt \
-  --metrics-out build/prefetch_xgboost_early_metrics.json \
-  --backend xgboost \
-  --top-k 2 \
-  --max-inflight 2
-```
-
-### 离线 replay
-
-```bash
-python3 scripts/replay_prefetch_policy.py \
-  --trace build/prefetch_closed_loop_trace.csv \
-  --model build/prefetch_xgboost_early.txt \
-  --top-k 1 2 4 \
-  --out-json build/prefetch_xgboost_early_replay.json \
-  --out-md build/prefetch_xgboost_early_replay.md
-```
-
-### 在线 A/B
-
-```bash
-python3 scripts/run_prefetch_ab.py \
-  --binary ./build/agent-aware \
-  --model build/prefetch_xgboost_early.txt \
-  --out-dir build/prefetch_ab_early \
-  --search-width 32 \
-  --beam-width 4 \
-  --entry-count 8 \
-  --prefetch-top-k 1 \
-  --prefetch-max-inflight 1 \
-  --query-limit 100 \
-  --base-limit 20000 \
-  --extra-args "--synthetic 1 --synthetic-dim 16 --synthetic-clusters 4 --graph-degree 8 --pq-subspaces 4 --pq-centroids 16 --pq-train-limit 512 --pq-iterations 2 --rerank-topk 20 --io-depth 8 --io-batch 4 --cache-pages 4"
-```
-
----
-
-## 11. 成功标准
+## 九、成功标准与排查
 
 在同一数据集、同一索引、同一模型训练流程下：
 
 | 指标 | 当前问题 | 成功标准 |
-|---|---|---|
+| --- | --- | --- |
 | `ready_hit_rate` | 低于或接近 pending | 提升 30% 以上 |
 | `pending_hit_rate` | 高于 ready | 低于 ready，或至少下降 20% |
 | `waste_rate` | 约 0.27-0.32 | 不高于当前 |
 | `submitted_reads` | 预取放大 | 相比 no-prefetch 增幅 <= 10%-15% |
-| `p95_latency_ms` | 小样本不稳 | 多次 repeat 中中位数下降 |
+| `p95_latency_ms` | 小样本不稳 | 多次 repeat 中位数下降 |
 | `recall@10` | 不允许退化 | 不下降 |
 
 如果出现：
@@ -497,9 +392,7 @@ ready_hit_rate 上升，但 p95 不降
 3. `unused_rate` 是否同步上升。
 4. `submit_to_demand_us` 是否只是变大，但 ready 仍晚于 demand。
 
----
-
-## 12. 推荐先做的最小改动
+## 十、推荐先做的最小改动
 
 第一版只实现：
 
@@ -515,3 +408,18 @@ T1 pre-beam frontier window trigger
 2. 代码改动小，不需要重写 search loop。
 3. 它能直接验证“发得太晚”是否真是主瓶颈。
 4. 如果 T1 仍不能提高 ready-before-demand，说明瓶颈不在触发点，而在 I/O 队列、page cache 或 batch 调度。
+
+## 验收标准
+
+最终实现应满足：
+
+1. `prefetch_ready_hit` 和 `was_ready_before_demand` 提升。
+2. `prefetch_pending_hit / prefetch_submitted` 下降。
+3. `prefetch_unused`、`submitted_reads`、`io_submit_syscalls` 不明显上升。
+4. `--prefetch-policy none|xgboost` 外部接口保持不变。
+5. 所有提前触发都使用 XGBoost page-level score 和统一限流器。
+6. trace 能区分 `warmup_entry/pre_beam/post_expand/rerank`。
+7. P0 pre-beam 触发能在保守限流下提高 ready-before-demand。
+8. 后续 T0/T2/T3 接入时不能破坏 T1 的 ready hit 主来源地位。
+9. Recall@10 不下降。
+10. P95/P99 延迟在多次 repeat 中位数下降。

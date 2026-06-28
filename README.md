@@ -6,7 +6,7 @@
 
 Agent-aware 是一个面向大模型 Agent 长期记忆场景的向量检索 I/O 优化原型。项目目标是在全精度向量常驻 SSD、内存预算约束为数据集大小 10%-20% 的条件下，提供可复现的 Top-K 近似最近邻检索、缓存/预取/I/O 统计，以及动态写入路径验证。
 
-当前主线实现围绕 `agent-aware` benchmark 展开：SIFT 或合成数据加载后，系统训练 PQ ADC 模型、构建或复用 Vamana packed graph index，再通过 Graph-Aware 2Q BufferPool、io_uring 异步 I/O 和**图邻居 + 滚动流水线预取**（参考 Agent-Mem-IO 架构）完成查询，并输出 JSON 结果。预取支持两条路径：纯 PQ 直接提交（已验证超过 baseline），以及可选的 XGBoost 二次精排（需训练模型）。动态写入由 `bench_mixed_rw` 和 `StorageEngine`/`DynamicWriteManager` 验证，覆盖 WAL、MemTable、SSTable、flush、compaction 和 base/delta Top-K merge。
+当前主线实现围绕 `agent-aware` benchmark 展开：SIFT 或合成数据加载后，系统训练 PQ ADC 模型、构建或复用 Vamana packed graph index，再通过 Graph-Aware 2Q BufferPool（参考 Agent-Mem-IO 架构）、io_uring 异步 I/O 和图邻居 + 滚动流水线预取完成查询，并输出 JSON 结果。预取支持两条路径：纯 PQ 直接提交（已验证超过 baseline），以及可选的 XGBoost 二次精排（需训练模型）。动态写入由 `bench_mixed_rw` 和 `StorageEngine`/`DynamicWriteManager` 验证，覆盖 WAL、MemTable、SSTable、flush、compaction 和 base/delta Top-K merge。
 
 核心结果（SIFT1M, query 5000-5999, xgboost 预取, beam=16, io_uring, cache=15000 pages）：
 
@@ -761,3 +761,15 @@ manager.close();
 | 观察 io_uring 收益 | 对比 `--io-mode pread` 与 `--io-mode io_uring` | `qps`、`latency_p95_ms`、`io_submit_syscalls` |
 | 评估预取 | `bash scripts/run_prefetch_ab.sh` 或对比 `--enable-prefetch 0` 与 `--enable-prefetch 1` | `prefetch_ready_hit`、`prefetch_pending_hit`、`prefetch_wasted`、latency Δ |
 | 验证动态写入 | 调整 `--read_ratio`、`--write_ratio`、`--memtable_flush_bytes` | `write_qps`、`flush_duration_ms`、`recovery_time_ms` |
+
+## 开源参考与合规说明
+
+本项目在技术路线、系统设计思路和实验组织方式上参考了开源项目 [Agent-Mem-IO](https://github.com/ouyangyipeng/Agent-Mem-IO)。参考内容包括PQ 编码、Graph-Aware 2Q 缓存策略。
+
+本项目没有直接复制 Agent-Mem-IO 的源代码和文档；核心代码由本队围绕赛题目标重新设计、实现、测试和验证。若后续引入第三方代码、文档或数据资产，将在对应文件、文档或提交说明中明确标注来源、使用目的和授权信息。项目将遵守所参考项目及其他第三方资源对应的开源协议要求。
+
+## AI 工具使用说明
+
+本项目开发过程中使用了 ChatGPT、OpenAI Codex / Codex CLI 等 AI 工具进行辅助。AI 主要用于赛题理解、方案讨论、代码结构分析、错误定位、重构建议、实验结果整理，以及 README 和设计文档草稿生成。
+
+AI 生成内容均经过参赛队成员人工审核、修改、编译测试和实验验证。项目的最终方案、代码合并、实验运行、结果判断和答辩内容由参赛队成员负责。详细说明见 [docs/AI_USAGE_DISCLOSURE.md](docs/AI_USAGE_DISCLOSURE.md)。

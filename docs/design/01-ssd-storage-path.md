@@ -9,20 +9,16 @@ SSD 存储链路的核心交付已经进入主路径：项目具备 4KB disk rec
 | 4KB 记录布局 | 已完成 | `DiskRecord`/packed page codec |
 | SSD index 文件读写 | 已完成 | `DiskIndexReader`/`DiskIndexWriter`、packed graph index |
 | O_DIRECT / pread fallback | 已完成 | Linux 下可启用 O_DIRECT，io_uring 不可用时回退 |
-| 同步读写测试 | 已完成 | `test_disk_record`、`test_disk_index_rw` |
+| 同步读写验证 | 已完成 | record 编解码与 index 读写验证 |
 | 大规模 SIFT 复用索引 | 已完成 | `indexes/sift1m_vamana_pq100_p4096_sm.idx` |
 
-## 1. 实现定位
-
-| 编号 | 建议时间 | 核心任务 | 交付物 |
-|---|---|---|---|
-| 01 SSD 存储链路 | 第 2–3 周 | 完成 4KB 记录布局、`O_DIRECT` 读写、`DiskIndexReader` / `DiskIndexWriter` | SSD index 文件、同步读写验证 |
+## 设计背景
 
 本设计主题目标是把图索引从“内存结构”落盘为“SSD 可随机读取的索引文件”，为后续图搜索、异步 I/O、预取、缓存和 io_uring 优化提供稳定的磁盘访问基础。
 
----
+该阶段对应第 2-3 周的核心任务：完成固定 4KB 记录布局、`O_DIRECT` 读写、`DiskIndexReader` / `DiskIndexWriter`，并形成可以被图搜索主路径复用的 SSD index 文件。
 
-## 2. 总体目标
+## 核心目标
 
 完成一个最小可用的 SSD 图索引存储链路，要求：
 
@@ -30,35 +26,27 @@ SSD 存储链路的核心交付已经进入主路径：项目具备 4KB disk rec
 2. 支持 Linux 下 `O_DIRECT` 对齐读写，减少 page cache 干扰。
 3. 实现 `DiskIndexWriter`，负责把内存图索引写入 SSD index 文件。
 4. 实现 `DiskIndexReader`，负责按 node id 随机读取指定节点记录。
-5. 完成同步读写 correctness 测试，确保落盘前后数据一致。
+5. 完成同步读写 correctness 验证，确保落盘前后数据一致。
 6. 记录基础性能指标：吞吐、平均延迟、P50/P95/P99、随机读取次数。
 
----
+## 相关实现文件
 
-## 3. 目录与文件建议
-
-建议新增或整理如下文件：
+相关源码入口如下：
 
 ```text
-include/
-  storage/
-    disk_record.h
-    disk_index_reader.h
-    disk_index_writer.h
-
-src/storage/
-  disk_record.cpp
-  disk_index_reader.cpp
-  disk_index_writer.cpp
+include/storage/disk_record.h
+include/storage/disk_index_reader.h
+include/storage/disk_index_writer.h
+src/storage/disk_record.cpp
+src/storage/disk_index_reader.cpp
+src/storage/disk_index_writer.cpp
 ```
 
 如当前项目已有 `core/` 或 `index/` 目录，也可以将 `storage/` 合并进去，但建议保持“磁盘存储层”和“图搜索层”解耦。
 
----
+## 具体设计要求
 
-## 4. 4KB 记录布局设计
-
-### 4.1 设计原则
+## 一、固定 4KB 记录布局
 
 每个节点占用一个固定大小记录：
 
@@ -68,11 +56,9 @@ static constexpr size_t kPageSize = 4096;
 
 固定 4KB 的好处：
 
-- `node_id -> 文件偏移` 可以直接计算：`offset = header_size + node_id * 4096`。
-- 适合 SSD page-level 随机读。
-- 后续可以直接接入 `pread`、`io_uring`、page cache、block cache、prefetch。
-
-### 4.2 推荐记录结构
+1. `node_id -> 文件偏移` 可以直接计算：`offset = header_size + node_id * 4096`。
+2. 适合 SSD page-level 随机读。
+3. 后续可以直接接入 `pread`、`io_uring`、page cache、block cache、prefetch。
 
 建议一个 4KB record 包含：
 
@@ -104,8 +90,6 @@ header 约 32 bytes
 总大小远小于 4096，可安全容纳 R=64/96/128 等图邻居数
 ```
 
-### 4.3 边界检查
-
 写入前必须检查：
 
 ```cpp
@@ -114,11 +98,7 @@ sizeof(header) + dim * sizeof(float) + degree * sizeof(uint32_t) <= 4096
 
 超过 4KB 时直接报错，不允许静默截断。
 
----
-
-## 5. SSD Index 文件格式
-
-### 5.1 文件整体布局
+## 二、SSD Index 文件格式
 
 建议文件格式：
 
@@ -131,7 +111,7 @@ sizeof(header) + dim * sizeof(float) + degree * sizeof(uint32_t) <= 4096
 [NodeRecord N-1: 4096 bytes]
 ```
 
-### 5.2 IndexFileHeader 建议字段
+`IndexFileHeader` 建议字段：
 
 ```cpp
 struct IndexFileHeader {
@@ -147,36 +127,30 @@ struct IndexFileHeader {
 };
 ```
 
-要求：
+文件格式要求：
 
-- header 本身也对齐到 4096。
-- 所有 node record 的起始偏移都是 4096 对齐。
-- 后续版本升级只增加 header 字段，不破坏旧格式。
+1. header 本身也对齐到 4096。
+2. 所有 node record 的起始偏移都是 4096 对齐。
+3. 后续版本升级只增加 header 字段，不破坏旧格式。
 
----
+## 三、O_DIRECT 读写实现
 
-## 6. O_DIRECT 读写实现要求
-
-### 6.1 打开文件
-
-Linux 下使用：
+Linux 下读路径使用：
 
 ```cpp
 int fd = ::open(path.c_str(), O_RDONLY | O_DIRECT);
 ```
 
-写入时使用：
+写路径使用：
 
 ```cpp
 int fd = ::open(path.c_str(), O_CREAT | O_TRUNC | O_WRONLY | O_DIRECT, 0644);
 ```
 
-### 6.2 对齐要求
-
 `O_DIRECT` 通常要求：
 
-1. buffer 地址按 4096 对齐；
-2. read/write size 是 4096 的倍数；
+1. buffer 地址按 4096 对齐。
+2. read/write size 是 4096 的倍数。
 3. file offset 是 4096 的倍数。
 
 建议封装统一分配函数：
@@ -192,11 +166,9 @@ void* aligned_alloc_4k(size_t size) {
 }
 ```
 
----
+实现必须检查 short read / short write，并在不支持 `O_DIRECT` 或对齐条件不满足时提供明确 fallback 或错误。
 
-## 7. DiskIndexWriter 设计
-
-### 7.1 职责
+## 四、DiskIndexWriter 设计
 
 `DiskIndexWriter` 负责把内存图结构写入 SSD index 文件。
 
@@ -221,7 +193,7 @@ public:
 };
 ```
 
-### 7.2 写入流程
+写入流程：
 
 ```text
 1. 创建 index 文件。
@@ -237,11 +209,7 @@ public:
 5. close。
 ```
 
----
-
-## 8. DiskIndexReader 设计
-
-### 8.1 职责
+## 五、DiskIndexReader 设计
 
 `DiskIndexReader` 负责从 SSD index 文件中读取节点记录。
 
@@ -262,7 +230,7 @@ public:
 };
 ```
 
-### 8.2 读取流程
+读取流程：
 
 ```text
 1. open index 文件。
@@ -274,7 +242,7 @@ public:
 7. 返回 NodeRecord 或填充调用者提供的 buffer。
 ```
 
-### 8.3 NodeRecord 建议
+`NodeRecord` 建议：
 
 ```cpp
 struct NodeRecord {
@@ -288,77 +256,7 @@ struct NodeRecord {
 
 性能路径中不建议频繁创建 `std::vector`，后续图搜索可使用 `read_node_into()` 直接复用 buffer。
 
----
-
-## 9. 同步读写测试计划
-
-### 9.1 单元测试：record 编码与解码
-
-建议验证目标：`test_disk_record`
-
-测试内容：
-
-- 构造一个 node record。
-- 编码到 4KB buffer。
-- 再从 buffer 解码。
-- 检查 node_id、dim、degree、vector、neighbors 是否一致。
-- 检查 padding 是否为 0。
-- 检查超过 4KB 时是否正确报错。
-
-### 9.2 集成测试：index 文件写入与读取
-
-建议验证目标：`test_disk_index_rw`
-
-测试内容：
-
-```text
-1. 随机生成 N 个向量和邻居表。
-2. 使用 DiskIndexWriter 写入 index 文件。
-3. 使用 DiskIndexReader 随机读取 node。
-4. 对比读取结果与原始内存数据。
-5. 分别测试普通 I/O 与 O_DIRECT。
-```
-
-建议参数：
-
-```text
-N = 1000
-Dim = 128
-MaxDegree = 64
-RandomReadCount = 10000
-```
-
-### 9.3 性能测试：同步随机读 benchmark
-
-可选扩展：如需单独压测同步磁盘读，可在 `src/` 下新增独立 benchmark 入口。
-
-记录指标：
-
-- total reads
-- QPS
-- avg latency
-- P50 latency
-- P95 latency
-- P99 latency
-- bytes read
-- O_DIRECT on/off
-
-输出格式建议：
-
-```text
-sync_disk_read_bench
-nodes=100000 dim=128 degree=64 direct_io=1
-reads=10000
-qps=xxxxx
-avg_us=xx
-p50_us=xx
-p95_us=xx
-p99_us=xx
-```
-
----
-
-## 10. CMake 集成
+## 六、CMake 与模块集成
 
 建议新增选项：
 
@@ -376,37 +274,81 @@ add_library(storage
 )
 
 target_include_directories(storage PUBLIC include)
-
-# 可选：add_executable(bench_sync_disk_read src/bench_sync_disk_read.cpp)
 target_link_libraries(bench_sync_disk_read PRIVATE storage)
 ```
 
----
+存储层应作为可复用模块提供给 packed graph、同步读 benchmark 和后续异步 I/O 路径。
 
-## 11. 验收标准
+## 七、验证与性能指标
 
-### 11.1 功能验收
+record 编解码验证需要覆盖：
 
-- [ ] 能生成 `.ssdindex` 或 `.disk.index` 文件。
-- [ ] 文件 header 正确记录 dim、num_nodes、max_degree、record_size。
-- [ ] 每个 node record 固定 4096 bytes。
-- [ ] 支持通过 node_id 随机读取 record。
-- [ ] 普通 I/O 模式读写测试通过。
-- [ ] `O_DIRECT` 模式读写测试通过。
-- [ ] 随机读取 10000 次无数据错误。
-- [ ] 不存在未检查的 short read / short write。
+1. 构造一个 node record。
+2. 编码到 4KB buffer。
+3. 再从 buffer 解码。
+4. 检查 node_id、dim、degree、vector、neighbors 是否一致。
+5. 检查 padding 是否为 0。
+6. 检查超过 4KB 时是否正确报错。
 
-### 11.2 正确性验收
+index 文件读写验证需要覆盖：
 
-- [ ] 写入前后 vector 完全一致。
-- [ ] 写入前后 neighbors 完全一致。
-- [ ] node_id 与 offset 映射正确。
-- [ ] 越界 node_id 正确报错。
-- [ ] degree 超过 max_degree 正确报错。
-- [ ] record 超过 4096 bytes 正确报错。
+1. 随机生成 N 个向量和邻居表。
+2. 使用 `DiskIndexWriter` 写入 index 文件。
+3. 使用 `DiskIndexReader` 随机读取 node。
+4. 对比读取结果与原始内存数据。
+5. 分别覆盖普通 I/O 与 `O_DIRECT`。
 
-### 11.3 性能验收
+建议验证参数：
 
-- [ ] benchmark 可以输出 QPS、Avg、P50、P95、P99。
-- [ ] 普通 I/O 与 `O_DIRECT` 结果可对比。
-- [ ] 在 WSL ext4 或原生 Linux 目录下测试，避免 `/mnt/c`、`/mnt/d` 干扰最终性能。
+```text
+N = 1000
+Dim = 128
+MaxDegree = 64
+RandomReadCount = 10000
+```
+
+同步随机读性能记录指标：
+
+1. total reads
+2. QPS
+3. avg latency
+4. P50 latency
+5. P95 latency
+6. P99 latency
+7. bytes read
+8. O_DIRECT on/off
+
+输出格式建议：
+
+```text
+sync_disk_read_bench
+nodes=100000 dim=128 degree=64 direct_io=1
+reads=10000
+qps=xxxxx
+avg_us=xx
+p50_us=xx
+p95_us=xx
+p99_us=xx
+```
+
+## 验收标准
+
+最终实现应满足：
+
+1. 能生成 `.ssdindex` 或 `.disk.index` 文件。
+2. 文件 header 正确记录 dim、num_nodes、max_degree、record_size。
+3. 每个 node record 固定 4096 bytes。
+4. 支持通过 node id 随机读取 record。
+5. 普通 I/O 模式读写验证通过。
+6. `O_DIRECT` 模式读写验证通过。
+7. 随机读取 10000 次无数据错误。
+8. 不存在未检查的 short read / short write。
+9. 写入前后 vector 完全一致。
+10. 写入前后 neighbors 完全一致。
+11. node id 与 offset 映射正确。
+12. 越界 node id 正确报错。
+13. degree 超过 max_degree 正确报错。
+14. record 超过 4096 bytes 正确报错。
+15. benchmark 可以输出 QPS、Avg、P50、P95、P99。
+16. 普通 I/O 与 `O_DIRECT` 结果可对比。
+17. 在 WSL ext4 或原生 Linux 目录下验证，避免 `/mnt/c`、`/mnt/d` 干扰最终性能。
