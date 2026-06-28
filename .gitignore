@@ -11,8 +11,8 @@ results/
 
 !src/data/
 !src/data/**
-!include/agentmem/data/
-!include/agentmem/data/**
+!include/data/
+!include/data/**
 
 !archive/results/
 !archive/results/**
@@ -22,7 +22,6 @@ results/
 # Generated benchmark artifacts
 logs/
 indexes/
-/data/
 
 # Large index / model / data files
 *.idx
@@ -33,9 +32,3 @@ indexes/
 *.pt
 *.pth
 *.ckpt
-
-# Keep source directories named data
-!/src/data/
-!/src/data/**
-!/include/data/
-!/include/data/**
