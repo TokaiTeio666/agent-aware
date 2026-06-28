@@ -1,6 +1,8 @@
 # Agent-aware
 
-通过网盘分享的文件：项目汇报.mp4 链接: https://pan.baidu.com/s/1rGpnNQwH75amCfqMsjau5g?pwd=rrxe 提取码: rrxe
+2026年全国大学生计算机系统能力大赛-操作系统设计赛(全国)-OS功能挑战赛道proj47参赛作品
+
+视频展示：链接: https://pan.baidu.com/s/1rGpnNQwH75amCfqMsjau5g?pwd=rrxe 提取码: rrxe
 
 Agent-aware 是一个面向大模型 Agent 长期记忆场景的向量检索 I/O 优化原型。项目目标是在全精度向量常驻 SSD、内存预算约束为数据集大小 10%-20% 的条件下，提供可复现的 Top-K 近似最近邻检索、缓存/预取/I/O 统计，以及动态写入路径验证。
 
