@@ -31,6 +31,8 @@
 namespace agent_aware {
 namespace {
 
+// AsyncPageReader 将平台 I/O 差异收束到同一套页读取 API：buffered
+// pread 作为基线，O_DIRECT 用于对齐同步读，io_uring 用于重叠 I/O。
 #ifdef __linux__
 constexpr std::size_t kDirectIoAlignment = 4096;
 
@@ -100,6 +102,7 @@ class AlignedBufferPool {
   }
 
   bool acquire(std::size_t& index, void*& buffer) {
+    // io_uring 在完成前持有 buffer，因此有界池同时限制未完成 direct read 数量。
     if (free_list_.empty()) {
       return false;
     }
@@ -316,6 +319,7 @@ struct AsyncPageReader::Impl {
     }
 
     if (mode == "odirect") {
+      // Direct I/O 要求页偏移和长度都按 4KB 对齐，否则回退而不改变调用方契约。
       if (!direct_io_layout_supported()) {
         fallback_to_pread("odirect_requires_4096_aligned_pages");
         return;
@@ -404,6 +408,7 @@ struct AsyncPageReader::Impl {
 
     const std::uint64_t token = next_async_token++;
     std::string reason;
+    // 调用方只需要 token；实现层会一直持有对齐 buffer，直到 reap_async_read 消费 CQE。
     if (!ring.queue_read(fd, offset, aligned, bytes, token, reason)) {
       async_buffer_pool->release(buffer_index);
       throw std::runtime_error("Graph page async read failed: " + reason);
@@ -440,6 +445,7 @@ struct AsyncPageReader::Impl {
     }
 
     if (!async_enabled()) {
+      // 非异步模式也返回 SubmittedRead token，让批量调用方复用同一条完成路径。
       for (const auto& request : read_requests) {
         const std::uint64_t token = next_async_token++;
         inline_completions.push_back(
@@ -520,6 +526,7 @@ struct AsyncPageReader::Impl {
     if (found == async_buffers.end()) {
       throw std::runtime_error("Unknown graph async completion token");
     }
+    // 释放 direct-I/O buffer 前先拷贝到 std::vector<char>；解码后的页可能比 I/O 请求活得更久。
     AsyncBuffer buffer = found->second;
     async_buffers.erase(found);
     ++stats.io_completions;
@@ -699,6 +706,7 @@ struct AsyncPageReader::Impl {
   void close_native() {
 #ifdef __linux__
 #if AGENT_AWARE_ASYNC_CAN_USE_LIBURING
+    // 销毁 ring 和文件描述符前先收割未完成 CQE，确保池中的 direct-I/O buffer 都被归还。
     while (!async_buffers.empty()) {
       LibUring::Completion completion;
       std::string reason;

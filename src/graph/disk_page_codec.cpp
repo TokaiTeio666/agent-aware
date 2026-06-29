@@ -6,6 +6,9 @@
 
 namespace agent_aware {
 
+// Packed page 使用 SoA 布局：
+// page header -> ids -> degrees -> vectors -> neighbor ids -> neighbor PQ codes。
+// decode 必须严格按 encode 的顺序消费字段。
 std::size_t graph_record_bytes(std::size_t dim, std::size_t degree,
                                std::size_t neighbor_pq_code_bytes) {
   return sizeof(std::uint32_t) * 2 + dim * sizeof(float) +
@@ -53,6 +56,7 @@ std::vector<char> DiskPageCodec::encode_packed_page(
   put_bytes(page, offset, page_id);
   put_bytes(page, offset, node_count);
 
+  // 定宽 id 和 degree 区块让每个 slot 的向量 payload 位于可预测偏移。
   for (std::size_t slot = 0; slot < nodes_per_page; ++slot) {
     const std::uint32_t id =
         slot < node_count ? order[begin + slot]
@@ -94,6 +98,7 @@ std::vector<char> DiskPageCodec::encode_packed_page(
 
   if (pq_code_bytes > 0) {
     const auto& codes = pq_model->codes();
+    // 邻居 PQ code 与边表相邻存储，扩展时可先用 ADC 排序，再决定是否读取邻居向量页。
     for (std::size_t slot = 0; slot < nodes_per_page; ++slot) {
       const std::uint32_t node_id =
           slot < node_count ? order[begin + slot]
@@ -148,6 +153,7 @@ PackedDiskGraphIndex::DecodedPage DiskPageCodec::decode_packed_page(
     if (slot < node_count) {
       PackedDiskGraphIndex::DiskNode node;
       node.id = ids[slot];
+      // 向量字节保留在 decoded.bytes 中，节点只存 offset，避免 cache 页时复制每个向量。
       node.vector_offset = cursor;
       decoded.nodes.push_back(std::move(node));
     }

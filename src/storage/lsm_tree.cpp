@@ -13,6 +13,8 @@
 namespace agent_aware {
 namespace {
 
+// 这个 storage 层 LSM helper 是 benchmark 使用的内存 delta/search 原型；
+// 较新的 dynamic/ 目录负责持久化 WAL/SSTable 恢复路径。
 constexpr char kWalMagic[8] = {'A', 'M', 'F', 'W', 'A', 'L', 'V', '5'};  // 文件签名。
 constexpr std::uint32_t kWalVersion = 5;       // WAL 二进制格式版本。
 constexpr std::uint32_t kWalInsertRecord = 1;  // 记录包含完整向量。
@@ -388,6 +390,7 @@ void DeltaIvfFlatIndex::rebuild() {
     return;
   }
 
+  // rebuild 从完整 delta 副本重新训练 centroid，再重填所有 bucket；两次 rebuild 之间的插入分配到当前最近中心。
   initialized_centroids_ = std::min(centroid_count_, size_);
   initialize_centroids(initialized_centroids_);
 
@@ -522,6 +525,7 @@ std::vector<SearchResult> merge_topk(const std::vector<SearchResult>& lhs,
   std::unordered_map<std::uint32_t, float> best_by_id;  // 合并 Main/Delta 时按 id 去重。
   best_by_id.reserve(lhs.size() + rhs.size());
 
+  // 两侧输入已经是 top-k 候选；merge 只需按 id 保留最优距离，再做最终排序。
   auto add = [&](const std::vector<SearchResult>& values) {
     for (const auto& value : values) {
       auto found = best_by_id.find(value.id);

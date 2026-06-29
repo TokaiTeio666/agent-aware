@@ -7,6 +7,7 @@
 
 namespace agent_aware {
 
+// Product Quantization 只用于快速候选排序；最终对距离敏感的结果仍可用原始向量 rerank。
 PQTrainingStats PQEncoder::train(const VectorSet& base,
                                  const PQTrainingConfig& config) {
   if (base.empty() || base.dim == 0 || config.subspaces == 0 ||
@@ -20,6 +21,7 @@ PQTrainingStats PQEncoder::train(const VectorSet& base,
   dim_ = base.dim;
   offsets_.resize(subspaces_ + 1);
   for (std::size_t m = 0; m <= subspaces_; ++m) {
+    // 子空间按连续维度切分；dim 不能整除子空间数时，宽度最多相差一维。
     offsets_[m] = (m * dim_) / subspaces_;
   }
 
@@ -39,6 +41,7 @@ PQTrainingStats PQEncoder::train(const VectorSet& base,
     const std::size_t end = offsets_[m + 1];
     const std::size_t width = end - begin;
     for (std::size_t c = 0; c < centroids_; ++c) {
+      // 确定性的均匀采样初始化让 benchmark 索引可复现，无需额外保存训练元数据。
       const std::size_t sample = sample_ids[(c * sample_count) / centroids_];
       float* centroid = codebooks_.data() + (m * centroids_ + c) * dim_;
       std::copy(base.row(sample) + begin, base.row(sample) + end,
@@ -140,6 +143,7 @@ std::vector<float> PQEncoder::build_adc_table(const float* query) const {
   if (!enabled()) {
     return {};
   }
+  // ADC 预计算 query 到各 centroid 的距离，扩展图时用子空间查表替代完整向量 L2。
   std::vector<float> table(subspaces_ * centroids_, 0.0f);
   for (std::size_t m = 0; m < subspaces_; ++m) {
     const std::size_t begin = offsets_[m];

@@ -17,6 +17,8 @@
 namespace agent_aware::dynamic {
 namespace {
 
+// Manager 将每次可见变更都保留为 append-only DynamicRecord；
+// 本文件中的辅助函数只在读边界折叠历史版本。
 std::string sstable_name(std::uint64_t sstable_id) {
   std::ostringstream name;
   name << "sst_" << std::setw(6) << std::setfill('0') << sstable_id;
@@ -201,6 +203,7 @@ bool DynamicWriteManager::open() {
     return false;
   }
 
+  // 恢复时先加载 manifest 中已提交的 SSTable，再 replay 当前 WAL 中尚未 flush 成表的记录。
   sstables_.clear();
   recent_records_.clear();
   std::uint64_t max_loaded_sequence = 0;
@@ -293,6 +296,7 @@ bool DynamicWriteManager::erase(NodeId node_id) {
 }
 
 bool DynamicWriteManager::append_record_locked(DynamicRecord record) {
+  // WAL append 先于发布变更；即使进程在下一次 flush 前停止，已确认写入也能恢复。
   if (options_.enable_wal) {
     if (!wal_writer_ || !wal_writer_->append(record)) {
       return false;
@@ -304,6 +308,7 @@ bool DynamicWriteManager::append_record_locked(DynamicRecord record) {
   }
   recent_records_.push_back(record);
   ++manifest_.next_sequence_id;
+  // 读路径不拿 mutex_；读者通过 atomic shared_ptr load/store 消费不可变 read view。
   publish_read_view_locked();
 
   if (options_.enable_auto_flush && memtable_->should_flush()) {
@@ -326,6 +331,7 @@ bool DynamicWriteManager::flush_locked() {
     return true;
   }
 
+  // Flush 先写完整 SSTable 和 manifest，确认提交后才清空 MemTable 并轮转 WAL。
   const auto sstable_id = manifest_.next_sstable_id;
   SSTableWriter writer(sstable_dir(), sstable_id, 0);
   if (!writer.write(snapshot)) {
@@ -477,6 +483,7 @@ std::vector<NodeId> DynamicWriteManager::select_incremental_neighbors_locked(
     return {};
   }
 
+  // Delta graph 边只属于动态覆盖层，用于后续 overlay 工作，不修改不可变 packed base graph。
   const auto records = collect_all_delta_records_locked();
   std::vector<ScoredRecord> candidates;
   candidates.reserve(records.size());
@@ -551,6 +558,7 @@ bool DynamicWriteManager::compact_once(DynamicCompactionStats* stats) {
     return false;
   }
 
+  // 当前 compaction 是 full-table：把所有可见 SSTable 合并成一个 level-1 表，再原子替换 manifest。
   agent_aware::dynamic::CompactionInput input;
   input.input_tables = sstables_;
   input.output_dir = sstable_dir();
@@ -646,6 +654,7 @@ bool DynamicWriteManager::rotate_wal_locked() {
   wal_writer_.reset();
 
   std::error_code error;
+  // Flush 后数据已由 manifest 可见，旧 WAL 不再参与恢复；新的空 WAL 成为下一段崩溃边界。
   std::filesystem::remove(wal_path(), error);
   wal_writer_ = std::make_unique<WalWriter>(wal_path());
   return wal_writer_->sync();
@@ -682,6 +691,7 @@ std::vector<SearchResult> merge_base_and_delta_l2(
   }
 
   for (const auto& record : delta_records) {
+    // Tombstone 删除 base 命中；insert/update 用动态向量精确距离按 id 覆盖旧结果。
     if (record.deleted) {
       by_id.erase(record.node_id);
       continue;

@@ -9,6 +9,7 @@
 namespace agent_aware {
 namespace {
 
+// 数据集工具负责加载 SIFT 风格 fvecs/ivecs，或生成带可选 Agent 会话局部性的聚簇合成负载。
 std::int32_t read_i32(std::ifstream& input, const std::string& path) {
   std::int32_t value = 0;  // fvecs/ivecs 每条记录都以 int32 维度开头。
   input.read(reinterpret_cast<char*>(&value), sizeof(value));
@@ -223,6 +224,7 @@ LoadedDataset load_dataset(const DatasetLoadConfig& config) {
   LoadedDataset loaded;
 
   if (config.synthetic) {
+    // 先生成足够覆盖 offset+limit 的 query，再切片，使合成数据和文件加载保持同样的窗口语义。
     auto synthetic_config = config.synthetic_config;
     if (config.query_limit > 0) {
       synthetic_config.query_count =
@@ -241,6 +243,7 @@ LoadedDataset load_dataset(const DatasetLoadConfig& config) {
 
   DatasetPaths paths = config.paths;
   if (!paths.sift_dir.empty()) {
+    // SIFT 目录提供默认文件名；显式路径可分别覆盖 base/query/truth 文件。
     const DatasetPaths sift_paths = resolve_sift_paths(paths.sift_dir);
     if (paths.base.empty()) {
       paths.base = sift_paths.base;

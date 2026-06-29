@@ -6,6 +6,7 @@
 
 namespace agent_aware {
 
+// StorageEngine 是 benchmark 使用的窄适配层，让精确内存搜索和 packed-graph 搜索暴露同一套读写接口。
 void StorageEngine::insert(std::uint32_t, const float*) {
   throw std::runtime_error("StorageEngine insert is not implemented");
 }
@@ -42,6 +43,7 @@ EngineSearchResult PackedGraphEngine::search_one(const float* query,
   search.top_k = top_k;
 
   EngineSearchResult output;
+  // 访问 base graph 前先捕获动态读序列；后续 delta lookup 和 merge 必须使用同一个逻辑快照。
   const auto snapshot_start = std::chrono::steady_clock::now();
   const std::uint64_t read_sequence =
       config_.dynamic_manager ? config_.dynamic_manager->current_sequence() : 0;
@@ -62,6 +64,7 @@ EngineSearchResult PackedGraphEngine::search_one(const float* query,
     for (const auto& result : graph_result.topk) {
       base_ids.push_back(result.id);
     }
+    // base id 可能已有更新版本或 tombstone，合并新增 id 前需要显式查一次动态层。
     const auto latest_start = std::chrono::steady_clock::now();
     auto latest_base_records = config_.dynamic_manager->latest_records_for(
         base_ids, read_sequence, true);
@@ -81,6 +84,7 @@ EngineSearchResult PackedGraphEngine::search_one(const float* query,
     for (auto& item : latest_base_records) {
       delta_records.push_back(std::move(item.second));
     }
+    // 最终 top-k 会用所有可见 delta 记录的精确向量计算，保证删除和更新覆盖近似 base 结果。
     const auto merge_start = std::chrono::steady_clock::now();
     output.topk = dynamic::merge_base_and_delta_l2(
         graph_result.topk, delta_records, query, metadata().dim, top_k);

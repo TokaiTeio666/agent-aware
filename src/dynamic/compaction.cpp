@@ -10,6 +10,7 @@
 namespace agent_aware::dynamic {
 namespace {
 
+// Compaction 在写出新 SSTable 前先合并重复 node id，保持 last-write-wins 语义。
 std::string sstable_name(std::uint64_t sstable_id) {
   std::ostringstream name;
   name << "sst_" << std::setw(6) << std::setfill('0') << sstable_id;
@@ -59,6 +60,7 @@ CompactionResult CompactionJob::run() {
     if (!table) {
       return result;
     }
+    // 复用 Reader 校验，避免 compaction 把不可读表静默传播到下一版 manifest。
     auto table_records = table->scan_all();
     result.input_record_count += table_records.size();
     records.insert(records.end(),

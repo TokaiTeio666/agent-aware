@@ -12,6 +12,7 @@
 namespace agent_aware {
 namespace {
 
+// 暴力搜索是 recall 校验的正确性基线，也适合 delta 集合仍较小时的动态覆盖层。
 struct HeapItem {
   std::uint32_t id = 0;
   float distance = 0.0f;
@@ -36,6 +37,7 @@ float squared_l2(const float* lhs, const float* rhs, std::size_t dim) {
   float distance = 0.0f;
   std::size_t i = 0;
 
+  // 可用时使用 SIMD，剩余尾部仍走标量累加，保证所有调用方的计算口径一致。
 #if defined(__AVX__)
   __m256 acc = _mm256_setzero_ps();
   for (; i + 8 <= dim; i += 8) {
@@ -104,6 +106,7 @@ std::vector<SearchResult> search_memory_fast(const VectorSet& base,
   const std::size_t effective_k = std::min(k, base.size());
   std::priority_queue<HeapItem, std::vector<HeapItem>, WorseFirst> heap;
 
+  // 只维护当前 worst-first top-k 堆，不物化全部距离，避免抽样校验时基线成本过高。
   for (std::size_t i = 0; i < base.size(); ++i) {
     const float distance = squared_l2(query, base.row(i), base.dim);
     const HeapItem item{static_cast<std::uint32_t>(i), distance};

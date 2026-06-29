@@ -20,6 +20,7 @@
 namespace agent_aware {
 namespace {
 
+// NaiveDiskGraphIndex 是 V1 基线：每个节点独占一页，用于校验搜索行为和衡量随机读放大。
 constexpr char kMagic[8] = {'A', 'M', 'F', 'G', 'V', '1', '\0', '\0'};
 constexpr std::uint32_t kVersion = 1;
 
@@ -163,6 +164,7 @@ NaiveDiskGraphIndex::DiskNode NaiveDiskGraphIndex::read_node(
   std::vector<char> page =
       page_reader_->read(offset, metadata_.page_size, stats);
 
+  // V1 页存放一个完整节点，因此解码时复制向量和邻居到自有 DiskNode，而不是共享页内存。
   std::size_t cursor = 0;
   DiskNode node;
   node.id = get_bytes<std::uint32_t>(page, cursor);
@@ -238,6 +240,7 @@ DiskGraphSearchResult NaiveDiskGraphIndex::search_one(
         std::chrono::duration<double, std::micro>(adc_end - adc_start).count();
   }
   auto candidate_distance = [&](std::uint32_t id) {
+    // 启用 PQ 后，扩展阶段无需读取完整页即可给未访问邻居打分，后续 exact rerank 再校正保留候选。
     if (!adc_table.empty()) {
       ++output.stats.pq_filter_accept_count;
       return config.pq_model->adc_distance(id, adc_table);

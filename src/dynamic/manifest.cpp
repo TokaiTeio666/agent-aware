@@ -10,6 +10,7 @@
 namespace agent_aware::dynamic {
 namespace {
 
+// manifest 是动态层的提交记录；这里刻意使用很小的手写 JSON 格式，恢复时无需额外依赖。
 constexpr std::uint32_t kManifestVersion = 1;
 
 bool parse_json_integer(const std::string& text, const std::string& key,
@@ -65,6 +66,7 @@ Manifest::Manifest(std::filesystem::path path) : path_(std::move(path)) {}
 
 bool Manifest::load(ManifestData& data) const {
   if (!std::filesystem::exists(path_)) {
+    // manifest 缺失表示全新的动态目录，不是恢复错误。
     data = ManifestData{};
     return true;
   }
@@ -121,6 +123,7 @@ bool Manifest::save(const ManifestData& data) const {
 
   const auto tmp_path = path_.string() + ".tmp";
   {
+    // 先写完整的下一版状态；后续 rename 是 DynamicWriteManager::open() 看到的提交点。
     std::ofstream output(tmp_path, std::ios::trunc);
     if (!output) {
       return false;
@@ -155,6 +158,7 @@ bool Manifest::save(const ManifestData& data) const {
     return true;
   }
 
+  // 某些文件系统 rename 不会覆盖已有目标，因此在临时文件安全关闭后删除旧 manifest 再重试。
   error.clear();
   std::filesystem::remove(path_, error);
   error.clear();

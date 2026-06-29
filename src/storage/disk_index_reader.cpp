@@ -26,6 +26,7 @@
 namespace agent_aware {
 namespace {
 
+// DiskIndexReader 同时支持可移植 stream 和 POSIX pread/O_DIRECT；对外始终读取完整 4KB 页。
 std::string errno_message(const std::string& prefix, const std::string& path) {
   return prefix + ": " + path + ": " + std::strerror(errno);
 }
@@ -144,6 +145,7 @@ void DiskIndexReader::read_node_into(std::uint32_t node_id,
     throw std::runtime_error("Disk index read buffer is null");
   }
   if (use_direct_io_) {
+    // O_DIRECT 除了页大小偏移外，还要求 buffer 本身按页对齐。
     require_direct_aligned(aligned_buffer);
   }
   read_page_at(aligned_buffer, disk_record_offset(node_id, header_));

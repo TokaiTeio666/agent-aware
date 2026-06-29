@@ -14,6 +14,7 @@
 namespace agent_aware {
 namespace {
 
+// 磁盘记录是固定 4KB 页；header 描述同一页内的字节偏移，reader 先校验布局再复制 payload。
 std::uint32_t fnv1a_bytes(const void* data, std::size_t bytes,
                           std::uint32_t seed = 2166136261u) {
   const auto* cursor = static_cast<const std::uint8_t*>(data);
@@ -216,6 +217,7 @@ void encode_node_record(std::uint32_t node_id, const float* vector,
       vector, dim, neighbors.data(), header.degree, neighbor_pq_codes.data(),
       header.neighbor_pq_code_bytes);
 
+  // 剩余页空间置零，后续格式扩展可保持稳定偏移，也避免把未初始化内存写入磁盘。
   std::memcpy(bytes, &header, sizeof(header));
   std::memcpy(bytes + header.vector_offset, vector,
               static_cast<std::size_t>(dim) * sizeof(float));
@@ -261,6 +263,7 @@ NodeRecord decode_node_record(const void* buffer, std::size_t buffer_bytes) {
     throw std::runtime_error("Disk node record layout is inconsistent");
   }
 
+  // 复制 payload 到 NodeRecord 前先校验 checksum，避免损坏页进入上层图逻辑。
   const auto* vector_ptr =
       reinterpret_cast<const float*>(bytes + header.vector_offset);
   const auto* neighbor_ptr =

@@ -5,6 +5,7 @@
 namespace agent_aware {
 namespace {
 
+// MemTable 每个 node 只保留最新记录；完整版本历史由 DynamicWriteManager::recent_records_ 保留给快照读。
 std::size_t estimate_record_bytes(const DynamicRecord& record) {
   return sizeof(DynamicRecord) + record.vector.size() * sizeof(float) +
          record.neighbors.size() * sizeof(NodeId);
@@ -19,6 +20,7 @@ bool MemTable::insert(const DynamicRecord& record) {
   std::unique_lock<std::shared_mutex> lock(mutex_);
   const auto existing = records_.find(record.node_id);
   if (existing != records_.end()) {
+    // sequence id 单调递增，replay 出来的旧记录或重复记录不能覆盖更新的内存值。
     if (record.sequence_id <= existing->second.sequence_id) {
       return false;
     }

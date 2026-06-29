@@ -14,6 +14,7 @@
 namespace agent_aware {
 namespace {
 
+// VamanaBuilder 在磁盘 builder 序列化前先构造内存图；deleted id 在整个构建过程中都视为不存在。
 struct Candidate {
   std::uint32_t id = 0;
   float distance = 0.0f;
@@ -106,6 +107,7 @@ VamanaGraph VamanaBuilder::build(const VectorSet& base) const {
   output.stats.medoid = output.medoid;
 
   const auto order = build_order(base.size());
+  // 随机插入顺序避免原始 id 顺序带来的偏置，同时固定 seed 下保持确定性。
   for (const auto node_id : order) {
     if (is_deleted(deleted, node_id)) {
       output.adjacency[node_id].clear();
@@ -215,6 +217,7 @@ std::vector<std::uint32_t> VamanaBuilder::search_for_construction(
   }
 
   while (!frontier.empty() && explored.size() < config_.search_width) {
+    // 构建阶段 search 在当前图上贪心扩展，返回给 robust prune 的候选池，而不是最终查询结果。
     const Candidate current = frontier.top();
     frontier.pop();
     explored.push_back(current);
@@ -270,6 +273,7 @@ std::vector<std::uint32_t> VamanaBuilder::robust_prune(
     const Candidate picked = pool.front();
     output.push_back(picked.id);
 
+    // robust prune 只保留不能被更近已选邻居解释的候选；alpha 越大，裁剪越宽松。
     remaining.clear();
     for (std::size_t i = 1; i < pool.size(); ++i) {
       const Candidate& candidate = pool[i];
@@ -316,6 +320,7 @@ void VamanaBuilder::insert(const VectorSet& base,
   if (!config_.add_reverse_edges) {
     return;
   }
+  // 反向边改善可达性；目标邻接表超载时用同样的 robust-prune 规则保持度数有界。
   const std::vector<std::uint32_t> neighbors = graph[node_id];
   for (const auto target : neighbors) {
     add_reverse_edge(base, graph, node_id, target, stats);

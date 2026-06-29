@@ -29,6 +29,7 @@
 
 namespace {
 
+// SIFT benchmark 负责构建或打开 packed graph 索引、执行 ANN 搜索，并输出包含 recall、latency、I/O、cache、prefetch 的 JSON。
 namespace fs = std::filesystem;
 using Clock = std::chrono::steady_clock;
 
@@ -811,6 +812,7 @@ MemoryBudgetReport apply_memory_budget_defaults(
   const std::size_t workers =
       std::min(args.num_search_threads,
                std::max<std::size_t>(1, dataset.queries.size()));
+  // 多线程搜索每个 worker 都会创建一份 index/cache 实例，因此 directory 和 cache 估算按 worker 数放大。
   const std::size_t directory_copies = workers == 1 ? 1 : workers + 1;
   const std::uint64_t node_directory_bytes =
       static_cast<std::uint64_t>(dataset.base.size()) *
@@ -854,6 +856,7 @@ void build_index_if_needed(const Args& args, const agent_aware::VectorSet& base,
   if (!args.rebuild_index && fs::exists(args.index_path)) {
     return;
   }
+  // 在固定 seed、policy 和 packing strategy 下索引构建是确定性的，便于跨运行比较结果 JSON。
   if (!args.index_path.parent_path().empty()) {
     fs::create_directories(args.index_path.parent_path());
   }
@@ -918,6 +921,7 @@ SearchAggregate run_search_worker(const Args& args,
   SearchAggregate aggregate;
   for (std::size_t i = first_query; i < dataset.queries.size();
        i += query_stride) {
+    // worker 以 stride 方式遍历 query，避免共享可变 query 状态，并保持每个 worker 的延迟样本独立。
     auto search =
         make_search_config(args, pq_model, entry_seed_ids,
                            args.prefetch_width);
@@ -960,6 +964,7 @@ SearchAggregate run_searches(const Args& args,
         run_search_worker(args, dataset, index, pq_model, entry_seed_ids, 0,
                           worker_count));
   } else {
+    // 每个 worker 打开自己的 PackedDiskGraphIndex，因为本 benchmark 中页 cache 和异步 I/O 状态按 index/thread 隔离。
     std::vector<SearchAggregate> partials(worker_count);
     std::vector<std::exception_ptr> errors(worker_count);
     std::vector<std::thread> workers;

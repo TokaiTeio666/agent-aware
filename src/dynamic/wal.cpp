@@ -7,6 +7,7 @@
 namespace agent_aware::dynamic {
 namespace {
 
+// 动态 WAL 刻意采用记录粒度：replay 遇到第一个畸形或不完整记录就停止，崩溃留下的 torn tail 可安全忽略。
 constexpr std::uint32_t kWalRecordMagic = 0x41574c50;  // "PLWA", little endian.
 constexpr std::uint16_t kWalRecordVersion = 1;
 constexpr std::uint16_t kWalInsertOp = 1;
@@ -142,6 +143,7 @@ bool WalWriter::append(const DynamicRecord& record) {
   header.deleted = record.deleted ? 1 : 0;
   header.payload_checksum = checksum_payload(record.vector, record.neighbors);
 
+  // header 和 payload 作为一条逻辑记录追加；checksum 覆盖向量字节和可选动态邻居元数据。
   if (!write_header(output_, header)) {
     return false;
   }
@@ -191,6 +193,7 @@ std::vector<DynamicRecord> WalReader::replay() {
 
   while (input.peek() != std::char_traits<char>::eof()) {
     WalRecordHeader header;
+    // 短读或非法记录视为 durable prefix 的结束。
     if (!read_header(input, header) || !header_shape_is_valid(header)) {
       break;
     }

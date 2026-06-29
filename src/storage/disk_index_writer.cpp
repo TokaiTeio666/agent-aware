@@ -26,6 +26,7 @@
 namespace agent_aware {
 namespace {
 
+// Writer 与 DiskIndexReader 对称：调用方提供完整节点记录，writer 将其写入确定的 4KB 偏移。
 std::string errno_message(const std::string& prefix, const std::string& path) {
   return prefix + ": " + path + ": " + std::strerror(errno);
 }
@@ -179,6 +180,7 @@ void DiskIndexWriter::close() {
 
 #if AGENT_AWARE_CAN_USE_POSIX_IO
   if (fd_ >= 0) {
+    // close 前 fsync，保证刚构建的索引文件能被随后的 DiskIndexReader benchmark 立即可靠打开。
     if (::fsync(fd_) != 0) {
       const auto message = errno_message("Failed to fsync disk index", path_);
       ::close(fd_);

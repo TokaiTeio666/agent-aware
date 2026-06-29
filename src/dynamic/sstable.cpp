@@ -12,6 +12,7 @@
 namespace agent_aware::dynamic {
 namespace {
 
+// 每个 SSTable 由三个同名前缀文件组成：.data 存序列化记录，.index 做 node_id -> offset 查找，.meta 做快速校验。
 constexpr std::uint32_t kSSTableDataMagic = 0x44535450;   // "PSTD".
 constexpr std::uint32_t kSSTableIndexMagic = 0x49535450;  // "PSTI".
 constexpr std::uint16_t kSSTableVersion = 1;
@@ -148,6 +149,7 @@ bool write_record(std::ofstream& output, const DynamicRecord& record) {
   header.neighbor_count = static_cast<std::uint32_t>(record.neighbors.size());
   header.payload_checksum = checksum_payload(record.vector, record.neighbors);
 
+  // 删除记录保持相同结构；空向量 payload 加 deleted 位即可在后续 merge 中压制旧 base/delta 值。
   if (!write_data_header(output, header)) {
     return false;
   }
@@ -375,6 +377,7 @@ bool SSTableWriter::write(const std::vector<DynamicRecord>& records) {
   const auto data_path = with_extension(base_path, ".data");
   const auto index_path = with_extension(base_path, ".index");
   const auto meta_path = with_extension(base_path, ".meta");
+  // flush 出来的表每个 node 只保留最新版本；表进入 manifest 后，旧版本已经过时。
   const auto latest_records = deduplicate_records(records);
 
   std::uint64_t min_sequence_id = 0;
@@ -397,6 +400,7 @@ bool SSTableWriter::write(const std::vector<DynamicRecord>& records) {
 
   for (const auto& record : latest_records) {
     const auto offset = static_cast<std::uint64_t>(data_output.tellp());
+    // index 记录 data offset 供点查；scan_all 复用同一路径，保持校验行为一致。
     if (!write_record(data_output, record) ||
         !write_index_entry(index_output, record.node_id, record.sequence_id,
                            offset)) {
@@ -423,6 +427,7 @@ bool SSTableReader::open() {
   index_.clear();
   opened_ = false;
 
+  // 先加载 metadata 再读二进制 index，文件集合不匹配时尽早拒绝，避免返回部分结果。
   if (!load_meta(meta_path_, id_, level_, record_count_, min_sequence_id_,
                  max_sequence_id_)) {
     return false;

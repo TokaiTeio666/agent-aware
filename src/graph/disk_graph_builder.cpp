@@ -22,6 +22,7 @@
 namespace agent_aware {
 namespace {
 
+// 磁盘图 builder 将内存邻接图写成两种布局：V1 单节点一页基线，或查询使用的 V2 packed-page。
 constexpr char kMagic[8] = {'A', 'M', 'F', 'G', 'V', '1', '\0', '\0'};  // 单节点页格式。
 constexpr char kPackedMagic[8] = {'A', 'M', 'F', 'P', 'V', '2', '\0', '\0'};  // 紧凑页格式。
 constexpr std::uint32_t kVersion = 1;
@@ -1216,6 +1217,7 @@ std::vector<std::uint32_t> hotpath_order(
 std::vector<std::uint32_t> packed_order(
     const VectorSet& base, const std::vector<std::vector<std::uint32_t>>& graph,
     const DiskGraphBuildConfig& config, std::size_t nodes_per_page) {
+  // 图构建后不可变；packing 是不改变搜索语义前提下改善后续页局部性的主要机会。
   if (config.packing_strategy == "random") {
     return random_order(graph.size(), config.random_seed);
   }
@@ -1378,6 +1380,7 @@ void PackedDiskGraphBuilder::build(const VectorSet& base,
   const std::uint64_t records_offset =
       align_up(directory_offset + directory_bytes, config.page_size);
 
+  // directory 位于 records 前，让搜索无需解码图页即可把 node id 映射到 page id。
   std::vector<std::uint32_t> node_to_page(base.size(), 0);  // 查询时 O(1) 定位所在页。
   for (std::size_t position = 0; position < order.size(); ++position) {
     const std::uint32_t page_id =

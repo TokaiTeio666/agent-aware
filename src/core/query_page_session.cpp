@@ -13,6 +13,8 @@
 namespace agent_aware {
 namespace {
 
+// QueryPageSession 持有单次 query 的全部页状态：已物化节点、飞行中的预取、
+// ready 页，以及共享 cache 中的临时 pin。
 std::mutex& prefetch_trace_mutex() {
   static std::mutex mutex;
   return mutex;
@@ -139,6 +141,7 @@ const QueryPageSession::Page& QueryPageSession::get_or_load_page(
   ++stats_.page_requests_before_dedup;
   record_prefetch_demand(page_id);
 
+  // 解析顺序很关键：query 本地页、全局 cache、ready 预取、pending 预取，最后才是同步 demand 读。
   const auto owned = owned_pages_.find(page_id);
   if (owned != owned_pages_.end()) {
     ++stats_.pinned_hits;
@@ -266,6 +269,7 @@ void QueryPageSession::ensure_pages_loaded_batch(
   stats_.page_requests_before_dedup += page_ids.size();
   stats_.page_dedup_requests += page_ids.size();
 
+  // 批量加载先消除 beam 内重复页，让 I/O 提交和单 query 物化量都按唯一页数计。
   std::vector<std::uint32_t> unique_pages;
   unique_pages.reserve(page_ids.size());
   std::unordered_set<std::uint32_t> seen;
@@ -318,6 +322,7 @@ void QueryPageSession::ensure_pages_loaded_batch(
           ? std::max<std::size_t>(1, demand_io_reserve())
           : missing_pages.size();
 
+  // 即使在异步模式下，demand 读也分块提交，为已经在飞行中的预取保留队列空间。
   for (std::size_t begin = 0; begin < missing_pages.size();
        begin += chunk_limit) {
     const std::size_t end =
@@ -538,6 +543,7 @@ void QueryPageSession::finish_query() {
   pending_hit_pages_.clear();
   stats_.prefetch_wasted_pages = stats_.prefetch_dropped;
   stats_.p4_io.prefetch_dropped = stats_.prefetch_dropped;
+  // 汇总计数只在查询结束时计算一次，此时所有 pending/ready 预取都已被消费或标记为 dropped。
   stats_.unique_pages_touched = visited_pages_.size();
   stats_.unique_demand_pages = demand_pages_.size();
   stats_.unique_prefetch_pages = prefetch_pages_.size();
@@ -1019,6 +1025,7 @@ bool QueryPageSession::queue_prefetch_request(
 
   if (prefetch_budget_pages_ == 0 ||
       demand_inflight_pages_ >= demand_io_reserve()) {
+    // 推测读不能借用 demand reserve；搜索主循环请求的 beam 页必须能立即推进。
     ++stats_.demand_priority_blocks_prefetch;
     record_prefetch_rejected(page_id, "demand_priority");
     return false;

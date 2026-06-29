@@ -32,6 +32,7 @@
 
 namespace {
 
+// 混合读写 benchmark 覆盖静态 packed graph + 动态 overlay 在顺序和并发负载下的路径。
 using Clock = std::chrono::steady_clock;
 
 struct Args {
@@ -534,6 +535,7 @@ bool search_result_less(const agent_aware::SearchResult& lhs,
 std::vector<agent_aware::SearchResult> exact_dynamic_topk(
     const agent_aware::VectorSet& base, const float* query, std::size_t topk,
     const agent_aware::dynamic::DynamicSnapshot& snapshot) {
+  // exact recall 使用与 engine 路径相同的快照语义：动态更新覆盖 base 向量，tombstone 删除 base id。
   std::unordered_map<agent_aware::NodeId, agent_aware::DynamicRecord> latest;
   latest.reserve(snapshot.records.size());
   for (const auto& record : snapshot.records) {
@@ -591,6 +593,7 @@ std::vector<agent_aware::SearchResult> search_memory_with_delta(
   }
   auto latest_base_records =
       manager->latest_records_for(base_ids, read_sequence, true);
+  // memory 模式对齐 PackedGraphEngine::search_one，方便用同一套 delta merge 语义比较图路径和 exact-base 路径。
   auto delta_records = manager->search_delta_l2_at(
       query, static_cast<std::uint32_t>(base.dim), topk, read_sequence);
   delta_records.reserve(delta_records.size() + latest_base_records.size());
@@ -734,6 +737,7 @@ void record_recall_sample(
     const std::shared_ptr<agent_aware::dynamic::DynamicWriteManager>& manager,
     std::uint64_t read_sequence) {
   const auto recall_start = Clock::now();
+  // recall 抽样可限速，因为 exact_dynamic_topk 会扫描完整 base 和可见 delta，否则会主导压测成本。
   const auto snapshot = manager->snapshot(read_sequence);
   const auto exact = exact_dynamic_topk(base, query, topk, snapshot);
   metrics.recall_sum +=
@@ -899,6 +903,7 @@ ScenarioResult run_sequential_scenario(
     const agent_aware::VectorSet& base,
     const std::vector<std::vector<float>>& queries) {
   const auto scenario_dir = args.dynamic_dir / scenario.name;
+  // 每个场景使用干净的动态目录，避免 recovery、flush 和磁盘占用指标被上一场景污染。
   std::filesystem::remove_all(scenario_dir);
   std::filesystem::create_directories(scenario_dir);
   auto manager = open_manager(args, scenario_dir);
@@ -1030,6 +1035,7 @@ ScenarioResult run_concurrent_scenario(
   std::atomic<std::size_t> write_index{0};
 
   auto claim_operation = [&]() {
+    // timed 模式下 worker 跑到 wall-clock stop；否则通过原子计数领取固定数量的操作槽位。
     if (args.duration_sec > 0.0) {
       return !stop.load(std::memory_order_relaxed);
     }

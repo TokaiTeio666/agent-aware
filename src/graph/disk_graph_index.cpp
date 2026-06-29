@@ -26,6 +26,7 @@
 namespace agent_aware {
 namespace {
 
+// PackedDiskGraphIndex 查询 V2 页布局，组合 PQ/ADC 候选打分、页 cache 复用和单 query 异步预取会话。
 struct CloserFirst {
   bool operator()(const SearchResult& lhs, const SearchResult& rhs) const {
     if (lhs.distance == rhs.distance) {
@@ -99,6 +100,7 @@ struct PackedDiskGraphIndex::SearchState {
         output(output),
         session(index, config, output.stats) {}
 
+  // SearchState 保存单 query 可变遍历状态；共享的 index 对象只负责索引元数据和 cache。
   const DiskNode& load_node(std::uint32_t id) {
     return session.get_node(id, config.same_page_reuse);
   }
@@ -253,6 +255,7 @@ void PackedDiskGraphIndex::configure_cache(const std::string& policy,
   }
   if (policy == "graph-aware-2q" || policy == "agent" ||
       protect_hot_pages) {
+    // hub-aware 策略需要从序列化图中统计入度，只在策略真正会使用时才懒加载。
     ensure_node_in_degrees();
   }
   std::lock_guard<std::mutex> lock(cache_mutex_);
@@ -388,6 +391,7 @@ void PackedDiskGraphIndex::ensure_node_in_degrees() {
     return;
   }
 
+  // 这是 cache 策略使用的离线统计，刻意走 read_page，校验正常查询也会读取的同一份字节。
   node_in_degrees_.assign(static_cast<std::size_t>(metadata_.vector_count), 0);
   DiskGraphSearchStats ignored;
   for (std::uint32_t page_id = 0; page_id < metadata_.page_count; ++page_id) {
@@ -542,6 +546,7 @@ double PackedDiskGraphIndex::cache_score(const CacheEntry& entry) const {
   }
 
   if (is_graph_aware_cache_policy()) {
+    // graph-aware 2Q 保留 recency/protected-queue 信号，并加入 hub bonus 和频次上限来保护高复用页。
     const double queue_bonus = entry.protected_queue ? 1000000000.0 : 0.0;
     const double hot_bonus = std::log1p(static_cast<double>(entry.hot_score)) *
                              64.0;
@@ -715,6 +720,7 @@ PackedDiskGraphIndex::initialize_search_state(
 
   state->entry_seed_ids.clear();
   state->entry_seed_ids.reserve(ranked_entries.size());
+  // entry point 按 PQ 距离顺序入堆，避免第一批扩展被任意 id 顺序主导。
   for (const auto& result : ranked_entries) {
     state->entry_seed_ids.push_back(result.id);
     state->candidates.push(result);
@@ -1073,6 +1079,7 @@ void PackedDiskGraphIndex::expand_candidate_batch(
     std::vector<SearchResult> ranked_neighbors =
         state.rank_neighbors_by_distance(new_neighbors);
 
+    // PQ 排名前列的邻居页通常会被下一轮 beam 最早 demand，因此趁 CPU 仍在处理时提交预取。
     for (std::size_t j = 0;
          j < ranked_neighbors.size() && prefetch_pages.size() < prefetch_count;
          ++j) {
@@ -1112,6 +1119,7 @@ void PackedDiskGraphIndex::finalize_topk(SearchState& state) {
   state.output.stats.visited = state.visited.size();
   state.output.topk = sorted_results(state.best);
   if (!state.adc_table.empty() && state.config.rerank_topk > 0) {
+    // PQ 距离是近似值；最终 rerank 会读取已物化页，对保留下来的候选池计算精确 L2。
     (void)maybe_issue_rerank_prefetch(state);
     const std::size_t reads_before_rerank = state.output.stats.node_reads;
     for (auto& result : state.output.topk) {

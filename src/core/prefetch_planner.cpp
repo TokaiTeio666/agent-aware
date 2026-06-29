@@ -13,6 +13,8 @@
 namespace agent_aware {
 namespace {
 
+// PrefetchPlanner 将按节点排序的 lookahead 列表聚合为按页排序的 I/O 请求；
+// 既可做启发式筛选，也可用 XGBoost dump 给页面打分。
 constexpr std::size_t kTopCandidateCutoff = 4;
 
 double finite_or_zero(double value) {
@@ -217,6 +219,7 @@ PrefetchPlanner::Plan PrefetchPlanner::plan_coalesced_candidates(
     auto [it, inserted] = aggregates.emplace(page_id, Aggregate{});
     Aggregate& aggregate = it->second;
     if (inserted) {
+      // 同一页可能承载多个高分邻居；首次出现时记录可用性和当前搜索上下文。
       aggregate.feature.page_id = page_id;
       aggregate.feature.min_pq_rank_on_page = rank;
       aggregate.last_rank = rank;
@@ -288,6 +291,7 @@ PrefetchPlanner::Plan PrefetchPlanner::plan_coalesced_candidates(
     }
     aggregate.feature.candidate_rank_span =
         aggregate.last_rank - aggregate.feature.min_pq_rank_on_page;
+    // 排序使用页级特征而不是原始 node id，因此能优先选择覆盖多个前沿候选的页。
     candidates.push_back(PageCandidate{aggregate.feature,
                                        aggregate.eligible});
   }
@@ -325,6 +329,7 @@ PrefetchPlanner::Plan PrefetchPlanner::rank_and_throttle(
         finite_or_negative_infinity(score_candidate(candidate.feature));
   }
 
+  // 模型分数越高越优先；确定性 tie-breaker 保证重复 benchmark 可比较。
   std::sort(candidates.begin(), candidates.end(),
             [](const PageCandidate& lhs, const PageCandidate& rhs) {
               if (lhs.feature.score != rhs.feature.score) {
@@ -387,6 +392,7 @@ PrefetchPlanner::Plan PrefetchPlanner::rank_and_throttle(
   }
 
   if (plan.pages.empty() && allow_low_reuse_fallback) {
+    // 如果所有候选只因复用阈值被过滤，保底提交一个最佳低复用页，避免本轮预取为空。
     for (auto& feature : plan.candidates) {
       if (feature.skip_reason != "low_page_reuse" ||
           feature.score < config_.score_threshold) {
@@ -425,6 +431,7 @@ void PrefetchPlanner::load_xgboost_model(const std::string& path) {
   std::string line;
   XGBoostTree* current_tree = nullptr;
   while (std::getline(input, line)) {
+    // 支持的输入是 XGBoost 明文树 dump，可包含训练脚本生成的 base_score= 行。
     const auto comment = line.find('#');
     if (comment != std::string::npos) {
       line = line.substr(0, comment);

@@ -9,6 +9,7 @@
 namespace agent_aware {
 namespace {
 
+// entry 选择在覆盖率和启动成本之间折中：可从单个全局 medoid、均匀 id，或 medoid/hub/cluster 混合入口启动。
 float squared_l2_to_vector(const float* lhs, const std::vector<float>& rhs,
                            std::size_t dim) {
   float distance = 0.0f;
@@ -98,6 +99,7 @@ std::vector<std::uint32_t> select_cluster_medoids(
 
   std::vector<float> centroids(centroid_count * base.dim, 0.0f);
   for (std::size_t centroid = 0; centroid < centroid_count; ++centroid) {
+    // 训练样本确定性选择，让同一数据集上的重复 benchmark 保持稳定 entry id。
     std::size_t sample_index = 0;
     if (centroid_count == 1) {
       sample_index = sample_ids.size() / 2;
@@ -285,6 +287,7 @@ std::vector<std::uint32_t> select_entry_points(
   entries.reserve(config.entry_count);
   append_unique(entries, seen, select_global_medoid(base), config.entry_count);
 
+  // hybrid 模式先放全局覆盖，再放图 hub，最后放 cluster medoid；重复或空桶由均匀 fallback 补齐。
   if (node_in_degrees != nullptr) {
     const auto hubs = select_hub_entries(*node_in_degrees, base.size(),
                                          config.hub_count);
