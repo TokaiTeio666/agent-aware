@@ -44,7 +44,8 @@ class QueryPageSession {
   void submit_prefetch(const std::vector<std::uint32_t>& page_ids);
   void submit_candidate_prefetch(
       const std::vector<std::uint32_t>& page_ids,
-      const std::string& trigger = "candidate");
+      const std::string& trigger = "candidate",
+      std::size_t max_pages = 0);
   std::size_t submit_jit_prefetch(
       const std::vector<std::uint32_t>& page_ids,
       const std::string& trigger = "pre_beam",
@@ -72,12 +73,16 @@ class QueryPageSession {
   void record_duplicate_skipped(std::size_t count = 1);
   void record_prefetch_plan(const PrefetchPlanner::Plan& plan,
                             const std::string& trigger);
-  void record_prefetch_submit(std::uint32_t page_id);
+  void record_prefetch_submit(std::uint32_t page_id, std::uint64_t token);
   void record_prefetch_rejected(std::uint32_t page_id,
                                 const std::string& reason);
-  void record_prefetch_ready(std::uint32_t page_id);
+  void record_prefetch_ready(std::uint32_t page_id, std::uint64_t token);
   void record_prefetch_demand(std::uint32_t page_id);
   void record_prefetch_dropped(std::uint32_t page_id);
+  void record_prefetch_hit(std::uint32_t page_id,
+                           const std::string& hit_type,
+                           std::int64_t demand_wait_us);
+  void validate_prefetch_trace() const;
   void write_prefetch_trace();
   std::int64_t trace_elapsed_us() const;
 
@@ -88,7 +93,7 @@ class QueryPageSession {
   bool consume_prefetch_completion(AsyncPageReader::CompletedRead completed,
                                    bool keep_ready);
   bool harvest_prefetch(bool wait);
-  void wait_for_prefetch_page(std::uint32_t page_id);
+  std::int64_t wait_for_prefetch_page(std::uint32_t page_id);
   std::size_t prefetch_batch_limit() const;
   bool queue_prefetch_request(
       std::uint32_t page_id,
@@ -112,11 +117,18 @@ class QueryPageSession {
   std::size_t beam_width_ = 0;
   std::uint64_t query_id_ = 0;
   std::size_t prefetch_step_ = 0;
+  std::uint64_t next_decision_id_ = 1;
+  std::uint64_t next_submission_id_ = 1;
   std::string prefetch_trace_path_;
+  std::string run_id_;
+  std::string policy_version_;
+  std::uint32_t random_seed_ = 0;
   std::chrono::steady_clock::time_point trace_start_;
   bool finished_ = false;
 
   struct PrefetchTraceRecord {
+    std::uint64_t decision_id = 0;
+    std::uint64_t submission_id = 0;
     std::uint64_t query_id = 0;
     std::size_t step_id = 0;
     std::size_t demand_step_id = 0;
@@ -127,6 +139,9 @@ class QueryPageSession {
     std::int64_t submit_time_us = -1;
     std::int64_t ready_time_us = -1;
     std::int64_t demand_time_us = -1;
+    std::int64_t demand_wait_us = 0;
+    std::int64_t saved_wait_us = 0;
+    std::string hit_type;
     bool was_prefetched = false;
     bool was_demanded = false;
     bool was_evicted_before_use = false;
@@ -142,12 +157,14 @@ class QueryPageSession {
   std::unordered_map<std::uint32_t, Node> local_nodes_;
   std::unordered_map<std::uint32_t, Page> ready_prefetch_pages_;
   std::unordered_map<std::uint64_t, std::uint32_t> token_to_page_;
+  std::unordered_map<std::uint64_t, std::size_t> token_to_record_;
   std::unordered_set<std::uint32_t> pending_pages_;
   std::unordered_set<std::uint32_t> completed_prefetch_pages_;
   std::unordered_set<std::uint32_t> pending_hit_pages_;
+  std::unordered_map<std::uint32_t, std::int64_t> pending_wait_us_by_page_;
   std::vector<PrefetchTraceRecord> prefetch_trace_records_;
-  std::unordered_map<std::uint32_t, std::vector<std::size_t>>
-      prefetch_trace_by_page_;
+  std::unordered_map<std::uint32_t, std::size_t> selected_record_by_page_;
+  std::unordered_map<std::uint32_t, std::size_t> active_submission_by_page_;
 };
 
 }  // namespace agent_aware

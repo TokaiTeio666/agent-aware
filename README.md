@@ -8,15 +8,15 @@ Agent-aware 是一个面向大模型 Agent 长期记忆场景的向量检索 I/O
 
 当前主线实现围绕 `agent-aware` benchmark 展开：SIFT 或合成数据加载后，系统训练 PQ ADC 模型、构建或复用 Vamana packed graph index，再通过 Graph-Aware 2Q BufferPool（参考 Agent-Mem-IO 架构）、io_uring 异步 I/O 和图邻居 + 滚动流水线预取完成查询，并输出 JSON 结果。预取支持两条路径：纯 PQ 直接提交（已验证超过 baseline），以及可选的 XGBoost 二次精排（需训练模型）。动态写入由 `bench_mixed_rw` 和 `StorageEngine`/`DynamicWriteManager` 验证，覆盖 WAL、MemTable、SSTable、flush、compaction 和 base/delta Top-K merge。
 
-核心结果（SIFT1M, query 5000-5999, xgboost 预取, beam=16, io_uring, cache=15000 pages）：
+核心结果（单次可追溯运行，来源 `build/prefetch_ab_xgboost.json`；SIFT1M, query 5000-5999, xgboost 预取, beam=16, io_uring, cache=15000 pages）：
 
 | 指标 | 数值 |
 | --- | ---: |
 | dataset | SIFT, base=1,000,000, query=1,000, dim=128 |
 | Recall@10 | `0.9917` |
 | avg latency | `168.03 ms` |
-| latency P95 | `202.83 ms` |
-| latency P99 | `216.63 ms` |
+| latency P95 | `216.71 ms` |
+| latency P99 | `234.20 ms` |
 | QPS | `5.95` |
 | search width / beam width | `350` / `16` |
 | I/O effective mode | `io_uring` |
@@ -27,6 +27,8 @@ Agent-aware 是一个面向大模型 Agent 长期记忆场景的向量检索 I/O
 | prefetch ready_hit | `140` |
 | prefetch pending_hit | `324` |
 | estimated resident ratio | `0.199` |
+
+同参数零预取 baseline 见 `build/prefetch_ab_baseline.json`：avg latency `168.99 ms`、P95 `220.37 ms`、P99 `241.57 ms`、QPS `5.92`、Recall@10 `0.9917`。两组 cache hit rate 分别为 `18.2529%` 与 `18.2564%`，基本相同；当前预取收益更应解释为 PQ 粗排、beam 滚动流水线和异步预取时序带来的组合优化，而不是缓存命中率提升。
 
 ## 技术架构
 

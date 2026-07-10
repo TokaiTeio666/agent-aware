@@ -88,6 +88,25 @@ bool rerank_prefetch_enabled(const DiskGraphSearchConfig& config) {
           config.prefetch_early_trigger == "all");
 }
 
+std::size_t effective_post_expand_submit_top_k(
+    const DiskGraphSearchConfig& config) {
+  if (config.prefetch_submit_top_k > 0) {
+    return config.prefetch_submit_top_k;
+  }
+  if (config.prefetch_top_k > 0) {
+    return config.prefetch_top_k;
+  }
+  return 4;
+}
+
+std::size_t effective_post_expand_candidate_pool_size(
+    const DiskGraphSearchConfig& config, std::size_t beam) {
+  if (config.prefetch_candidate_pool_size > 0) {
+    return config.prefetch_candidate_pool_size;
+  }
+  return std::max<std::size_t>(1, beam * 4);
+}
+
 }  // namespace
 
 struct PackedDiskGraphIndex::SearchState {
@@ -188,6 +207,11 @@ struct PackedDiskGraphIndex::SearchState {
   std::size_t stagnant_expansions = 0;
   std::size_t jit_prefetch_submitted_pages = 0;
   double previous_worst_distance = std::numeric_limits<double>::infinity();
+};
+
+struct PackedDiskGraphIndex::PostExpandPrefetchCandidates {
+  std::vector<std::uint32_t> ordered_page_sequence;
+  std::vector<std::uint32_t> ordered_unique_pages;
 };
 
 PackedDiskGraphIndex::PackedDiskGraphIndex(const std::string& path)
@@ -802,6 +826,58 @@ PackedDiskGraphIndex::collect_post_expand_lookahead_pages(
   return lookahead_pages;
 }
 
+PackedDiskGraphIndex::PostExpandPrefetchCandidates
+PackedDiskGraphIndex::collect_post_expand_prefetch_candidates(
+    SearchState& state,
+    const std::vector<std::vector<SearchResult>>&
+        ranked_neighbors_by_candidate,
+    std::size_t candidate_pool_size) const {
+  PostExpandPrefetchCandidates output;
+  if (candidate_pool_size == 0 || ranked_neighbors_by_candidate.empty()) {
+    return output;
+  }
+
+  std::size_t max_rank = 0;
+  for (const auto& ranked_neighbors : ranked_neighbors_by_candidate) {
+    max_rank = std::max(max_rank, ranked_neighbors.size());
+  }
+  if (max_rank == 0) {
+    return output;
+  }
+
+  std::unordered_set<std::uint32_t> seen_pages;
+  seen_pages.reserve(candidate_pool_size);
+  output.ordered_page_sequence.reserve(candidate_pool_size);
+  output.ordered_unique_pages.reserve(candidate_pool_size);
+
+  for (std::size_t rank = 0; rank < max_rank &&
+                             output.ordered_unique_pages.size() <
+                                 candidate_pool_size;
+       ++rank) {
+    for (const auto& ranked_neighbors : ranked_neighbors_by_candidate) {
+      if (rank >= ranked_neighbors.size()) {
+        continue;
+      }
+
+      const std::uint32_t page_id =
+          state.session.page_for_node(ranked_neighbors[rank].id);
+      if (state.session.page_available_for_scheduling(page_id)) {
+        continue;
+      }
+
+      output.ordered_page_sequence.push_back(page_id);
+      if (seen_pages.insert(page_id).second) {
+        output.ordered_unique_pages.push_back(page_id);
+        if (output.ordered_unique_pages.size() >= candidate_pool_size) {
+          break;
+        }
+      }
+    }
+  }
+
+  return output;
+}
+
 std::vector<std::uint32_t>
 PackedDiskGraphIndex::collect_rerank_lookahead_pages(
     const SearchState& state) const {
@@ -1054,12 +1130,16 @@ void PackedDiskGraphIndex::expand_candidate_batch(
   std::vector<std::vector<SearchResult>> ranked_neighbors_by_candidate;
   ranked_neighbors_by_candidate.reserve(batch.size());
 
-  // Agent-Mem-IO: 每批预取 beam_width*2 个 PQ-top 邻居页面
   const std::size_t beam =
       state.config.beam_width == 0 ? state.config.search_width
                                    : state.config.beam_width;
-  const std::size_t prefetch_count = std::max<std::size_t>(1, beam * 2);
-  std::unordered_set<std::uint32_t> prefetch_pages;
+  const std::size_t candidate_pool_size =
+      effective_post_expand_candidate_pool_size(state.config, beam);
+  const std::size_t submit_top_k =
+      effective_post_expand_submit_top_k(state.config);
+  const bool neighbor_prefetch_enabled =
+      !state.session.has_prefetch_model() ||
+      post_expand_prefetch_enabled(state.config);
 
   for (const auto& current : batch) {
     const DiskNode& node = state.load_node(current.id);
@@ -1079,29 +1159,26 @@ void PackedDiskGraphIndex::expand_candidate_batch(
     std::vector<SearchResult> ranked_neighbors =
         state.rank_neighbors_by_distance(new_neighbors);
 
-    // PQ 排名前列的邻居页通常会被下一轮 beam 最早 demand，因此趁 CPU 仍在处理时提交预取。
-    for (std::size_t j = 0;
-         j < ranked_neighbors.size() && prefetch_pages.size() < prefetch_count;
-         ++j) {
-      const std::uint32_t page_id =
-          state.session.page_for_node(ranked_neighbors[j].id);
-      if (!state.session.page_available_for_scheduling(page_id)) {
-        prefetch_pages.insert(page_id);
-      }
-    }
-
     ranked_neighbors_by_candidate.push_back(std::move(ranked_neighbors));
   }
 
-  if (state.session.async_prefetch_enabled() && !prefetch_pages.empty()) {
-    std::vector<std::uint32_t> pages(prefetch_pages.begin(),
-                                     prefetch_pages.end());
+  if (neighbor_prefetch_enabled &&
+      state.session.async_prefetch_enabled() && submit_top_k > 0) {
+    const auto prefetch_candidates = collect_post_expand_prefetch_candidates(
+        state, ranked_neighbors_by_candidate, candidate_pool_size);
     if (state.session.has_prefetch_model()) {
       // ML 路径：XGBoost 二次精选（页面聚合 + 特征打分 + 限流）
-      state.session.submit_candidate_prefetch(std::move(pages), "neighbor_xgb");
-    } else {
+      state.session.submit_candidate_prefetch(
+          prefetch_candidates.ordered_page_sequence, "post_expand",
+          submit_top_k);
+    } else if (!prefetch_candidates.ordered_unique_pages.empty()) {
       // 纯 PQ 路径：直接提交（Agent-Mem-IO 风格，已验证超过 baseline）
-      state.session.submit_pages_direct(std::move(pages));
+      std::vector<std::uint32_t> pages =
+          prefetch_candidates.ordered_unique_pages;
+      if (pages.size() > submit_top_k) {
+        pages.resize(submit_top_k);
+      }
+      state.session.submit_pages_direct(pages);
     }
   }
 

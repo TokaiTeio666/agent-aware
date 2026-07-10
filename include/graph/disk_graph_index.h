@@ -78,6 +78,8 @@ struct DiskGraphSearchConfig {
   std::size_t prefetch_width = 1;
   std::size_t prefetch_depth = 1;
   std::size_t prefetch_min_candidates_per_page = 2;
+  std::size_t prefetch_candidate_pool_size = 0;
+  std::size_t prefetch_submit_top_k = 0;
   std::size_t jit_window_multiplier = 2;
   std::size_t jit_prefetch_interval_batches = 2;
   std::size_t jit_prefetch_max_pages_per_query = 16;
@@ -85,6 +87,9 @@ struct DiskGraphSearchConfig {
   std::string prefetch_policy = "none";
   std::string prefetch_model_path;
   std::string prefetch_trace_path;
+  std::string run_id = "manual";
+  std::string policy_version = "unspecified";
+  std::uint32_t random_seed = 0;
   std::uint64_t query_id = 0;
   std::size_t prefetch_top_k = 0;
   double prefetch_score_threshold =
@@ -290,6 +295,7 @@ class PackedDiskGraphIndex {
   friend class DiskPageCodec;
   friend class QueryPageSession;
   struct SearchState;
+  struct PostExpandPrefetchCandidates;
 
   struct DiskNode {
     std::uint32_t id = 0;
@@ -352,6 +358,11 @@ class PackedDiskGraphIndex {
       const SearchState& state) const;
   std::vector<std::uint32_t> collect_post_expand_lookahead_pages(
       const SearchState& state, std::size_t effective_beam_width) const;
+  PostExpandPrefetchCandidates collect_post_expand_prefetch_candidates(
+      SearchState& state,
+      const std::vector<std::vector<SearchResult>>&
+          ranked_neighbors_by_candidate,
+      std::size_t candidate_pool_size) const;
   std::vector<std::uint32_t> collect_rerank_lookahead_pages(
       const SearchState& state) const;
   void maybe_issue_prefetch(SearchState& state) const;

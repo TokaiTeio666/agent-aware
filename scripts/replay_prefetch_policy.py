@@ -1,46 +1,23 @@
 #!/usr/bin/env python3
-"""Offline replay for XGBoost and oracle prefetch policies."""
+"""Streaming offline replay for XGBoost and oracle prefetch policies."""
 
 from __future__ import annotations
 
 import argparse
-import csv
 import json
 import math
-from collections import defaultdict
 from pathlib import Path
-from typing import Callable, Dict, Iterable, List, Sequence
+from typing import Callable, Dict, Iterator, List, Sequence
 
-from train_prefetch_ranker import TRACE_FEATURES, parse_float
-
-
-def parse_bool(value: object) -> bool:
-    if value is None:
-        return False
-    return str(value).strip().lower() in {"1", "true", "yes", "on"}
-
-
-def parse_int(value: object) -> int:
-    parsed = parse_float(value)
-    return int(parsed) if parsed is not None else 0
-
-
-def load_trace(path: Path) -> List[dict]:
-    with path.open(newline="") as handle:
-        rows = list(csv.DictReader(handle))
-    if not rows:
-        raise RuntimeError(f"empty prefetch trace: {path}")
-    return rows
-
-
-def group_rows(rows: Iterable[dict]) -> Dict[str, List[dict]]:
-    groups: Dict[str, List[dict]] = defaultdict(list)
-    for row in rows:
-        group_id = row.get("group_id")
-        if not group_id:
-            group_id = f"{row.get('query_id', 'unknown')}_{row.get('step_id', 0)}"
-        groups[group_id].append(row)
-    return groups
+from prefetch_trace_utils import (
+    is_missing_at_decision,
+    iter_trace_rows,
+    parse_bool,
+    parse_float,
+    trace_group_id,
+    trace_outcome,
+)
+from train_prefetch_ranker import TRACE_FEATURES
 
 
 class TreeNode:
@@ -101,28 +78,6 @@ def load_xgboost_dump(path: Path) -> tuple[float, List[Dict[int, TreeNode]]]:
     return base_score, trees
 
 
-def row_label(row: dict) -> int:
-    for name in ("label", "prefetch_label"):
-        if name in row:
-            return parse_int(row.get(name))
-    return 1 if parse_bool(row.get("was_demanded")) else 0
-
-
-def is_positive(row: dict) -> bool:
-    return row_label(row) > 0 or parse_bool(row.get("was_demanded"))
-
-
-def current_score(row: dict) -> float:
-    count = parse_float(row.get("num_candidates_on_page")) or 0.0
-    rank = parse_float(row.get("min_pq_rank_on_page")) or 0.0
-    return count * 1_000_000.0 - rank
-
-
-def trace_score(row: dict) -> float:
-    score = parse_float(row.get("prefetch_score"))
-    return score if score is not None else current_score(row)
-
-
 def feature_value(row: dict, feature_name: str) -> float:
     for trace_name, model_name in TRACE_FEATURES:
         if model_name == feature_name:
@@ -130,7 +85,9 @@ def feature_value(row: dict, feature_name: str) -> float:
     return 0.0
 
 
-def xgboost_score(row: dict, base_score: float, trees: List[Dict[int, TreeNode]]) -> float:
+def xgboost_score(
+    row: dict, base_score: float, trees: List[Dict[int, TreeNode]]
+) -> float:
     score = base_score
     for tree in trees:
         node_id = 0
@@ -147,53 +104,81 @@ def xgboost_score(row: dict, base_score: float, trees: List[Dict[int, TreeNode]]
     return score
 
 
+def is_positive(row: dict) -> bool:
+    return trace_outcome(row) in {"ready_hit", "pending_hit"} or bool(
+        parse_bool(row.get("was_demanded"))
+    )
+
+
 def oracle_score(row: dict) -> float:
-    label = row_label(row)
-    demanded = 1 if is_positive(row) else 0
     rank = parse_float(row.get("min_pq_rank_on_page")) or 0.0
-    return demanded * 10_000.0 + label * 100.0 - rank
+    return (1.0 if is_positive(row) else 0.0) * 10000.0 - rank
 
 
-def replay(
-    groups: Dict[str, List[dict]],
-    scorer: Callable[[dict], float],
-    top_k: int,
-) -> dict:
-    selected_pages = 0
-    positive_pages = 0
-    selected_positive_pages = 0
+def iter_groups(path: Path) -> Iterator[tuple[str, List[dict]]]:
+    current_group = None
+    rows: List[dict] = []
+    for row in iter_trace_rows([path]):
+        group_id = trace_group_id(row)
+        if current_group is None:
+            current_group = group_id
+        if group_id != current_group:
+            yield current_group, rows
+            current_group = group_id
+            rows = []
+        rows.append(row)
+    if current_group is not None:
+        yield current_group, rows
 
-    for group in groups.values():
-        positives = [row for row in group if is_positive(row)]
-        positive_pages += len(positives)
-        ranked = sorted(group, key=scorer, reverse=True)
-        selected = ranked[:top_k]
-        selected_pages += len(selected)
-        selected_positive_pages += sum(1 for row in selected if is_positive(row))
 
-    return {
-        "groups": len(groups),
-        "selected_pages": selected_pages,
-        "positive_pages": positive_pages,
-        "selected_positive_pages": selected_positive_pages,
-        "precision_at_k": selected_positive_pages / selected_pages
-        if selected_pages
-        else None,
-        "recall_at_k": selected_positive_pages / positive_pages
-        if positive_pages
-        else None,
-    }
+class ReplayAccumulator:
+    def __init__(self) -> None:
+        self.groups = 0
+        self.selected_pages = 0
+        self.positive_pages = 0
+        self.selected_positive_pages = 0
+
+    def add(self, candidates: Sequence[dict], selected: Sequence[dict]) -> None:
+        self.groups += 1
+        self.selected_pages += len(selected)
+        self.positive_pages += sum(1 for row in candidates if is_positive(row))
+        self.selected_positive_pages += sum(
+            1 for row in selected if is_positive(row)
+        )
+
+    def finish(self) -> dict:
+        useful_rate = (
+            self.selected_positive_pages / self.selected_pages
+            if self.selected_pages
+            else None
+        )
+        recall = (
+            self.selected_positive_pages / self.positive_pages
+            if self.positive_pages
+            else None
+        )
+        return {
+            "groups": self.groups,
+            "selected_pages": self.selected_pages,
+            "positive_pages": self.positive_pages,
+            "selected_positive_pages": self.selected_positive_pages,
+            "useful_rate": useful_rate,
+            "precision_at_k": useful_rate,
+            "recall_at_k": recall,
+        }
 
 
 def make_markdown(payload: dict) -> str:
     lines = [
-        "# Prefetch XGBoost Replay",
+        "# Prefetch Policy Replay",
         "",
-        "| Policy | Top-K | Groups | Selected | Positives | Selected Positives | Precision@K | Recall@K | Oracle Gap |",
-        "| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |",
+        f"Replay evaluable: `{payload['replay_evaluable']}`",
+        "",
+        "| Policy | Top-K | Evaluable | Groups | Selected | Useful | Useful Rate | Online Useful Rate | Gap (pp) | Recall@K |",
+        "| --- | ---: | --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: |",
     ]
     for row in payload["results"]:
-        def fmt(value):
+        def fmt(value: object) -> str:
             if value is None:
                 return "null"
             if isinstance(value, float):
@@ -201,89 +186,109 @@ def make_markdown(payload: dict) -> str:
             return str(value)
 
         lines.append(
-            "| {policy} | {top_k} | {groups} | {selected_pages} | {positive_pages} | "
-            "{selected_positive_pages} | {precision_at_k} | {recall_at_k} | {oracle_gap} |".format(
-                policy=row["policy"],
-                top_k=row["top_k"],
-                groups=row["groups"],
-                selected_pages=row["selected_pages"],
-                positive_pages=row["positive_pages"],
-                selected_positive_pages=row["selected_positive_pages"],
-                precision_at_k=fmt(row["precision_at_k"]),
-                recall_at_k=fmt(row["recall_at_k"]),
-                oracle_gap=fmt(row["oracle_gap"]),
+            "| {policy} | {top_k} | {evaluable} | {groups} | {selected_pages} | "
+            "{selected_positive_pages} | {useful_rate} | {online_useful_rate} | "
+            "{useful_rate_gap_pp} | {recall_at_k} |".format(
+                **{key: fmt(value) for key, value in row.items()}
             )
         )
-
-    lines.extend(["", "## Diagnostics", ""])
-    max_oracle = max(
-        (row["recall_at_k"] or 0.0 for row in payload["results"] if row["policy"] == "oracle"),
-        default=0.0,
-    )
-    max_xgboost = max(
-        (row["recall_at_k"] or 0.0 for row in payload["results"] if row["policy"] == "xgboost"),
-        default=0.0,
-    )
-    diagnostics_added = False
-    if max_oracle < 0.3:
-        lines.append("- oracle_recall_at_k 也偏低：当前触发点太晚，或候选集合本身缺少未来 demand page。")
-        diagnostics_added = True
-    if max_oracle >= 0.5 and max_xgboost < max_oracle * 0.6:
-        lines.append("- oracle 明显高于 xgboost：特征、训练标签或模型排序可能有问题。")
-        diagnostics_added = True
-    if max_xgboost >= max_oracle * 0.8 and max_oracle >= 0.5:
-        lines.append("- replay xgboost 接近 oracle：如果 online xgboost 没收益，优先检查在线限流、I/O depth、ready 时机或 trace 时间戳。")
-        diagnostics_added = True
-    if not diagnostics_added:
-        lines.append("- 未发现明显 replay 异常。")
     return "\n".join(lines) + "\n"
 
 
 def main() -> None:
-    parser = argparse.ArgumentParser(description="Replay XGBoost prefetch policy from trace CSV.")
+    parser = argparse.ArgumentParser(
+        description="Replay XGBoost prefetch policy from a trace CSV."
+    )
     parser.add_argument("--trace", required=True, type=Path)
     parser.add_argument("--model", required=True, type=Path)
     parser.add_argument("--top-k", nargs="+", type=int, required=True)
+    parser.add_argument("--match-online-budget", action="store_true")
     parser.add_argument("--out-json", type=Path)
     parser.add_argument("--out-md", type=Path)
     args = parser.parse_args()
 
-    if any(k <= 0 for k in args.top_k):
+    if any(value <= 0 for value in args.top_k):
         raise SystemExit("--top-k values must be positive")
 
-    rows = load_trace(args.trace)
-    groups = group_rows(rows)
     base_score, trees = load_xgboost_dump(args.model)
-
-    raw_results = []
-    oracle_by_k = {}
-    scorers = {
+    scorers: Dict[str, Callable[[dict], float]] = {
         "xgboost": lambda row: xgboost_score(row, base_score, trees),
         "oracle": oracle_score,
     }
-    for top_k in args.top_k:
-        oracle_by_k[top_k] = replay(groups, scorers["oracle"], top_k)
+    accumulators = {
+        (policy, top_k): ReplayAccumulator()
+        for top_k in args.top_k
+        for policy in scorers
+    }
+    online_submitted = 0
+    online_useful = 0
+
+    for _, group in iter_groups(args.trace):
+        online_rows = [
+            row for row in group if bool(parse_bool(row.get("was_prefetched")))
+        ]
+        online_submitted += len(online_rows)
+        online_useful += sum(
+            1
+            for row in online_rows
+            if trace_outcome(row) in {"ready_hit", "pending_hit"}
+        )
+        candidates = [row for row in group if is_missing_at_decision(row)]
+        for policy, scorer in scorers.items():
+            ranked = sorted(candidates, key=scorer, reverse=True)
+            for top_k in args.top_k:
+                budget = len(online_rows) if args.match_online_budget else top_k
+                accumulators[(policy, top_k)].add(candidates, ranked[:budget])
+
+    online_useful_rate = (
+        online_useful / online_submitted if online_submitted else None
+    )
+    results = []
     for top_k in args.top_k:
         for policy in ("xgboost", "oracle"):
-            metrics = replay(groups, scorers[policy], top_k)
-            oracle_recall = oracle_by_k[top_k]["recall_at_k"]
-            recall = metrics["recall_at_k"]
+            metrics = accumulators[(policy, top_k)].finish()
+            useful_rate = metrics["useful_rate"]
+            evaluable = (
+                online_submitted > 0
+                and online_useful > 0
+                and metrics["positive_pages"] > 0
+                and metrics["selected_pages"] > 0
+            )
             metrics.update(
                 {
                     "policy": policy,
                     "top_k": top_k,
-                    "oracle_gap": None
-                    if oracle_recall is None or recall is None
-                    else oracle_recall - recall,
+                    "evaluable": evaluable,
+                    "match_online_budget": args.match_online_budget,
+                    "online_submitted_pages": online_submitted,
+                    "online_useful_pages": online_useful,
+                    "online_useful_rate": online_useful_rate,
+                    "useful_rate_gap_pp": (
+                        None
+                        if not evaluable
+                        or useful_rate is None
+                        or online_useful_rate is None
+                        else (useful_rate - online_useful_rate) * 100.0
+                    ),
+                    "absolute_useful_rate_gap_pp": (
+                        None
+                        if not evaluable
+                        or useful_rate is None
+                        or online_useful_rate is None
+                        else abs(useful_rate - online_useful_rate) * 100.0
+                    ),
                 }
             )
-            raw_results.append(metrics)
+            results.append(metrics)
 
     payload = {
         "trace": str(args.trace),
-        "model": str(args.model) if args.model else None,
+        "model": str(args.model),
         "top_k": args.top_k,
-        "results": raw_results,
+        "match_online_budget": args.match_online_budget,
+        "replay_evaluable": bool(results)
+        and all(row["evaluable"] for row in results),
+        "results": results,
     }
     text = json.dumps(payload, indent=2, sort_keys=True)
     if args.out_json:

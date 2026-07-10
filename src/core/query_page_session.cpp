@@ -59,6 +59,7 @@ std::size_t session_prefetch_budget(const PackedDiskGraphIndex& index,
   }
   // Agent-Mem-IO 风格：width/top_k=0 时用 io_depth/4 作为默认预算
   std::size_t width = std::max(config.prefetch_width, config.prefetch_top_k);
+  width = std::max(width, config.prefetch_submit_top_k);
   if (width == 0) {
     width = std::max<std::size_t>(1, io_depth / 4);
   }
@@ -99,6 +100,9 @@ QueryPageSession::QueryPageSession(PackedDiskGraphIndex& index,
                                          : config.beam_width),
       query_id_(config.query_id),
       prefetch_trace_path_(config.prefetch_trace_path),
+      run_id_(config.run_id),
+      policy_version_(config.policy_version),
+      random_seed_(config.random_seed),
       trace_start_(std::chrono::steady_clock::now()) {}
 
 QueryPageSession::~QueryPageSession() {
@@ -442,7 +446,8 @@ void QueryPageSession::submit_pages_direct(
 
 void QueryPageSession::submit_candidate_prefetch(
     const std::vector<std::uint32_t>& page_ids,
-    const std::string& trigger) {
+    const std::string& trigger,
+    std::size_t max_pages) {
   if (!frontier_prefetch_enabled() || page_ids.empty()) {
     return;
   }
@@ -453,7 +458,7 @@ void QueryPageSession::submit_candidate_prefetch(
       page_ids, [this](std::uint32_t page_id) {
         return page_availability(page_id);
       },
-      0, true, context);
+      max_pages, true, context);
   record_prefetch_plan(plan, trigger);
   apply_prefetch_plan_stats(plan.stats);
   submit_prefetch_plan(plan.pages);
@@ -538,9 +543,11 @@ void QueryPageSession::finish_query() {
   stats_.prefetch_dropped += ready_prefetch_pages_.size();
   pending_pages_.clear();
   token_to_page_.clear();
+  token_to_record_.clear();
   ready_prefetch_pages_.clear();
   completed_prefetch_pages_.clear();
   pending_hit_pages_.clear();
+  pending_wait_us_by_page_.clear();
   stats_.prefetch_wasted_pages = stats_.prefetch_dropped;
   stats_.p4_io.prefetch_dropped = stats_.prefetch_dropped;
   // 汇总计数只在查询结束时计算一次，此时所有 pending/ready 预取都已被消费或标记为 dropped。
@@ -554,6 +561,7 @@ void QueryPageSession::finish_query() {
     }
   }
   stats_.prefetch_only_pages = prefetch_only;
+  validate_prefetch_trace();
   write_prefetch_trace();
   unpin_all();
   finished_ = true;
@@ -644,6 +652,7 @@ void QueryPageSession::record_prefetch_plan(
                                   plan.candidates.size());
   for (const auto& feature : plan.candidates) {
     PrefetchTraceRecord record;
+    record.decision_id = next_decision_id_++;
     record.query_id = query_id_;
     record.step_id = feature.search_step;
     record.trigger = trigger;
@@ -653,28 +662,38 @@ void QueryPageSession::record_prefetch_plan(
     record.sync_fallback_used = !index_.io_status().io_uring_enabled;
     const std::size_t index = prefetch_trace_records_.size();
     prefetch_trace_records_.push_back(std::move(record));
-    prefetch_trace_by_page_[feature.page_id].push_back(index);
+    if (feature.selected) {
+      const auto inserted =
+          selected_record_by_page_.emplace(feature.page_id, index);
+      if (!inserted.second) {
+        throw std::logic_error(
+            "A prefetch page was selected by more than one decision record");
+      }
+    }
   }
 }
 
-void QueryPageSession::record_prefetch_submit(std::uint32_t page_id) {
+void QueryPageSession::record_prefetch_submit(std::uint32_t page_id,
+                                              std::uint64_t token) {
   if (prefetch_trace_path_.empty()) {
     return;
   }
-  const auto found = prefetch_trace_by_page_.find(page_id);
-  if (found == prefetch_trace_by_page_.end()) {
+  const auto found = selected_record_by_page_.find(page_id);
+  if (found == selected_record_by_page_.end()) {
     return;
   }
-  const std::int64_t now = trace_elapsed_us();
-  for (const auto index : found->second) {
-    PrefetchTraceRecord& record = prefetch_trace_records_[index];
-    if (!record.feature.selected || record.was_prefetched) {
-      continue;
-    }
-    record.was_prefetched = true;
-    record.submit_time_us = now;
-    return;
+  PrefetchTraceRecord& record = prefetch_trace_records_[found->second];
+  if (record.was_prefetched ||
+      active_submission_by_page_.find(page_id) !=
+          active_submission_by_page_.end()) {
+    throw std::logic_error(
+        "A prefetch page was submitted by more than one decision record");
   }
+  record.was_prefetched = true;
+  record.submission_id = next_submission_id_++;
+  record.submit_time_us = trace_elapsed_us();
+  active_submission_by_page_[page_id] = found->second;
+  token_to_record_[token] = found->second;
 }
 
 void QueryPageSession::record_prefetch_rejected(
@@ -682,55 +701,48 @@ void QueryPageSession::record_prefetch_rejected(
   if (prefetch_trace_path_.empty()) {
     return;
   }
-  const auto found = prefetch_trace_by_page_.find(page_id);
-  if (found == prefetch_trace_by_page_.end()) {
+  const auto found = selected_record_by_page_.find(page_id);
+  if (found == selected_record_by_page_.end()) {
     return;
   }
-  for (const auto index : found->second) {
-    PrefetchTraceRecord& record = prefetch_trace_records_[index];
-    if (!record.feature.selected || record.was_prefetched) {
-      continue;
-    }
-    if (record.feature.skip_reason.empty()) {
-      record.feature.skip_reason = reason;
-    }
-    return;
+  PrefetchTraceRecord& record = prefetch_trace_records_[found->second];
+  if (!record.was_prefetched && record.feature.skip_reason.empty()) {
+    record.feature.skip_reason = reason;
   }
 }
 
-void QueryPageSession::record_prefetch_ready(std::uint32_t page_id) {
+void QueryPageSession::record_prefetch_ready(std::uint32_t page_id,
+                                             std::uint64_t token) {
   if (prefetch_trace_path_.empty()) {
     return;
   }
-  const auto found = prefetch_trace_by_page_.find(page_id);
-  if (found == prefetch_trace_by_page_.end()) {
+  const auto token_found = token_to_record_.find(token);
+  if (token_found == token_to_record_.end()) {
     return;
   }
-  const std::int64_t now = trace_elapsed_us();
-  for (const auto index : found->second) {
-    PrefetchTraceRecord& record = prefetch_trace_records_[index];
-    if (record.was_prefetched && record.ready_time_us < 0) {
-      record.ready_time_us = now;
-    }
+  PrefetchTraceRecord& record = prefetch_trace_records_[token_found->second];
+  if (record.page_id != page_id) {
+    throw std::logic_error("Prefetch completion token/page ownership mismatch");
   }
+  if (record.ready_time_us < 0) {
+    record.ready_time_us = trace_elapsed_us();
+  }
+  token_to_record_.erase(token_found);
 }
 
 void QueryPageSession::record_prefetch_demand(std::uint32_t page_id) {
   if (prefetch_trace_path_.empty()) {
     return;
   }
-  const auto found = prefetch_trace_by_page_.find(page_id);
-  if (found == prefetch_trace_by_page_.end()) {
+  const auto found = selected_record_by_page_.find(page_id);
+  if (found == selected_record_by_page_.end()) {
     return;
   }
-  const std::int64_t now = trace_elapsed_us();
-  for (const auto index : found->second) {
-    PrefetchTraceRecord& record = prefetch_trace_records_[index];
-    if (!record.was_demanded) {
-      record.was_demanded = true;
-      record.demand_step_id = prefetch_step_;
-      record.demand_time_us = now;
-    }
+  PrefetchTraceRecord& record = prefetch_trace_records_[found->second];
+  if (!record.was_demanded) {
+    record.was_demanded = true;
+    record.demand_step_id = prefetch_step_;
+    record.demand_time_us = trace_elapsed_us();
   }
 }
 
@@ -738,16 +750,79 @@ void QueryPageSession::record_prefetch_dropped(std::uint32_t page_id) {
   if (prefetch_trace_path_.empty()) {
     return;
   }
-  const auto found = prefetch_trace_by_page_.find(page_id);
-  if (found == prefetch_trace_by_page_.end()) {
+  const auto found = active_submission_by_page_.find(page_id);
+  if (found == active_submission_by_page_.end()) {
     return;
   }
-  for (const auto index : found->second) {
-    PrefetchTraceRecord& record = prefetch_trace_records_[index];
-    if (record.was_prefetched && !record.was_demanded &&
-        !record.was_evicted_before_use) {
+  PrefetchTraceRecord& record = prefetch_trace_records_[found->second];
+  if (record.hit_type.empty()) {
+    record.hit_type = "wasted";
+    if (!record.was_evicted_before_use) {
       record.was_evicted_before_use = true;
       ++stats_.prefetch_evicted_before_use;
+    }
+  }
+}
+
+void QueryPageSession::record_prefetch_hit(std::uint32_t page_id,
+                                           const std::string& hit_type,
+                                           std::int64_t demand_wait_us) {
+  if (prefetch_trace_path_.empty()) {
+    return;
+  }
+  const auto found = active_submission_by_page_.find(page_id);
+  if (found == active_submission_by_page_.end()) {
+    return;
+  }
+  PrefetchTraceRecord& record = prefetch_trace_records_[found->second];
+  if (!record.hit_type.empty() && record.hit_type != hit_type) {
+    throw std::logic_error(
+        "Prefetch submission received multiple terminal outcomes");
+  }
+  record.hit_type = hit_type;
+  record.demand_wait_us = std::max<std::int64_t>(0, demand_wait_us);
+  if (record.submit_time_us >= 0 &&
+      record.ready_time_us >= record.submit_time_us) {
+    const std::int64_t io_time_us =
+        record.ready_time_us - record.submit_time_us;
+    record.saved_wait_us =
+        std::max<std::int64_t>(0, io_time_us - record.demand_wait_us);
+  }
+}
+
+void QueryPageSession::validate_prefetch_trace() const {
+  if (stats_.prefetch_useful_pages !=
+      stats_.prefetch_ready_hit + stats_.prefetch_pending_hit) {
+    throw std::logic_error(
+        "prefetch_useful_pages must equal ready_hit + pending_hit");
+  }
+  if (prefetch_trace_path_.empty()) {
+    return;
+  }
+
+  std::unordered_set<std::uint64_t> submission_ids;
+  for (const auto& record : prefetch_trace_records_) {
+    const bool missing_at_decision =
+        !record.feature.is_cached && !record.feature.is_inflight &&
+        !record.feature.is_ready && !record.feature.is_materialized;
+    if (record.trigger == "rerank" && record.feature.selected &&
+        missing_at_decision && !record.was_demanded) {
+      throw std::logic_error(
+          "Selected missing rerank page was not subsequently demanded");
+    }
+    if (!record.was_prefetched) {
+      continue;
+    }
+    if (record.submission_id == 0 ||
+        !submission_ids.insert(record.submission_id).second) {
+      throw std::logic_error(
+          "Each submitted page must have one unique submission id");
+    }
+    if (record.hit_type != "ready_hit" &&
+        record.hit_type != "pending_hit" &&
+        record.hit_type != "wasted") {
+      throw std::logic_error(
+          "Each submitted page must have exactly one terminal outcome");
     }
   }
 }
@@ -772,19 +847,22 @@ void QueryPageSession::write_prefetch_trace() {
 
   if (write_header) {
     output
-        << "query_id,step_id,trigger,group_id,candidate_node_id,"
+        << "run_id,policy_version,seed,query_id,step_id,trigger,"
+        << "group_id,decision_id,submission_id,candidate_node_id,"
         << "candidate_page_id,"
         << "num_candidates_on_page,min_pq_rank_on_page,"
         << "avg_pq_rank_on_page,candidate_rank_span,"
         << "contains_top1_candidate,contains_topk_candidate,"
         << "is_cached_at_decision,is_inflight_at_decision,"
+        << "is_ready_at_decision,is_materialized_at_decision,"
         << "io_queue_depth,cache_pressure,prefetch_rank,prefetch_score,"
         << "selected_by_policy,skip_reason,prefetch_decision_time,"
         << "was_prefetched,prefetch_submit_time,prefetch_ready_time,"
         << "demand_time,was_demanded,demand_step_id,lead_steps,"
         << "submit_to_demand_us,ready_before_demand_us,"
         << "was_ready_before_demand,"
-        << "was_evicted_before_use,sync_fallback_used,label\n";
+        << "was_evicted_before_use,sync_fallback_used,hit_type,"
+        << "demand_wait_us,saved_wait_us,label\n";
   }
 
   for (const auto& record : prefetch_trace_records_) {
@@ -817,9 +895,11 @@ void QueryPageSession::write_prefetch_trace() {
     }
 
     const auto& feature = record.feature;
-    output << record.query_id << ',' << record.step_id << ','
+    output << run_id_ << ',' << policy_version_ << ',' << random_seed_ << ','
+           << record.query_id << ',' << record.step_id << ','
            << record.trigger << ','
-           << record.query_id << '_' << record.step_id << ','
+           << run_id_ << ':' << record.query_id << ':' << record.step_id << ','
+           << record.decision_id << ',' << record.submission_id << ','
            << ',' << record.page_id << ','
            << feature.num_candidates_on_page << ','
            << feature.min_pq_rank_on_page << ','
@@ -829,6 +909,8 @@ void QueryPageSession::write_prefetch_trace() {
            << (feature.contains_topk_candidate ? 1 : 0) << ','
            << (feature.is_cached ? 1 : 0) << ','
            << (feature.is_inflight ? 1 : 0) << ','
+           << (feature.is_ready ? 1 : 0) << ','
+           << (feature.is_materialized ? 1 : 0) << ','
            << feature.io_queue_depth << ',' << feature.cache_pressure << ','
            << feature.rank << ',' << feature.score << ','
            << (feature.selected ? 1 : 0) << ','
@@ -842,7 +924,9 @@ void QueryPageSession::write_prefetch_trace() {
            << submit_to_demand_us << ',' << ready_before_demand_us << ','
            << (ready_before_demand ? 1 : 0) << ','
            << (record.was_evicted_before_use ? 1 : 0) << ','
-           << (record.sync_fallback_used ? 1 : 0) << ',' << label
+           << (record.sync_fallback_used ? 1 : 0) << ','
+           << record.hit_type << ',' << record.demand_wait_us << ','
+           << record.saved_wait_us << ',' << label
            << '\n';
   }
 }
@@ -953,7 +1037,7 @@ bool QueryPageSession::consume_prefetch_completion(
 
   Page decoded = index_.decode_page(page_id, std::move(completed.data));
   completed_prefetch_pages_.insert(page_id);
-  record_prefetch_ready(page_id);
+  record_prefetch_ready(page_id, completed.token);
   if (index_.cache_enabled()) {
     ++stats_.prefetch_cache_pollution_avoided;
   }
@@ -985,7 +1069,7 @@ bool QueryPageSession::harvest_prefetch(bool wait) {
   return harvested;
 }
 
-void QueryPageSession::wait_for_prefetch_page(std::uint32_t page_id) {
+std::int64_t QueryPageSession::wait_for_prefetch_page(std::uint32_t page_id) {
   bool waited = false;
   const auto wait_start = std::chrono::steady_clock::now();
   while (pending_pages_.find(page_id) != pending_pages_.end()) {
@@ -998,10 +1082,14 @@ void QueryPageSession::wait_for_prefetch_page(std::uint32_t page_id) {
   if (waited) {
     const auto wait_end = std::chrono::steady_clock::now();
     ++stats_.demand_read_waits;
-    stats_.demand_read_wait_us +=
+    const auto wait_us = static_cast<std::int64_t>(
         std::chrono::duration<double, std::micro>(wait_end - wait_start)
-            .count();
+            .count());
+    stats_.demand_read_wait_us += static_cast<double>(wait_us);
+    pending_wait_us_by_page_[page_id] = wait_us;
+    return wait_us;
   }
+  return 0;
 }
 
 std::size_t QueryPageSession::prefetch_batch_limit() const {
@@ -1082,7 +1170,7 @@ void QueryPageSession::flush_prefetch_requests(
     token_to_page_[read.token] = read.page_id;
     pending_pages_.insert(read.page_id);
     prefetch_pages_.insert(read.page_id);
-    record_prefetch_submit(read.page_id);
+    record_prefetch_submit(read.page_id, read.token);
     ++stats_.prefetch_reads;
     ++stats_.node_reads;
     ++stats_.io_prefetches;
@@ -1132,9 +1220,18 @@ const QueryPageSession::Page* QueryPageSession::take_ready_prefetch_page(
   }
 
   const bool was_pending_hit = pending_hit_pages_.erase(page_id) > 0;
+  std::int64_t demand_wait_us = 0;
+  const auto wait_found = pending_wait_us_by_page_.find(page_id);
+  if (wait_found != pending_wait_us_by_page_.end()) {
+    demand_wait_us = wait_found->second;
+    pending_wait_us_by_page_.erase(wait_found);
+  }
   if (!was_pending_hit) {
     ++stats_.prefetch_ready_hit;
   }
+  record_prefetch_hit(page_id,
+                      was_pending_hit ? "pending_hit" : "ready_hit",
+                      demand_wait_us);
   mark_prefetch_used(page_id);
   ++stats_.prefetch_promoted;
   Page page = std::move(ready->second);

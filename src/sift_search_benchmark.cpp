@@ -46,6 +46,10 @@ struct Args {
   std::size_t synthetic_dim = 32;
   std::size_t synthetic_clusters = 16;
   std::uint32_t seed = 42;
+  std::string run_id = "manual";
+  std::string policy_version = "unspecified";
+  std::string cache_condition = "unspecified";
+  std::size_t warmup_query_limit = 0;
 
   fs::path index_path = "indexes/sift.idx";
   fs::path output_json = "logs/sift_bench/result.json";
@@ -81,6 +85,8 @@ struct Args {
   std::optional<std::size_t> effective_prefetch_depth = 1;
   std::size_t prefetch_width = 4;
   std::size_t prefetch_min_candidates_per_page = 2;
+  std::size_t prefetch_candidate_pool_size = 0;
+  std::size_t prefetch_submit_top_k = 0;
   std::size_t jit_window_multiplier = 2;
   std::size_t jit_prefetch_interval_batches = 1;
   std::size_t jit_prefetch_max_pages_per_query = 16;
@@ -187,6 +193,10 @@ void print_help() {
       << "  --base-limit N               Loaded base vectors, default 1000000\n"
       << "  --query-offset N             First query id to load, default 0\n"
       << "  --query-limit N              Loaded query vectors, default 1000\n"
+      << "  --warmup-query-limit N       Untimed same-process warmup queries, default 0\n"
+      << "  --run-id ID                  Experiment run identifier, default manual\n"
+      << "  --policy-version VERSION     Policy/model version, default unspecified\n"
+      << "  --cache-condition NAME       Experiment cache condition metadata\n"
       << "Search:\n"
       << "  --top-k N, --k N             Result count, default 10\n"
       << "  --search-width N             Total expansion budget, default 350\n"
@@ -211,12 +221,14 @@ void print_help() {
       << "  --prefetch-depth N           Prefetch depth; 0 disables prefetch, default 1\n"
       << "  --prefetch-width N           Prefetch page submit width per round, default 4\n"
       << "  --prefetch-min-candidates-per-page N Candidate page reuse threshold, default 2\n"
+      << "  --prefetch-candidate-pool-size N Post-expand unique pages visible to planner, 0 uses beam*4\n"
+      << "  --prefetch-submit-top-k N    Post-expand pages to submit, 0 uses --prefetch-top-k or 4\n"
       << "  --prefetch-early-trigger NAME off/entry-warmup/pre-beam/rerank/all, default pre-beam\n"
       << "  --jit-window-multiplier N    Pre-beam frontier window = beam*N, default 2\n"
       << "  --jit-prefetch-interval-batches N Issue pre-beam every N batches, default 1\n"
       << "  --jit-prefetch-max-pages-per-query N Max pre-beam submissions per query, 0 disables cap, default 16\n"
       << "  --prefetch-policy NAME       none/xgboost, default xgboost\n"
-      << "  --prefetch-model PATH        Required XGBoost text-dump ranker for xgboost policy\n"
+      << "  --prefetch-model PATH        Optional XGBoost text-dump ranker; empty uses PQ-direct\n"
       << "  --prefetch-top-k N           Ranking top-K cap, 0 uses --prefetch-width\n"
       << "  --prefetch-score-threshold R Drop ranked pages below score threshold\n"
       << "  --prefetch-max-inflight N    Max prefetch inflight/ready pages, 0 uses query budget\n"
@@ -266,6 +278,15 @@ Args parse_args(int argc, char** argv) {
     } else if (name == "--query-limit") {
       args.query_limit = parse_size_value(require_value(i, argc, argv, name),
                                           name, 1);
+    } else if (name == "--warmup-query-limit") {
+      args.warmup_query_limit =
+          parse_size_value(require_value(i, argc, argv, name), name, 0);
+    } else if (name == "--run-id") {
+      args.run_id = require_value(i, argc, argv, name);
+    } else if (name == "--policy-version") {
+      args.policy_version = require_value(i, argc, argv, name);
+    } else if (name == "--cache-condition") {
+      args.cache_condition = require_value(i, argc, argv, name);
     } else if (name == "--synthetic-dim") {
       args.synthetic_dim = parse_size_value(require_value(i, argc, argv, name),
                                             name, 1);
@@ -357,6 +378,14 @@ Args parse_args(int argc, char** argv) {
                name == "--prefetch_min_candidates_per_page") {
       args.prefetch_min_candidates_per_page =
           parse_size_value(require_value(i, argc, argv, name), name, 1);
+    } else if (name == "--prefetch-candidate-pool-size" ||
+               name == "--prefetch_candidate_pool_size") {
+      args.prefetch_candidate_pool_size =
+          parse_size_value(require_value(i, argc, argv, name), name, 0);
+    } else if (name == "--prefetch-submit-top-k" ||
+               name == "--prefetch_submit_top_k") {
+      args.prefetch_submit_top_k =
+          parse_size_value(require_value(i, argc, argv, name), name, 0);
     } else if (name == "--jit-window-multiplier" ||
                name == "--jit_window_multiplier") {
       args.jit_window_multiplier =
@@ -468,12 +497,6 @@ void validate_and_finalize_args(Args& args) {
         "--enable-pq=0 is no longer supported; search requires PQ+ADC candidate generation");
   }
 
-  if (args.enable_prefetch && args.prefetch_policy == "xgboost" &&
-      args.prefetch_model_path.empty()) {
-    throw std::runtime_error(
-        "--prefetch-policy xgboost requires --prefetch-model");
-  }
-
   if (args.enable_pq) {
     if (args.pq_subspaces < 1) {
       throw std::runtime_error("Invalid --pq-subspaces: must be >= 1");
@@ -499,6 +522,19 @@ void validate_and_finalize_args(Args& args) {
   if (args.memory_budget_ratio <= 0.0 || args.memory_budget_ratio > 1.0) {
     throw std::runtime_error(
         "Invalid --memory-budget-ratio: must be in (0, 1]");
+  }
+  if (args.run_id.empty()) {
+    throw std::runtime_error("Invalid --run-id: must not be empty");
+  }
+  if (args.policy_version.empty()) {
+    throw std::runtime_error("Invalid --policy-version: must not be empty");
+  }
+  if (args.cache_condition.empty()) {
+    throw std::runtime_error("Invalid --cache-condition: must not be empty");
+  }
+  if (args.warmup_query_limit > 0 && args.num_search_threads != 1) {
+    throw std::runtime_error(
+        "--warmup-query-limit currently requires --num-search-threads 1");
   }
 }
 
@@ -895,6 +931,8 @@ agent_aware::DiskGraphSearchConfig make_search_config(
   }
   search.prefetch_model_path = args.prefetch_model_path;
   search.prefetch_top_k = args.prefetch_top_k;
+  search.prefetch_candidate_pool_size = args.prefetch_candidate_pool_size;
+  search.prefetch_submit_top_k = args.prefetch_submit_top_k;
   search.prefetch_score_threshold = args.prefetch_score_threshold;
   search.prefetch_max_inflight = args.prefetch_max_inflight;
   search.prefetch_depth = args.effective_prefetch_depth.value_or(1);
@@ -907,6 +945,9 @@ agent_aware::DiskGraphSearchConfig make_search_config(
   search.jit_prefetch_max_pages_per_query =
       args.jit_prefetch_max_pages_per_query;
   search.prefetch_early_trigger = args.prefetch_early_trigger;
+  search.run_id = args.run_id;
+  search.policy_version = args.policy_version;
+  search.random_seed = args.seed;
   return search;
 }
 
@@ -917,9 +958,10 @@ SearchAggregate run_search_worker(const Args& args,
                                   const std::vector<std::uint32_t>&
                                       entry_seed_ids,
                                   std::size_t first_query,
-                                  std::size_t query_stride) {
+                                  std::size_t query_stride,
+                                  std::size_t query_count) {
   SearchAggregate aggregate;
-  for (std::size_t i = first_query; i < dataset.queries.size();
+  for (std::size_t i = first_query; i < query_count;
        i += query_stride) {
     // worker 以 stride 方式遍历 query，避免共享可变 query 状态，并保持每个 worker 的延迟样本独立。
     auto search =
@@ -949,8 +991,12 @@ SearchAggregate run_searches(const Args& args,
                              agent_aware::PackedDiskGraphIndex& index,
                              const agent_aware::PqAdcModel* pq_model,
                              const std::vector<std::uint32_t>&
-                                 entry_seed_ids) {
-  const std::size_t query_count = dataset.queries.size();
+                                 entry_seed_ids,
+                             std::size_t query_limit = 0) {
+  const std::size_t query_count =
+      query_limit == 0
+          ? dataset.queries.size()
+          : std::min(query_limit, dataset.queries.size());
   const std::size_t worker_count =
       std::min(args.num_search_threads, std::max<std::size_t>(1, query_count));
 
@@ -962,7 +1008,7 @@ SearchAggregate run_searches(const Args& args,
     merge_aggregate(
         aggregate,
         run_search_worker(args, dataset, index, pq_model, entry_seed_ids, 0,
-                          worker_count));
+                          worker_count, query_count));
   } else {
     // 每个 worker 打开自己的 PackedDiskGraphIndex，因为本 benchmark 中页 cache 和异步 I/O 状态按 index/thread 隔离。
     std::vector<SearchAggregate> partials(worker_count);
@@ -977,7 +1023,7 @@ SearchAggregate run_searches(const Args& args,
           configure_index_from_args(args, worker_index);
           partials[worker] = run_search_worker(
               args, dataset, worker_index, pq_model, entry_seed_ids, worker,
-              worker_count);
+              worker_count, query_count);
         } catch (...) {
           errors[worker] = std::current_exception();
         }
@@ -1075,6 +1121,13 @@ std::string json_for_run(const Args& args,
   json << "  \"base_limit\": " << args.base_limit << ",\n";
   json << "  \"query_offset\": " << args.query_offset << ",\n";
   json << "  \"query_limit\": " << args.query_limit << ",\n";
+  json << "  \"warmup_query_limit\": " << args.warmup_query_limit << ",\n";
+  json << "  \"run_id\": \"" << json_escape(args.run_id) << "\",\n";
+  json << "  \"policy_version\": \"" << json_escape(args.policy_version)
+       << "\",\n";
+  json << "  \"cache_condition\": \""
+       << json_escape(args.cache_condition) << "\",\n";
+  json << "  \"seed\": " << args.seed << ",\n";
   json << "  \"graph_degree\": " << args.graph_degree << ",\n";
   json << "  \"page_size\": " << args.page_size << ",\n";
   json << "  \"build_policy\": \"" << json_escape(args.build_policy)
@@ -1118,6 +1171,10 @@ std::string json_for_run(const Args& args,
   json << "  \"prefetch_model\": \""
        << json_escape(args.prefetch_model_path) << "\",\n";
   json << "  \"prefetch_top_k\": " << args.prefetch_top_k << ",\n";
+  json << "  \"prefetch_candidate_pool_size\": "
+       << args.prefetch_candidate_pool_size << ",\n";
+  json << "  \"prefetch_submit_top_k\": " << args.prefetch_submit_top_k
+       << ",\n";
   json << "  \"prefetch_score_threshold\": ";
   if (std::isfinite(args.prefetch_score_threshold)) {
     json << args.prefetch_score_threshold;
@@ -1430,6 +1487,20 @@ void write_json_output(const fs::path& output_path, const std::string& json) {
   output << json;
 }
 
+void prepare_prefetch_trace(const fs::path& trace_path) {
+  if (trace_path.empty()) {
+    return;
+  }
+  if (!trace_path.parent_path().empty()) {
+    fs::create_directories(trace_path.parent_path());
+  }
+  std::ofstream output(trace_path, std::ios::trunc);
+  if (!output) {
+    throw std::runtime_error("Cannot create prefetch trace: " +
+                             trace_path.string());
+  }
+}
+
 }  // namespace
 
 int main(int argc, char** argv) {
@@ -1488,6 +1559,13 @@ int main(int argc, char** argv) {
     }
 
     const auto entry_seed_ids = select_search_entries(args, dataset, index);
+    if (args.warmup_query_limit > 0) {
+      Args warmup_args = args;
+      warmup_args.prefetch_trace_path.clear();
+      (void)run_searches(warmup_args, dataset, index, pq_model_ptr,
+                         entry_seed_ids, args.warmup_query_limit);
+    }
+    prepare_prefetch_trace(args.prefetch_trace_path);
     const auto aggregate =
         run_searches(args, dataset, index, pq_model_ptr, entry_seed_ids);
     const std::string json =

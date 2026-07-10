@@ -558,9 +558,6 @@ def main():
     if args.prefetch_policy not in {"none", "xgboost"}:
         raise SystemExit("--prefetch-policy must be none or xgboost")
     prefetch_enabled = any(spec.prefetch_depth != 0 for spec in specs)
-    model_in_extra_args = has_explicit_option(extra_args, ["--prefetch-model", "--prefetch_model"])
-    if prefetch_enabled and args.prefetch_policy == "xgboost" and not args.prefetch_model and not model_in_extra_args:
-        raise SystemExit("--prefetch-model is required when --prefetch-policy xgboost is enabled")
     output_dir.mkdir(parents=True, exist_ok=True)
     write_plan_metadata(output_dir / "matrix_plan.json", args, specs, warnings)
 
