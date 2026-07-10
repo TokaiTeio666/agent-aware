@@ -24,6 +24,7 @@
 #include <utility>
 #include <vector>
 
+#include "agent_aware/core/benchmark_support.h"
 #include "agent_aware/core/brute_force.h"
 #include "agent_aware/data/dataset.h"
 #include "agent_aware/dynamic/dynamic_write_manager.h"
@@ -181,25 +182,6 @@ struct ThreadMetrics {
   ReadBreakdownSamples read_breakdown;
 };
 
-std::string require_value(int& index, int argc, char** argv,
-                          const std::string& option) {
-  const std::string current = argv[index];
-  const auto eq = current.find('=');
-  if (eq != std::string::npos) {
-    return current.substr(eq + 1);
-  }
-  if (index + 1 >= argc) {
-    throw std::runtime_error("Missing value for " + option);
-  }
-  ++index;
-  return argv[index];
-}
-
-bool parse_bool(const std::string& value) {
-  return value == "1" || value == "true" || value == "on" ||
-         value == "yes";
-}
-
 void print_help() {
   std::cout
       << "Usage: bench_mixed_rw [options]\n"
@@ -232,100 +214,44 @@ void print_help() {
 
 Args parse_args(int argc, char** argv) {
   Args args;
-  for (int i = 1; i < argc; ++i) {
-    const std::string option = argv[i];
-    const auto name = option.substr(0, option.find('='));
-    if (name == "--data_path") {
-      args.data_path = require_value(i, argc, argv, name);
-    } else if (name == "--index_path") {
-      args.index_path = require_value(i, argc, argv, name);
-    } else if (name == "--dynamic_dir") {
-      args.dynamic_dir = require_value(i, argc, argv, name);
-    } else if (name == "--output") {
-      args.output = require_value(i, argc, argv, name);
-    } else if (name == "--num_operations") {
-      args.num_operations = static_cast<std::size_t>(
-          std::stoull(require_value(i, argc, argv, name)));
-    } else if (name == "--duration_sec") {
-      args.duration_sec = std::stod(require_value(i, argc, argv, name));
-    } else if (name == "--read_threads") {
-      args.read_threads = static_cast<std::size_t>(
-          std::stoull(require_value(i, argc, argv, name)));
-    } else if (name == "--write_threads") {
-      args.write_threads = static_cast<std::size_t>(
-          std::stoull(require_value(i, argc, argv, name)));
-    } else if (name == "--read_ratio") {
-      args.read_ratio = std::stod(require_value(i, argc, argv, name));
-    } else if (name == "--write_ratio") {
-      args.write_ratio = std::stod(require_value(i, argc, argv, name));
-    } else if (name == "--recall_sample_rate") {
-      args.recall_sample_rate = std::stod(require_value(i, argc, argv, name));
-    } else if (name == "--recall_max_samples_per_sec") {
-      args.recall_max_samples_per_sec =
-          std::stod(require_value(i, argc, argv, name));
-    } else if (name == "--topk") {
-      args.topk = static_cast<std::size_t>(
-          std::stoull(require_value(i, argc, argv, name)));
-    } else if (name == "--insert_batch_size") {
-      args.insert_batch_size = static_cast<std::size_t>(
-          std::stoull(require_value(i, argc, argv, name)));
-    } else if (name == "--enable_flush") {
-      args.enable_flush = parse_bool(require_value(i, argc, argv, name));
-    } else if (name == "--enable_compaction") {
-      args.enable_compaction = parse_bool(require_value(i, argc, argv, name));
-    } else if (name == "--compaction_background") {
-      args.compaction_background =
-          parse_bool(require_value(i, argc, argv, name));
-    } else if (name == "--compaction_interval_ms") {
-      args.compaction_interval_ms = static_cast<std::size_t>(
-          std::stoull(require_value(i, argc, argv, name)));
-    } else if (name == "--base_count") {
-      args.base_count = static_cast<std::size_t>(
-          std::stoull(require_value(i, argc, argv, name)));
-    } else if (name == "--query_count") {
-      args.query_count = static_cast<std::size_t>(
-          std::stoull(require_value(i, argc, argv, name)));
-    } else if (name == "--dim") {
-      args.dim = static_cast<std::size_t>(
-          std::stoull(require_value(i, argc, argv, name)));
-    } else if (name == "--memtable_flush_bytes") {
-      args.memtable_flush_bytes = static_cast<std::size_t>(
-          std::stoull(require_value(i, argc, argv, name)));
-    } else if (name == "--dynamic_graph_degree") {
-      args.dynamic_graph_degree = static_cast<std::size_t>(
-          std::stoull(require_value(i, argc, argv, name)));
-    } else if (name == "--search_width") {
-      args.search_width = static_cast<std::size_t>(
-          std::stoull(require_value(i, argc, argv, name)));
-    } else if (name == "--entry_count") {
-      args.entry_count = static_cast<std::size_t>(
-          std::stoull(require_value(i, argc, argv, name)));
-    } else if (name == "--beam_width") {
-      args.beam_width = static_cast<std::size_t>(
-          std::stoull(require_value(i, argc, argv, name)));
-    } else if (name == "--io_mode") {
-      args.io_mode = require_value(i, argc, argv, name);
-    } else if (name == "--io_batch") {
-      args.io_batch = static_cast<std::size_t>(
-          std::stoull(require_value(i, argc, argv, name)));
-    } else if (name == "--io_depth") {
-      args.io_depth = static_cast<std::size_t>(
-          std::stoull(require_value(i, argc, argv, name)));
-    } else if (name == "--cache_policy") {
-      args.cache_policy = require_value(i, argc, argv, name);
-    } else if (name == "--cache_pages") {
-      args.cache_pages = static_cast<std::size_t>(
-          std::stoull(require_value(i, argc, argv, name)));
-    } else if (name == "--seed") {
-      args.seed = static_cast<std::uint32_t>(
-          std::stoul(require_value(i, argc, argv, name)));
-    } else if (name == "--help" || name == "-h") {
+  agent_aware::bench::ArgParser parser(argc, argv);
+  if (parser.flag({"--help", "-h"})) {
       print_help();
       std::exit(0);
-    } else {
-      throw std::runtime_error("Unknown option: " + option);
-    }
   }
+  parser.take(args.data_path, {"--data_path"});
+  parser.take(args.index_path, {"--index_path"});
+  parser.take(args.dynamic_dir, {"--dynamic_dir"});
+  parser.take(args.output, {"--output"});
+  parser.take(args.num_operations, {"--num_operations"});
+  parser.take(args.duration_sec, {"--duration_sec"});
+  parser.take(args.read_threads, {"--read_threads"});
+  parser.take(args.write_threads, {"--write_threads"});
+  parser.take(args.read_ratio, {"--read_ratio"});
+  parser.take(args.write_ratio, {"--write_ratio"});
+  parser.take(args.recall_sample_rate, {"--recall_sample_rate"});
+  parser.take(args.recall_max_samples_per_sec, {"--recall_max_samples_per_sec"});
+  parser.take(args.topk, {"--topk"});
+  parser.take(args.insert_batch_size, {"--insert_batch_size"});
+  parser.take(args.enable_flush, {"--enable_flush"});
+  parser.take(args.enable_compaction, {"--enable_compaction"});
+  parser.take(args.compaction_background, {"--compaction_background"});
+  parser.take(args.compaction_interval_ms, {"--compaction_interval_ms"});
+  parser.take(args.base_count, {"--base_count"});
+  parser.take(args.query_count, {"--query_count"});
+  parser.take(args.dim, {"--dim"});
+  parser.take(args.memtable_flush_bytes, {"--memtable_flush_bytes"});
+  parser.take(args.dynamic_graph_degree, {"--dynamic_graph_degree"});
+  parser.take(args.search_width, {"--search_width"});
+  parser.take(args.entry_count, {"--entry_count"});
+  parser.take(args.beam_width, {"--beam_width"});
+  parser.take(args.io_mode, {"--io_mode"});
+  parser.take(args.io_batch, {"--io_batch"});
+  parser.take(args.io_depth, {"--io_depth"});
+  parser.take(args.cache_policy, {"--cache_policy"});
+  parser.take(args.cache_pages, {"--cache_pages"});
+  parser.take(args.seed, {"--seed"});
+  parser.finish();
   if (args.num_operations == 0 || args.topk == 0 ||
       args.insert_batch_size == 0 || args.search_width == 0 ||
       args.entry_count == 0 || args.beam_width == 0 || args.io_batch == 0 ||
@@ -898,6 +824,93 @@ ScenarioResult finalize_result(
   return result;
 }
 
+void execute_read(
+    const Args& args, const agent_aware::VectorSet& base, const float* query,
+    const std::shared_ptr<agent_aware::dynamic::DynamicWriteManager>& manager,
+    agent_aware::PackedGraphEngine* engine, ThreadMetrics& metrics,
+    std::mt19937& rng, std::atomic<std::int64_t>& next_recall_ns) {
+  const auto start = Clock::now();
+  std::vector<agent_aware::SearchResult> merged;
+  std::uint64_t sequence = 0;
+  if (engine != nullptr) {
+    const auto result = engine->search_one(query, args.topk);
+    merged = result.topk;
+    sequence = result.stats.dynamic_read_sequence;
+    append_read_timing(metrics, result.stats);
+  } else {
+    sequence = manager->current_sequence();
+    merged = search_memory_with_delta(base, manager, query, args.topk, sequence);
+  }
+  std::uniform_real_distribution<double> sample(0.0, 1.0);
+  if (sample(rng) <= args.recall_sample_rate &&
+      allow_recall_sample(args, next_recall_ns)) {
+    record_recall_sample(metrics, base, merged, query, args.topk, manager,
+                         sequence);
+  }
+  const double latency = elapsed_ms(start, Clock::now());
+  metrics.read_latencies_ms.push_back(latency);
+  metrics.op_latencies_ms.push_back(latency);
+  ++metrics.read_ops;
+}
+
+template <typename NextNodeId>
+void execute_write(
+    const Args& args, std::size_t dim,
+    const std::shared_ptr<agent_aware::dynamic::DynamicWriteManager>& manager,
+  agent_aware::PackedGraphEngine* engine, ThreadMetrics& metrics,
+  std::mt19937& rng, NextNodeId next_node_id) {
+  const auto start = Clock::now();
+  for (std::size_t i = 0; i < args.insert_batch_size; ++i) {
+    const auto [id, write_index] = next_node_id();
+    auto vector = make_insert_vector(write_index, dim, rng);
+    if (engine != nullptr) {
+      engine->insert(id, vector.data());
+    } else if (!manager->insert(id, vector.data(), static_cast<std::uint32_t>(dim))) {
+      throw std::runtime_error("Dynamic insert failed");
+    }
+    ++metrics.write_records;
+  }
+  const double latency = elapsed_ms(start, Clock::now());
+  metrics.write_latencies_ms.push_back(latency);
+  metrics.op_latencies_ms.push_back(latency);
+}
+
+ScenarioResult close_scenario(
+    const Args& args, const Scenario& scenario,
+    const std::filesystem::path& scenario_dir,
+    const std::shared_ptr<agent_aware::dynamic::DynamicWriteManager>& manager,
+    ThreadMetrics metrics, const CompactionAggregate& compaction,
+    Clock::time_point start, Clock::time_point end) {
+  double flush_ms = 0.0;
+  if (args.enable_flush) {
+    const auto flush_start = Clock::now();
+    if (!manager->flush()) {
+      throw std::runtime_error("Dynamic flush failed");
+    }
+    flush_ms = elapsed_ms(flush_start, Clock::now());
+  }
+  const auto records = manager->collect_all_delta_records();
+  if (!manager->close()) {
+    throw std::runtime_error("Dynamic close failed");
+  }
+  agent_aware::dynamic::DynamicWriteOptions options;
+  options.dynamic_dir = scenario_dir;
+  options.memtable_flush_bytes = args.memtable_flush_bytes;
+  options.dynamic_graph_degree = args.dynamic_graph_degree;
+  options.enable_wal = true;
+  options.enable_auto_flush = args.enable_flush;
+  const auto recovery_start = Clock::now();
+  agent_aware::dynamic::DynamicWriteManager recovered(options);
+  if (!recovered.open()) {
+    throw std::runtime_error("Dynamic recovery open failed");
+  }
+  const double recovery_ms = elapsed_ms(recovery_start, Clock::now());
+  (void)recovered.close();
+  return finalize_result(args, scenario, scenario_dir, records,
+                         std::move(metrics), compaction, start, end, flush_ms,
+                         recovery_ms);
+}
+
 ScenarioResult run_sequential_scenario(
     const Args& args, const Scenario& scenario,
     const agent_aware::VectorSet& base,
@@ -916,7 +929,6 @@ ScenarioResult run_sequential_scenario(
 
   std::mt19937 rng(args.seed ^ static_cast<std::uint32_t>(scenario.name.size()));
   std::uniform_real_distribution<double> choice(0.0, 1.0);
-  std::uniform_real_distribution<double> sample_pick(0.0, 1.0);
   ThreadMetrics metrics;
   metrics.op_latencies_ms.reserve(args.num_operations);
   std::size_t next_node_id = base.size();
@@ -926,57 +938,18 @@ ScenarioResult run_sequential_scenario(
   const auto start = Clock::now();
   for (std::size_t op = 0; op < args.num_operations; ++op) {
     const bool do_read = choice(rng) < scenario.read_ratio;
-    const auto op_start = Clock::now();
     if (do_read) {
       const auto& query = queries[next_query++ % queries.size()];
-      std::vector<agent_aware::SearchResult> merged;
-      std::uint64_t read_sequence = 0;
-      if (engine) {
-        const auto engine_result = engine->search_one(query.data(), args.topk);
-        merged = engine_result.topk;
-        read_sequence = engine_result.stats.dynamic_read_sequence;
-        append_read_timing(metrics, engine_result.stats);
-      } else {
-        read_sequence = manager->current_sequence();
-        merged = search_memory_with_delta(base, manager, query.data(),
-                                          args.topk, read_sequence);
-      }
-      if (sample_pick(rng) <= args.recall_sample_rate &&
-          allow_recall_sample(args, next_recall_ns)) {
-        record_recall_sample(metrics, base, merged, query.data(), args.topk,
-                             manager, read_sequence);
-      }
-      ++metrics.read_ops;
-      const double latency = elapsed_ms(op_start, Clock::now());
-      metrics.read_latencies_ms.push_back(latency);
-      metrics.op_latencies_ms.push_back(latency);
+      execute_read(args, base, query.data(), manager, engine.get(), metrics,
+                   rng, next_recall_ns);
     } else {
-      for (std::size_t i = 0; i < args.insert_batch_size; ++i) {
-        auto vector = make_insert_vector(metrics.write_records, base.dim, rng);
-        const auto node_id = static_cast<agent_aware::NodeId>(next_node_id++);
-        if (engine) {
-          engine->insert(node_id, vector.data());
-        } else if (!manager->insert(node_id, vector.data(),
-                                    static_cast<std::uint32_t>(base.dim))) {
-          throw std::runtime_error("Dynamic insert failed");
-        }
-        ++metrics.write_records;
-      }
-      const double latency = elapsed_ms(op_start, Clock::now());
-      metrics.write_latencies_ms.push_back(latency);
-      metrics.op_latencies_ms.push_back(latency);
+      execute_write(args, base.dim, manager, engine.get(), metrics, rng, [&]() {
+        return std::pair{static_cast<agent_aware::NodeId>(next_node_id++),
+                         metrics.write_records};
+      });
     }
   }
   const auto end = Clock::now();
-
-  double flush_ms = 0.0;
-  if (args.enable_flush) {
-    const auto flush_start = Clock::now();
-    if (!manager->flush()) {
-      throw std::runtime_error("Dynamic flush failed");
-    }
-    flush_ms = elapsed_ms(flush_start, Clock::now());
-  }
 
   CompactionAggregate compaction;
   std::mutex compaction_mutex;
@@ -984,28 +957,8 @@ ScenarioResult run_sequential_scenario(
     maybe_run_compaction(manager, compaction, compaction_mutex);
   }
 
-  agent_aware::dynamic::DynamicWriteOptions options;
-  options.dynamic_dir = scenario_dir;
-  options.memtable_flush_bytes = args.memtable_flush_bytes;
-  options.dynamic_graph_degree = args.dynamic_graph_degree;
-  options.enable_wal = true;
-  options.enable_auto_flush = args.enable_flush;
-
-  const auto final_delta_records = manager->collect_all_delta_records();
-  if (!manager->close()) {
-    throw std::runtime_error("Dynamic close failed");
-  }
-  const auto recovery_start = Clock::now();
-  agent_aware::dynamic::DynamicWriteManager recovered(options);
-  if (!recovered.open()) {
-    throw std::runtime_error("Dynamic recovery open failed");
-  }
-  const double recovery_ms = elapsed_ms(recovery_start, Clock::now());
-  (void)recovered.close();
-
-  return finalize_result(args, scenario, scenario_dir, final_delta_records,
-                         std::move(metrics), compaction, start, end, flush_ms,
-                         recovery_ms);
+  return close_scenario(args, scenario, scenario_dir, manager,
+                        std::move(metrics), compaction, start, end);
 }
 
 ScenarioResult run_concurrent_scenario(
@@ -1078,35 +1031,13 @@ ScenarioResult run_concurrent_scenario(
               engine_config_for(args, manager));
         }
         std::mt19937 rng(args.seed ^ static_cast<std::uint32_t>(thread_id + 17));
-        std::uniform_real_distribution<double> sample_pick(0.0, 1.0);
         auto& metrics = reader_metrics[thread_id];
         while (claim_operation()) {
           const auto& query =
               queries[query_cursor.fetch_add(1, std::memory_order_relaxed) %
                       queries.size()];
-          const auto op_start = Clock::now();
-          std::vector<agent_aware::SearchResult> merged;
-          std::uint64_t read_sequence = 0;
-          if (engine) {
-            const auto engine_result =
-                engine->search_one(query.data(), args.topk);
-            merged = engine_result.topk;
-            read_sequence = engine_result.stats.dynamic_read_sequence;
-            append_read_timing(metrics, engine_result.stats);
-          } else {
-            read_sequence = manager->current_sequence();
-            merged = search_memory_with_delta(base, manager, query.data(),
-                                              args.topk, read_sequence);
-          }
-          if (sample_pick(rng) <= args.recall_sample_rate &&
-              allow_recall_sample(args, next_recall_ns)) {
-            record_recall_sample(metrics, base, merged, query.data(), args.topk,
-                                 manager, read_sequence);
-          }
-          const double latency = elapsed_ms(op_start, Clock::now());
-          metrics.read_latencies_ms.push_back(latency);
-          metrics.op_latencies_ms.push_back(latency);
-          ++metrics.read_ops;
+          execute_read(args, base, query.data(), manager, engine.get(), metrics,
+                       rng, next_recall_ns);
         }
       } catch (...) {
         errors[thread_id] = std::current_exception();
@@ -1121,22 +1052,12 @@ ScenarioResult run_concurrent_scenario(
         std::mt19937 rng(args.seed ^ static_cast<std::uint32_t>(thread_id + 911));
         auto& metrics = writer_metrics[thread_id];
         while (claim_operation()) {
-          const auto op_start = Clock::now();
-          for (std::size_t i = 0; i < args.insert_batch_size; ++i) {
-            const auto local_write =
-                write_index.fetch_add(1, std::memory_order_relaxed);
-            auto vector = make_insert_vector(local_write, base.dim, rng);
-            const auto node_id = static_cast<agent_aware::NodeId>(
-                next_node_id.fetch_add(1, std::memory_order_relaxed));
-            if (!manager->insert(node_id, vector.data(),
-                                 static_cast<std::uint32_t>(base.dim))) {
-              throw std::runtime_error("Dynamic insert failed");
-            }
-            ++metrics.write_records;
-          }
-          const double latency = elapsed_ms(op_start, Clock::now());
-          metrics.write_latencies_ms.push_back(latency);
-          metrics.op_latencies_ms.push_back(latency);
+          execute_write(args, base.dim, manager, nullptr, metrics, rng, [&]() {
+            return std::pair{
+                static_cast<agent_aware::NodeId>(
+                    next_node_id.fetch_add(1, std::memory_order_relaxed)),
+                write_index.fetch_add(1, std::memory_order_relaxed)};
+          });
         }
       } catch (...) {
         errors[read_threads + thread_id] = std::current_exception();
@@ -1173,43 +1094,15 @@ ScenarioResult run_concurrent_scenario(
     merge_thread_metrics(metrics, std::move(item));
   }
 
-  double flush_ms = 0.0;
-  if (args.enable_flush) {
-    const auto flush_start = Clock::now();
-    if (!manager->flush()) {
-      throw std::runtime_error("Dynamic flush failed");
-    }
-    flush_ms = elapsed_ms(flush_start, Clock::now());
-  }
   if (args.enable_compaction && !args.compaction_background) {
     maybe_run_compaction(manager, compaction, compaction_mutex);
   }
 
-  agent_aware::dynamic::DynamicWriteOptions options;
-  options.dynamic_dir = scenario_dir;
-  options.memtable_flush_bytes = args.memtable_flush_bytes;
-  options.dynamic_graph_degree = args.dynamic_graph_degree;
-  options.enable_wal = true;
-  options.enable_auto_flush = args.enable_flush;
-
-  const auto final_delta_records = manager->collect_all_delta_records();
-  if (!manager->close()) {
-    throw std::runtime_error("Dynamic close failed");
-  }
-  const auto recovery_start = Clock::now();
-  agent_aware::dynamic::DynamicWriteManager recovered(options);
-  if (!recovered.open()) {
-    throw std::runtime_error("Dynamic recovery open failed");
-  }
-  const double recovery_ms = elapsed_ms(recovery_start, Clock::now());
-  (void)recovered.close();
-
   Args effective_args = args;
   effective_args.read_threads = read_threads;
   effective_args.write_threads = write_threads;
-  return finalize_result(effective_args, scenario, scenario_dir,
-                         final_delta_records, std::move(metrics), compaction,
-                         start, end, flush_ms, recovery_ms);
+  return close_scenario(effective_args, scenario, scenario_dir, manager,
+                        std::move(metrics), compaction, start, end);
 }
 
 std::vector<Scenario> scenarios_for(const Args& args) {

@@ -507,14 +507,6 @@ std::uint64_t SSTableReader::id() const {
   return id_;
 }
 
-int SSTableReader::level() const {
-  return level_;
-}
-
-std::size_t SSTableReader::record_count() const {
-  return record_count_;
-}
-
 std::uint64_t SSTableReader::max_sequence_id() const {
   return max_sequence_id_;
 }

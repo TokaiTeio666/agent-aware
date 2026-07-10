@@ -112,26 +112,6 @@ std::vector<DynamicRecord> deduplicate_newest_at(
   return deduplicate_newest(visible);
 }
 
-std::optional<DynamicRecord> latest_record_from_history(
-    const std::vector<DynamicRecord>& records, NodeId node_id,
-    std::uint64_t read_sequence, bool include_deleted) {
-  DynamicRecord latest;
-  bool found = false;
-  for (const auto& record : records) {
-    if (record.node_id != node_id || record.sequence_id > read_sequence) {
-      continue;
-    }
-    if (!found || record.sequence_id > latest.sequence_id) {
-      latest = record;
-      found = true;
-    }
-  }
-  if (!found || (latest.deleted && !include_deleted)) {
-    return std::nullopt;
-  }
-  return latest;
-}
-
 std::unordered_map<NodeId, DynamicRecord> latest_records_for_from_history(
     const std::vector<DynamicRecord>& records,
     const std::vector<NodeId>& node_ids, std::uint64_t read_sequence,
@@ -380,27 +360,8 @@ DynamicWriteManager::load_read_view() const {
   return std::atomic_load_explicit(&read_view_, std::memory_order_acquire);
 }
 
-bool DynamicWriteManager::get(NodeId node_id, DynamicRecord& out) const {
-  const auto record = latest_record(node_id, current_sequence(), false);
-  if (!record.has_value()) {
-    return false;
-  }
-  out = *record;
-  return true;
-}
-
 std::uint64_t DynamicWriteManager::current_sequence() const {
   return latest_sequence_.load(std::memory_order_acquire);
-}
-
-std::optional<DynamicRecord> DynamicWriteManager::latest_record(
-    NodeId node_id, std::uint64_t read_sequence, bool include_deleted) const {
-  const auto view = load_read_view();
-  if (!view || !view->opened) {
-    return std::nullopt;
-  }
-  return latest_record_from_history(view->history_records, node_id,
-                                    read_sequence, include_deleted);
 }
 
 std::unordered_map<NodeId, DynamicRecord>
@@ -430,22 +391,6 @@ DynamicSnapshot DynamicWriteManager::snapshot(
     }
   }
   return output;
-}
-
-bool DynamicWriteManager::latest_record_locked(NodeId node_id,
-                                               std::uint64_t read_sequence,
-                                               bool include_deleted,
-                                               DynamicRecord& out) const {
-  const auto records = collect_all_delta_records_locked(read_sequence);
-  const auto found = std::find_if(records.begin(), records.end(),
-                                  [&](const DynamicRecord& record) {
-                                    return record.node_id == node_id;
-                                  });
-  if (found == records.end() || (found->deleted && !include_deleted)) {
-    return false;
-  }
-  out = *found;
-  return true;
 }
 
 std::vector<DynamicRecord> DynamicWriteManager::collect_all_delta_records()
@@ -507,12 +452,6 @@ std::vector<NodeId> DynamicWriteManager::select_incremental_neighbors_locked(
     neighbors.push_back(candidate.record.node_id);
   }
   return neighbors;
-}
-
-std::vector<DynamicRecord> DynamicWriteManager::search_delta_l2(
-    const float* query, std::uint32_t dim, std::size_t topk) const {
-  return search_delta_l2_at(query, dim, topk,
-                            std::numeric_limits<std::uint64_t>::max());
 }
 
 std::vector<DynamicRecord> DynamicWriteManager::search_delta_l2_at(

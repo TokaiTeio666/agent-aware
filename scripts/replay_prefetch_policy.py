@@ -9,7 +9,7 @@ import math
 from pathlib import Path
 from typing import Callable, Dict, Iterator, List, Sequence
 
-from prefetch_trace_utils import (
+from prefetch_trace import (
     is_missing_at_decision,
     iter_trace_rows,
     parse_bool,
@@ -168,33 +168,6 @@ class ReplayAccumulator:
         }
 
 
-def make_markdown(payload: dict) -> str:
-    lines = [
-        "# Prefetch Policy Replay",
-        "",
-        f"Replay evaluable: `{payload['replay_evaluable']}`",
-        "",
-        "| Policy | Top-K | Evaluable | Groups | Selected | Useful | Useful Rate | Online Useful Rate | Gap (pp) | Recall@K |",
-        "| --- | ---: | --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: |",
-    ]
-    for row in payload["results"]:
-        def fmt(value: object) -> str:
-            if value is None:
-                return "null"
-            if isinstance(value, float):
-                return f"{value:.6g}"
-            return str(value)
-
-        lines.append(
-            "| {policy} | {top_k} | {evaluable} | {groups} | {selected_pages} | "
-            "{selected_positive_pages} | {useful_rate} | {online_useful_rate} | "
-            "{useful_rate_gap_pp} | {recall_at_k} |".format(
-                **{key: fmt(value) for key, value in row.items()}
-            )
-        )
-    return "\n".join(lines) + "\n"
-
-
 def main() -> None:
     parser = argparse.ArgumentParser(
         description="Replay XGBoost prefetch policy from a trace CSV."
@@ -204,7 +177,6 @@ def main() -> None:
     parser.add_argument("--top-k", nargs="+", type=int, required=True)
     parser.add_argument("--match-online-budget", action="store_true")
     parser.add_argument("--out-json", type=Path)
-    parser.add_argument("--out-md", type=Path)
     args = parser.parse_args()
 
     if any(value <= 0 for value in args.top_k):
@@ -294,9 +266,6 @@ def main() -> None:
     if args.out_json:
         args.out_json.parent.mkdir(parents=True, exist_ok=True)
         args.out_json.write_text(text + "\n", encoding="utf-8")
-    if args.out_md:
-        args.out_md.parent.mkdir(parents=True, exist_ok=True)
-        args.out_md.write_text(make_markdown(payload), encoding="utf-8")
     print(text)
 
 

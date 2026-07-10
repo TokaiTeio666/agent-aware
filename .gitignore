@@ -1,5 +1,8 @@
 build/
 .vs/
+__pycache__/
+*.pyc
+exit.status
 *.exe
 *.o
 *.obj

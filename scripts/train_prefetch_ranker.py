@@ -133,85 +133,6 @@ class Stump:
         return self.left if values[self.feature_idx] < self.threshold else self.right
 
 
-def candidate_thresholds(values: Sequence[float]) -> List[float]:
-    uniq = sorted(set(values))
-    if len(uniq) <= 1:
-        return []
-    if len(uniq) > 32:
-        picks = []
-        for i in range(1, 32):
-            picks.append(uniq[min(len(uniq) - 1, math.floor(i * len(uniq) / 32))])
-        uniq = sorted(set(picks))
-    return [(a + b) / 2.0 for a, b in zip(uniq, uniq[1:])]
-
-
-def best_stump(vectors: Sequence[Sequence[float]], residuals: Sequence[float]) -> Stump:
-    best = Stump(0, math.inf, 0.0, 0.0)
-    best_loss = math.inf
-    feature_count = len(TRACE_FEATURES)
-    for feature_idx in range(feature_count):
-        values = [row[feature_idx] for row in vectors]
-        for threshold in candidate_thresholds(values):
-            left = [res for value, res in zip(values, residuals) if value < threshold]
-            right = [res for value, res in zip(values, residuals) if value >= threshold]
-            if not left or not right:
-                continue
-            left_value = sum(left) / len(left)
-            right_value = sum(right) / len(right)
-            loss = 0.0
-            for value, residual in zip(values, residuals):
-                pred = left_value if value < threshold else right_value
-                error = residual - pred
-                loss += error * error
-            if loss < best_loss:
-                best_loss = loss
-                best = Stump(feature_idx, threshold, left_value, right_value)
-    if not math.isfinite(best_loss):
-        mean = sum(residuals) / max(1, len(residuals))
-        return Stump(0, math.inf, mean, mean)
-    return best
-
-
-def train_stump_ensemble(
-    train_rows: Sequence[dict],
-    rounds: int,
-    learning_rate: float,
-    seed: int,
-) -> tuple[float, List[Stump]]:
-    rng = random.Random(seed)
-    rows = list(train_rows)
-    rng.shuffle(rows)
-    labels = [float(row["label"]) for row in rows]
-    vectors = [vector(row) for row in rows]
-    base_score = sum(labels) / max(1, len(labels))
-    predictions = [base_score] * len(rows)
-    stumps: List[Stump] = []
-    for _ in range(max(1, rounds)):
-        residuals = [label - pred for label, pred in zip(labels, predictions)]
-        stump = best_stump(vectors, residuals)
-        stump.left *= learning_rate
-        stump.right *= learning_rate
-        for i, values in enumerate(vectors):
-            predictions[i] += stump.score(values)
-        stumps.append(stump)
-    return base_score, stumps
-
-
-def write_xgboost_dump(path: Path, base_score: float, stumps: Sequence[Stump]) -> None:
-    path.parent.mkdir(parents=True, exist_ok=True)
-    with path.open("w", encoding="utf-8") as handle:
-        handle.write("# agent-aware xgboost text dump\n")
-        handle.write(f"base_score={base_score:.12g}\n")
-        for tree_id, stump in enumerate(stumps):
-            feature = TRACE_FEATURES[stump.feature_idx][1]
-            handle.write(f"booster[{tree_id}]:\n")
-            handle.write(
-                f"0:[{feature}<{stump.threshold:.12g}] yes=1,no=2,missing=1\n"
-            )
-            handle.write(f"\t1:leaf={stump.left:.12g}\n")
-            handle.write(f"\t2:leaf={stump.right:.12g}\n")
-
-
 def train_real_xgboost(
     train_rows: Sequence[dict],
     rounds: int,
@@ -376,10 +297,6 @@ def main() -> None:
             "the train/valid/test split is done by separate benchmark runs."
         ),
     )
-    # Kept as compatibility no-ops for older smoke commands.
-    parser.add_argument("--backend", type=str)
-    parser.add_argument("--epochs", type=int)
-    parser.add_argument("--l2", type=float)
     args = parser.parse_args()
 
     if args.top_k <= 0:

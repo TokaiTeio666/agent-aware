@@ -9,24 +9,6 @@ set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 set(CMAKE_CXX_EXTENSIONS OFF)
 
-set(AGENT_AWARE_GENERATED_INCLUDE "${CMAKE_CURRENT_BINARY_DIR}/generated/include")
-set(AGENT_AWARE_COMPAT_INCLUDE "${AGENT_AWARE_GENERATED_INCLUDE}/agent_aware")
-file(MAKE_DIRECTORY "${AGENT_AWARE_GENERATED_INCLUDE}")
-file(REMOVE_RECURSE "${AGENT_AWARE_COMPAT_INCLUDE}")
-file(
-  CREATE_LINK
-    "${CMAKE_CURRENT_SOURCE_DIR}/include"
-    "${AGENT_AWARE_COMPAT_INCLUDE}"
-  SYMBOLIC
-  COPY_ON_ERROR
-  RESULT AGENT_AWARE_COMPAT_LINK_RESULT
-)
-if(NOT AGENT_AWARE_COMPAT_LINK_RESULT STREQUAL "0")
-  message(FATAL_ERROR
-    "Failed to prepare generated include compatibility tree: "
-    "${AGENT_AWARE_COMPAT_LINK_RESULT}")
-endif()
-
 find_package(Threads REQUIRED)
 
 if(CMAKE_SYSTEM_NAME STREQUAL "Linux")
@@ -67,12 +49,7 @@ set(AGENT_AWARE_LIBRARY_SOURCES
   src/graph/disk_graph_index.cpp
   src/graph/disk_page_codec.cpp
   src/graph/entry_selector.cpp
-  src/graph/naive_disk_graph_index.cpp
   src/graph/vamana_builder.cpp
-  src/storage/disk_index_reader.cpp
-  src/storage/disk_index_writer.cpp
-  src/storage/disk_record.cpp
-  src/storage/lsm_tree.cpp
 )
 
 add_library(agent_aware STATIC ${AGENT_AWARE_LIBRARY_SOURCES})
@@ -81,7 +58,6 @@ add_library(agent_aware::agent_aware ALIAS agent_aware)
 target_include_directories(agent_aware
   PUBLIC
     "$<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include>"
-    "$<BUILD_INTERFACE:${AGENT_AWARE_GENERATED_INCLUDE}>"
 )
 
 target_link_libraries(agent_aware PUBLIC Threads::Threads)
@@ -105,3 +81,16 @@ target_link_libraries(agent-aware PRIVATE agent_aware::agent_aware)
 
 add_executable(bench_mixed_rw src/mixed_rw_benchmark.cpp)
 target_link_libraries(bench_mixed_rw PRIVATE agent_aware::agent_aware)
+
+include(CTest)
+if(BUILD_TESTING)
+  find_package(Python3 REQUIRED COMPONENTS Interpreter)
+  add_test(
+    NAME contract_smoke
+    COMMAND "${Python3_EXECUTABLE}"
+            "${CMAKE_CURRENT_SOURCE_DIR}/tests/contract_smoke.py"
+            "$<TARGET_FILE:agent-aware>"
+            "$<TARGET_FILE:bench_mixed_rw>"
+            "${CMAKE_CURRENT_SOURCE_DIR}/scripts/agent_aware.py"
+  )
+endif()

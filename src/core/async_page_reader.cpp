@@ -41,12 +41,6 @@ std::string errno_reason(const std::string& prefix) {
 }
 #endif
 
-void record_pending_peak(DiskGraphSearchStats& stats,
-                         std::size_t pending_reads) {
-  stats.p4_io.pending_reads =
-      std::max(stats.p4_io.pending_reads, pending_reads);
-}
-
 class AlignedBufferPool {
  public:
   AlignedBufferPool() = default;
@@ -242,7 +236,6 @@ class LibUring {
     }
     ++stats.io_submits;
     ++stats.submitted_reads;
-    ++stats.p4_io.async_submits;
     stats.io_submit_syscalls += submit_syscalls;
     stats.uring_submit_count += submit_syscalls;
 
@@ -255,7 +248,6 @@ class LibUring {
 
     ++stats.io_completions;
     ++stats.completed_reads;
-    ++stats.p4_io.async_completions;
     ++stats.uring_cqe_count;
     const int result = completion.result;
     if (result != static_cast<int>(bytes)) {
@@ -417,9 +409,6 @@ struct AsyncPageReader::Impl {
     async_buffers.emplace(token, AsyncBuffer{aligned, bytes, buffer_index});
     ++stats.io_submits;
     ++stats.submitted_reads;
-    ++stats.p4_io.async_submits;
-    ++stats.p4_io.ssd_reads;
-    record_pending_peak(stats, pending_async_reads());
     return token;
 #else
     (void)offset;
@@ -531,7 +520,6 @@ struct AsyncPageReader::Impl {
     async_buffers.erase(found);
     ++stats.io_completions;
     ++stats.completed_reads;
-    ++stats.p4_io.async_completions;
     ++stats.uring_cqe_count;
 
     if (completion.result != static_cast<int>(buffer.bytes)) {
@@ -553,7 +541,6 @@ struct AsyncPageReader::Impl {
     if (async_buffer_pool != nullptr) {
       async_buffer_pool->release(buffer.index);
     }
-    record_pending_peak(stats, pending_async_reads());
     return true;
 #else
     (void)wait;
@@ -595,8 +582,6 @@ struct AsyncPageReader::Impl {
       if (status.effective_mode == "io_uring") {
 #if AGENT_AWARE_ASYNC_CAN_USE_LIBURING
         ok = ring.read(fd, offset, aligned, bytes, stats, reason);
-        ++stats.p4_io.sync_reads;
-        ++stats.p4_io.ssd_reads;
 #endif
       } else {
         ok = read_with_pread(aligned, bytes, offset, stats, reason);
@@ -629,8 +614,6 @@ struct AsyncPageReader::Impl {
     ++stats.submitted_reads;
     ++stats.io_completions;
     ++stats.completed_reads;
-    ++stats.p4_io.sync_reads;
-    ++stats.p4_io.ssd_reads;
 #endif
     return output;
   }
@@ -671,10 +654,7 @@ struct AsyncPageReader::Impl {
     ++stats.io_submits;
     ++stats.submitted_reads;
     ++stats.io_submit_syscalls;
-    ++stats.p4_io.sync_reads;
-    ++stats.p4_io.ssd_reads;
     if (status.requested_mode != status.effective_mode) {
-      ++stats.p4_io.fallback_reads;
     }
     if (result < 0) {
       reason = errno_reason("pread_failed_errno");

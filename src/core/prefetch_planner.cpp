@@ -224,6 +224,17 @@ PrefetchPlanner::Plan PrefetchPlanner::plan_coalesced_candidates(
       aggregate.feature.min_pq_rank_on_page = rank;
       aggregate.last_rank = rank;
       aggregate.feature.search_step = context.search_step;
+      const auto first_seen =
+          first_seen_steps_.emplace(page_id, context.search_step);
+      aggregate.feature.first_seen_step = first_seen.first->second;
+      const auto estimate =
+          context.estimated_demand_step_deltas.find(page_id);
+      const std::size_t demand_step_delta =
+          estimate == context.estimated_demand_step_deltas.end()
+              ? std::size_t{1}
+              : estimate->second;
+      aggregate.feature.estimated_demand_step =
+          context.search_step + demand_step_delta;
       aggregate.feature.visited_count = context.visited_count;
       aggregate.feature.frontier_size = context.frontier_size;
       aggregate.feature.result_size = context.result_size;
@@ -265,6 +276,10 @@ PrefetchPlanner::Plan PrefetchPlanner::plan_coalesced_candidates(
         ++stats.dedup_hits;
         ++stats.skip_seen_before;
         aggregate.feature.skip_reason = "seen_before";
+      } else if (demand_step_delta < 1) {
+        aggregate.eligible = false;
+        ++stats.skip_too_late;
+        aggregate.feature.skip_reason = "too_late";
       }
     }
 

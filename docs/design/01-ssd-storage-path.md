@@ -1,5 +1,7 @@
 # 01 SSD 存储链路设计文档
 
+> 历史设计：当前主线已删除 V1 `storage/` 与单节点页实现，仅保留 Vamana+BFS packed graph。下文用于记录早期取舍，不代表当前目录结构。
+
 ## 当前实现状态（2026-06-21）
 
 SSD 存储链路的核心交付已经进入主路径：项目具备 4KB disk record、磁盘索引读写、packed graph 文件、O_DIRECT/pread 读路径以及对应验证。该文档现在作为 SSD 存储链路的设计归档和验收依据。

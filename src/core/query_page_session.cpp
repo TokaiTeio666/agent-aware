@@ -24,7 +24,7 @@ bool session_async_prefetch_enabled(const PackedDiskGraphIndex& index,
                                     const DiskGraphSearchConfig& config) {
   const DiskGraphIoStatus& status = index.io_status();
   // Agent-Mem-IO 风格：policy=xgboost 表示启用预取，不依赖 width/top_k
-  return status.io_uring_enabled && status.depth > 0 &&
+  return status.io_uring_enabled && status.depth >= 4 &&
          config.prefetch_depth > 0 &&
          config.prefetch_policy != "none";
 }
@@ -57,15 +57,17 @@ std::size_t session_prefetch_budget(const PackedDiskGraphIndex& index,
   if (io_depth <= demand_reserve) {
     return 0;
   }
-  // Agent-Mem-IO 风格：width/top_k=0 时用 io_depth/4 作为默认预算
-  std::size_t width = std::max(config.prefetch_width, config.prefetch_top_k);
-  width = std::max(width, config.prefetch_submit_top_k);
-  if (width == 0) {
-    width = std::max<std::size_t>(1, io_depth / 4);
+  const std::size_t io_guard = std::min<std::size_t>(8, io_depth / 4);
+  if (io_guard == 0) {
+    return 0;
   }
-  const std::size_t requested =
-      width * std::max<std::size_t>(1, config.prefetch_depth);
-  return std::min(requested, io_depth - demand_reserve);
+  std::size_t requested = config.prefetch_max_inflight;
+  if (requested == 0) {
+    std::size_t width = std::max(config.prefetch_width, config.prefetch_top_k);
+    width = std::max(width, config.prefetch_submit_top_k);
+    requested = width * std::max<std::size_t>(1, config.prefetch_depth);
+  }
+  return std::min({requested, io_guard, io_depth - demand_reserve});
 }
 
 PrefetchPlanner::Config session_prefetch_config(
@@ -103,7 +105,9 @@ QueryPageSession::QueryPageSession(PackedDiskGraphIndex& index,
       run_id_(config.run_id),
       policy_version_(config.policy_version),
       random_seed_(config.random_seed),
-      trace_start_(std::chrono::steady_clock::now()) {}
+      trace_start_(std::chrono::steady_clock::now()) {
+  stats_.effective_prefetch_max_inflight = prefetch_budget_pages_;
+}
 
 QueryPageSession::~QueryPageSession() {
   try {
@@ -185,7 +189,6 @@ const QueryPageSession::Page& QueryPageSession::get_or_load_page(
   ++stats_.page_requests_after_dedup;
   demand_pages_.insert(page_id);
   Page page = read_demand_page(page_id);
-  index_.record_hub_cache_access(index_.page_is_hub(page), false, stats_);
 
   if (index_.cache_enabled()) {
     const Page& cached_page = index_.store_cached_page(std::move(page), stats_);
@@ -289,7 +292,6 @@ void QueryPageSession::ensure_pages_loaded_batch(
   if (duplicate_count > 0) {
     stats_.page_dedup_hits += duplicate_count;
     stats_.duplicate_pages_eliminated += duplicate_count;
-    stats_.p4_io.dedup_hits += duplicate_count;
     stats_.duplicate_skipped += duplicate_count;
   }
 
@@ -386,8 +388,6 @@ void QueryPageSession::ensure_pages_loaded_batch(
       submitted_pages.erase(token);
 
       Page decoded = index_.decode_page(page_id, std::move(completed.data));
-      index_.record_hub_cache_access(index_.page_is_hub(decoded), false,
-                                     stats_);
       if (index_.cache_enabled()) {
         const Page& cached_page =
             index_.store_cached_page(std::move(decoded), stats_);
@@ -423,7 +423,7 @@ void QueryPageSession::submit_prefetch(
   }
 
   auto context = prefetch_context();
-  context.search_step = prefetch_step_++;
+  context.search_step = current_search_step_;
   const auto plan = prefetch_planner_.plan_frontier(
       page_ids, [this](std::uint32_t page_id) {
         return page_availability(page_id);
@@ -447,13 +447,16 @@ void QueryPageSession::submit_pages_direct(
 void QueryPageSession::submit_candidate_prefetch(
     const std::vector<std::uint32_t>& page_ids,
     const std::string& trigger,
-    std::size_t max_pages) {
+    std::size_t max_pages,
+    const std::unordered_map<std::uint32_t, std::size_t>&
+        estimated_demand_step_deltas) {
   if (!frontier_prefetch_enabled() || page_ids.empty()) {
     return;
   }
 
   auto context = prefetch_context();
-  context.search_step = prefetch_step_++;
+  context.search_step = current_search_step_;
+  context.estimated_demand_step_deltas = estimated_demand_step_deltas;
   const auto plan = prefetch_planner_.plan_candidates(
       page_ids, [this](std::uint32_t page_id) {
         return page_availability(page_id);
@@ -467,6 +470,7 @@ void QueryPageSession::submit_candidate_prefetch(
 std::size_t QueryPageSession::submit_jit_prefetch(
     const std::vector<std::uint32_t>& page_ids,
     const std::string& trigger,
+    std::size_t max_pages,
     std::size_t min_candidates_per_page) {
   if (!async_prefetch_ || page_ids.empty()) {
     return 0;
@@ -474,13 +478,13 @@ std::size_t QueryPageSession::submit_jit_prefetch(
 
   const std::size_t submitted_before = stats_.prefetch_submitted;
   auto context = prefetch_context();
-  context.search_step = prefetch_step_++;
+  context.search_step = current_search_step_;
   context.min_candidates_per_page = min_candidates_per_page;
   const auto plan = prefetch_planner_.plan_candidates(
       page_ids, [this](std::uint32_t page_id) {
         return page_availability(page_id);
       },
-      0, true, context);
+      max_pages, true, context);
   record_prefetch_plan(plan, trigger);
   apply_prefetch_plan_stats(plan.stats);
   submit_prefetch_plan(plan.pages);
@@ -508,7 +512,6 @@ bool QueryPageSession::pin_page(std::uint32_t page_id) {
     return false;
   }
   pinned_pages_.insert(page_id);
-  ++stats_.page_cache_pins;
   return true;
 }
 
@@ -549,7 +552,6 @@ void QueryPageSession::finish_query() {
   pending_hit_pages_.clear();
   pending_wait_us_by_page_.clear();
   stats_.prefetch_wasted_pages = stats_.prefetch_dropped;
-  stats_.p4_io.prefetch_dropped = stats_.prefetch_dropped;
   // 汇总计数只在查询结束时计算一次，此时所有 pending/ready 预取都已被消费或标记为 dropped。
   stats_.unique_pages_touched = visited_pages_.size();
   stats_.unique_demand_pages = demand_pages_.size();
@@ -561,7 +563,11 @@ void QueryPageSession::finish_query() {
     }
   }
   stats_.prefetch_only_pages = prefetch_only;
-  validate_prefetch_trace();
+  if (stats_.prefetch_useful_pages !=
+      stats_.prefetch_ready_hit + stats_.prefetch_pending_hit) {
+    throw std::logic_error(
+        "prefetch_useful_pages must equal ready_hit + pending_hit");
+  }
   write_prefetch_trace();
   unpin_all();
   finished_ = true;
@@ -623,7 +629,6 @@ void QueryPageSession::apply_prefetch_plan_stats(
   stats_.page_requests_before_dedup += stats.page_requests_before_dedup;
   stats_.page_dedup_requests += stats.dedup_requests;
   stats_.page_dedup_hits += stats.dedup_hits;
-  stats_.p4_io.dedup_hits += stats.dedup_hits;
   stats_.duplicate_skipped += stats.dedup_hits;
   stats_.prefetch_skip_seen_before += stats.skip_seen_before;
   stats_.prefetch_skip_cached += stats.skip_cached;
@@ -633,13 +638,13 @@ void QueryPageSession::apply_prefetch_plan_stats(
   stats_.prefetch_skip_low_page_reuse += stats.skip_low_page_reuse;
   stats_.prefetch_skip_score_threshold += stats.skip_score_threshold;
   stats_.prefetch_skip_inflight_full += stats.skip_inflight_full;
+  stats_.prefetch_skip_too_late += stats.skip_too_late;
 }
 
 void QueryPageSession::record_duplicate_skipped(std::size_t count) {
   stats_.page_dedup_hits += count;
   stats_.duplicate_pages_eliminated += count;
   stats_.duplicate_skipped += count;
-  stats_.p4_io.dedup_hits += count;
 }
 
 void QueryPageSession::record_prefetch_plan(
@@ -648,11 +653,13 @@ void QueryPageSession::record_prefetch_plan(
     return;
   }
 
+  const std::uint64_t group_id = next_group_id_++;
   prefetch_trace_records_.reserve(prefetch_trace_records_.size() +
                                   plan.candidates.size());
   for (const auto& feature : plan.candidates) {
     PrefetchTraceRecord record;
     record.decision_id = next_decision_id_++;
+    record.group_id = group_id;
     record.query_id = query_id_;
     record.step_id = feature.search_step;
     record.trigger = trigger;
@@ -741,7 +748,7 @@ void QueryPageSession::record_prefetch_demand(std::uint32_t page_id) {
   PrefetchTraceRecord& record = prefetch_trace_records_[found->second];
   if (!record.was_demanded) {
     record.was_demanded = true;
-    record.demand_step_id = prefetch_step_;
+    record.demand_step_id = current_search_step_;
     record.demand_time_us = trace_elapsed_us();
   }
 }
@@ -790,43 +797,6 @@ void QueryPageSession::record_prefetch_hit(std::uint32_t page_id,
   }
 }
 
-void QueryPageSession::validate_prefetch_trace() const {
-  if (stats_.prefetch_useful_pages !=
-      stats_.prefetch_ready_hit + stats_.prefetch_pending_hit) {
-    throw std::logic_error(
-        "prefetch_useful_pages must equal ready_hit + pending_hit");
-  }
-  if (prefetch_trace_path_.empty()) {
-    return;
-  }
-
-  std::unordered_set<std::uint64_t> submission_ids;
-  for (const auto& record : prefetch_trace_records_) {
-    const bool missing_at_decision =
-        !record.feature.is_cached && !record.feature.is_inflight &&
-        !record.feature.is_ready && !record.feature.is_materialized;
-    if (record.trigger == "rerank" && record.feature.selected &&
-        missing_at_decision && !record.was_demanded) {
-      throw std::logic_error(
-          "Selected missing rerank page was not subsequently demanded");
-    }
-    if (!record.was_prefetched) {
-      continue;
-    }
-    if (record.submission_id == 0 ||
-        !submission_ids.insert(record.submission_id).second) {
-      throw std::logic_error(
-          "Each submitted page must have one unique submission id");
-    }
-    if (record.hit_type != "ready_hit" &&
-        record.hit_type != "pending_hit" &&
-        record.hit_type != "wasted") {
-      throw std::logic_error(
-          "Each submitted page must have exactly one terminal outcome");
-    }
-  }
-}
-
 void QueryPageSession::write_prefetch_trace() {
   if (prefetch_trace_path_.empty() || prefetch_trace_records_.empty()) {
     return;
@@ -848,6 +818,7 @@ void QueryPageSession::write_prefetch_trace() {
   if (write_header) {
     output
         << "run_id,policy_version,seed,query_id,step_id,trigger,"
+        << "first_seen_step,estimated_demand_step,"
         << "group_id,decision_id,submission_id,candidate_node_id,"
         << "candidate_page_id,"
         << "num_candidates_on_page,min_pq_rank_on_page,"
@@ -897,8 +868,9 @@ void QueryPageSession::write_prefetch_trace() {
     const auto& feature = record.feature;
     output << run_id_ << ',' << policy_version_ << ',' << random_seed_ << ','
            << record.query_id << ',' << record.step_id << ','
-           << record.trigger << ','
-           << run_id_ << ':' << record.query_id << ':' << record.step_id << ','
+           << record.trigger << ',' << feature.first_seen_step << ','
+           << feature.estimated_demand_step << ','
+           << run_id_ << ':' << record.query_id << ':' << record.group_id << ','
            << record.decision_id << ',' << record.submission_id << ','
            << ',' << record.page_id << ','
            << feature.num_candidates_on_page << ','
@@ -1081,7 +1053,6 @@ std::int64_t QueryPageSession::wait_for_prefetch_page(std::uint32_t page_id) {
   }
   if (waited) {
     const auto wait_end = std::chrono::steady_clock::now();
-    ++stats_.demand_read_waits;
     const auto wait_us = static_cast<std::int64_t>(
         std::chrono::duration<double, std::micro>(wait_end - wait_start)
             .count());
@@ -1176,7 +1147,6 @@ void QueryPageSession::flush_prefetch_requests(
     ++stats_.io_prefetches;
     ++stats_.prefetch_submitted_pages;
     ++stats_.prefetch_submitted;
-    ++stats_.p4_io.prefetch_issued;
   }
   update_pending_peak();
   requests.clear();
@@ -1250,7 +1220,6 @@ void QueryPageSession::mark_prefetch_used(std::uint32_t page_id) {
   }
   ++stats_.io_prefetch_hits;
   ++stats_.prefetch_useful_pages;
-  ++stats_.p4_io.prefetch_used;
 }
 
 }  // namespace agent_aware

@@ -6,28 +6,6 @@
 
 namespace agent_aware {
 
-// StorageEngine 是 benchmark 使用的窄适配层，让精确内存搜索和 packed-graph 搜索暴露同一套读写接口。
-void StorageEngine::insert(std::uint32_t, const float*) {
-  throw std::runtime_error("StorageEngine insert is not implemented");
-}
-
-void StorageEngine::update(std::uint32_t, const float*) {
-  throw std::runtime_error("StorageEngine update is not implemented");
-}
-
-void StorageEngine::erase(std::uint32_t) {
-  throw std::runtime_error("StorageEngine erase is not implemented");
-}
-
-ExactMemoryEngine::ExactMemoryEngine(const VectorSet& base) : index_(base) {}
-
-EngineSearchResult ExactMemoryEngine::search_one(const float* query,
-                                                 std::size_t top_k) {
-  EngineSearchResult output;
-  output.topk = index_.search_one(query, top_k);
-  return output;
-}
-
 PackedGraphEngine::PackedGraphEngine(PackedGraphEngineConfig config)
     : config_(std::move(config)), index_(config_.index_path) {
   index_.configure_cache(config_.cache_policy, config_.cache_pages,

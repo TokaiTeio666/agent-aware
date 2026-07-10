@@ -2,11 +2,11 @@
 
 > 关联文档：主计划 `PROJECT_PLAN.md` §8.1 P9、I/O 尾延迟 `docs/roadmap/recall-to-io-tail-latency-plan.md`、预取排序 `docs/design/XGBOOST_PREFETCH_PLAN.md`
 >
-> 最后更新：2026-06-25
+> 最后更新：2026-07-11
 
 ## 当前背景
 
-截至 2026-06-25，项目已经具备 SIFT1M SSD packed Vamana 主路径、Graph-Aware 2Q cache、io_uring fallback、WAL/MemTable/SSTable 动态写入、immutable read view、XGBoost 学习型预取排序、early trigger 提前触发、mixed RW benchmark 和动态 Recall evidence。当前最需要补强的不是再铺很多新功能，而是把结果从”单点可展示”推进到”曲线可解释、环境可信、大 delta 不退化”。
+截至 2026-07-11，项目已经具备 SIFT1M SSD packed Vamana 主路径、Graph-Aware 2Q cache、io_uring fallback、WAL/MemTable/SSTable 动态写入、immutable read view、XGBoost 学习型预取排序、early trigger 提前触发、mixed RW benchmark 和动态 Recall evidence。`search_width=128/156/192` 首轮扫描已找到当前平衡点 `156`，下一步要把单轮结果推进到三轮稳定、预取可归因、环境可信和大 delta 不退化。
 
 本计划聚焦三件最需要补的事：
 
@@ -44,7 +44,7 @@
 
 | 阶段 | 固定项 | 扫描项 | 产物 |
 | --- | --- | --- | --- |
-| M1 search sweep | `beam_width=16`、`cache_ratio=0.20`、`io_mode=io_uring` | `search_width=128/192/256/350/512` | Recall/P95/I/O 拐点 |
+| M1 search sweep | `beam_width=16`、cache=15000 pages、`io_mode=io_uring` | 已测 `128/156/192`；补测 `144/168` | 收紧 `156` 附近的 Recall/P95/I/O 拐点 |
 | M2 beam sweep | M1 选出的 2 个 `search_width` | `beam_width=8/16/32` | beam 对 QPS 与尾延迟影响 |
 | M3 cache sweep | 最优 `search_width/beam_width`、`io_uring` | `cache_ratio=0.10/0.15/0.20` | 内存约束内的收益 |
 | M4 I/O sweep | 最优搜索与 cache | `io_mode=pread/odirect/io_uring` | 真实 I/O 策略对照 |
@@ -55,7 +55,7 @@
 `agent-aware` 支持 `--search-width`、`--beam-width`、`--memory-budget-ratio`、`--io-mode`、`--cache-policy` 和 `--output-json`。复用已有 packed index 时保持 `REBUILD_INDEX=0` 或不设置。
 
 ```bash
-for sw in 128 192 256 350 512; do
+for sw in 128 144 156 168 192; do
   TAG="matrix_sw${sw}_bw16_cache020_iouring"
   EXTRA_ARGS="--query-limit 1000 \
     --search-width ${sw} \
@@ -87,12 +87,12 @@ done
   --enable_compaction 1 \
   --compaction_background 1 \
   --topk 10 \
-  --search_width 256 \
+  --search_width 156 \
   --entry_count 64 \
   --beam_width 16 \
   --io_mode io_uring \
   --cache_policy graph-aware-2q \
-  --output build/matrix_mixed_sw256_bw16_iouring.json
+  --output build/matrix_mixed_sw156_bw16_iouring.json
 ```
 
 ### 必须汇总的字段

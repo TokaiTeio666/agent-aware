@@ -85,11 +85,6 @@ std::vector<SearchResult> BruteForceIndex::search_one(const float* query,
   return search_memory_fast(base_, query, k);
 }
 
-std::vector<std::vector<SearchResult>> BruteForceIndex::search_batch(
-    const VectorSet& queries, std::size_t k) const {
-  return search_memory_fast_batch(base_, queries, k);
-}
-
 std::vector<SearchResult> search_memory_fast(const VectorSet& base,
                                              const float* query,
                                              std::size_t k) {
@@ -137,20 +132,6 @@ std::vector<SearchResult> search_memory_fast(const VectorSet& base,
               return lhs.distance < rhs.distance;
             });
   return results;
-}
-
-std::vector<std::vector<SearchResult>> search_memory_fast_batch(
-    const VectorSet& base, const VectorSet& queries, std::size_t k) {
-  if (queries.dim != base.dim) {
-    throw std::runtime_error("Query dimension does not match base dimension");
-  }
-
-  std::vector<std::vector<SearchResult>> all_results;
-  all_results.reserve(queries.size());
-  for (std::size_t i = 0; i < queries.size(); ++i) {
-    all_results.push_back(search_memory_fast(base, queries.row(i), k));
-  }
-  return all_results;
 }
 
 }  // namespace agent_aware

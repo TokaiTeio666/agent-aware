@@ -188,7 +188,7 @@ SSD graph 搜索本身很慢
   --recall_sample_rate 0 \
   --enable_compaction 0 \
   --topk 10 \
-  --search_width 350 \
+  --search_width 156 \
   --beam_width 16 \
   --io_mode io_uring \
   --cache_policy graph-aware-2q \
@@ -263,7 +263,7 @@ build/sift1m_readonly_t8.json
   --recall_sample_rate 0 \
   --enable_compaction 0 \
   --topk 10 \
-  --search_width 350 \
+  --search_width 156 \
   --beam_width 16 \
   --io_mode io_uring \
   --cache_policy graph-aware-2q \
@@ -285,7 +285,7 @@ build/sift1m_readonly_t8.json
   --enable_compaction 1 \
   --compaction_background 1 \
   --topk 10 \
-  --search_width 350 \
+  --search_width 156 \
   --beam_width 16 \
   --io_mode io_uring \
   --cache_policy graph-aware-2q \
@@ -416,7 +416,7 @@ base/delta merge 正确
   --enable_compaction 1 \
   --compaction_background 1 \
   --topk 10 \
-  --search_width 350 \
+  --search_width 156 \
   --beam_width 16 \
   --io_mode io_uring \
   --cache_policy graph-aware-2q \
@@ -537,7 +537,7 @@ write_qps 是否下降
   --recall_sample_rate 0 \
   --enable_compaction 0 \
   --topk 10 \
-  --search_width 350 \
+  --search_width 156 \
   --beam_width 16 \
   --output build/sift1m_delta_10k_read.json
 ```
@@ -563,25 +563,25 @@ preload_delta_count = 100000
 
 ## 11. Phase 7：Base 搜索参数调优
 
-当前使用：
+2026-07-11 当前推荐口径：
 
 ```text
-search_width = 350
+search_width = 156
 beam_width = 16
 ```
 
-需要确认 SIFT1M 下它们是否过重。
+`128/156/192` 首轮扫描中，`156` 达到 Recall@10 `0.9748`、avg `48.10 ms`、P99 `66.29 ms`。仍需三轮复验，并补测 `144/168`。
 
 ### 参数矩阵
 
 | search_width | beam_width |
 |---:|---:|
-| 128 | 8 |
-| 256 | 8 |
-| 256 | 16 |
-| 350 | 16 |
-| 512 | 16 |
-| 512 | 32 |
+| 128 | 16 |
+| 144 | 16 |
+| 156 | 16 |
+| 168 | 16 |
+| 192 | 16 |
+| 156 | 8 / 32 |
 
 ### 观察指标
 
@@ -604,14 +604,14 @@ graph_reads_per_query 可解释
 cache_hit_rate 较高
 ```
 
-第一版建议从：
+后续 mixed-RW 和预取实验从：
 
 ```text
-search_width = 256
+search_width = 156
 beam_width = 16
 ```
 
-开始对比当前：
+历史高召回对照保留：
 
 ```text
 search_width = 350

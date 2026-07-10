@@ -67,7 +67,7 @@ struct Args {
   std::size_t rerank_topk = 100;
 
   std::size_t top_k = 10;
-  std::size_t search_width = 350;
+  std::size_t search_width = 156;
   std::size_t entry_count = 64;
   std::string entry_strategy = "single-medoid";
   std::size_t entry_hub_count = 15;
@@ -457,6 +457,12 @@ Args parse_args(int argc, char** argv) {
 
 void validate_and_finalize_args(Args& args) {
   (void)agent_aware::parse_entry_strategy(args.entry_strategy);
+  if (args.build_policy != "vamana") {
+    throw std::runtime_error("Unsupported --build-policy: only vamana is supported");
+  }
+  if (args.packing_strategy != "bfs") {
+    throw std::runtime_error("Unsupported --packing-strategy: only bfs is supported");
+  }
 
   args.effective_beam_width = std::clamp(
       args.beam_width_requested ? args.requested_beam_width
@@ -738,6 +744,10 @@ void add_stats(SearchAggregate& aggregate,
       stats.prefetch_skip_score_threshold;
   aggregate.stats.prefetch_skip_inflight_full +=
       stats.prefetch_skip_inflight_full;
+  aggregate.stats.prefetch_skip_too_late += stats.prefetch_skip_too_late;
+  aggregate.stats.effective_prefetch_max_inflight = std::max(
+      aggregate.stats.effective_prefetch_max_inflight,
+      stats.effective_prefetch_max_inflight);
   aggregate.stats.prefetch_evicted_before_use +=
       stats.prefetch_evicted_before_use;
   aggregate.stats.page_dedup_requests += stats.page_dedup_requests;
@@ -765,15 +775,6 @@ void add_stats(SearchAggregate& aggregate,
   aggregate.stats.pq_filter_reject_count += stats.pq_filter_reject_count;
   aggregate.stats.pq_filter_accept_count += stats.pq_filter_accept_count;
   aggregate.stats.search_mutex_wait_us += stats.search_mutex_wait_us;
-  aggregate.stats.p4_io.ssd_reads += stats.p4_io.ssd_reads;
-  aggregate.stats.p4_io.async_submits += stats.p4_io.async_submits;
-  aggregate.stats.p4_io.async_completions += stats.p4_io.async_completions;
-  aggregate.stats.p4_io.prefetch_issued += stats.p4_io.prefetch_issued;
-  aggregate.stats.p4_io.prefetch_used += stats.p4_io.prefetch_used;
-  aggregate.stats.p4_io.prefetch_dropped += stats.p4_io.prefetch_dropped;
-  aggregate.stats.p4_io.fallback_reads += stats.p4_io.fallback_reads;
-  aggregate.stats.p4_io.sync_reads += stats.p4_io.sync_reads;
-  aggregate.stats.p4_io.dedup_hits += stats.p4_io.dedup_hits;
 }
 
 void merge_aggregate(SearchAggregate& aggregate,
@@ -899,8 +900,6 @@ void build_index_if_needed(const Args& args, const agent_aware::VectorSet& base,
   agent_aware::DiskGraphBuildConfig config;
   config.degree = args.graph_degree;
   config.page_size = args.page_size;
-  config.build_policy = args.build_policy;
-  config.packing_strategy = args.packing_strategy;
   config.random_seed = args.seed;
   config.pq_model = pq_model;
   agent_aware::PackedDiskGraphBuilder::build(base, args.index_path.string(),
@@ -1163,6 +1162,8 @@ std::string json_for_run(const Args& args,
     json << "null";
   }
   json << ",\n";
+  json << "  \"effective_prefetch_max_inflight\": "
+       << aggregate.stats.effective_prefetch_max_inflight << ",\n";
   json << "  \"prefetch_enabled\": " << runtime_prefetch_enabled << ",\n";
   json << "  \"prefetch_policy\": \"" << json_escape(args.enable_prefetch
                                                          ? args.prefetch_policy
@@ -1439,6 +1440,8 @@ std::string json_for_run(const Args& args,
        << aggregate.stats.prefetch_skip_score_threshold << ",\n";
   json << "    \"prefetch_skip_inflight_full\": "
        << aggregate.stats.prefetch_skip_inflight_full << ",\n";
+  json << "    \"prefetch_skip_too_late\": "
+       << aggregate.stats.prefetch_skip_too_late << ",\n";
   json << "    \"prefetch_evicted_before_use\": "
        << aggregate.stats.prefetch_evicted_before_use << ",\n";
   json << "    \"prefetch_unused\": "

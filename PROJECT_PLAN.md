@@ -4,23 +4,23 @@
 > 英文说明：I/O Optimization of Vector Retrieval Systems for Agent Memory  
 > 适用赛题：2026 年全国大学生计算机系统能力大赛操作系统设计赛 OS 功能挑战赛道  
 > 编写日期：2026-05-21  
-> 最后更新：2026-06-29
+> 最后更新：2026-07-11
 
-## 当前实现状态（2026-06-29）
+## 当前实现状态（2026-07-11）
 
 项目已从最初计划推进到 SIFT1M 全链路可展示版本：SSD packed Vamana 主路径、PQ/ADC、Graph-Aware cache 统计、io_uring/pread fallback、XGBoost 学习型预取排序、early trigger 提前触发、LSM 动态写入、manifest/compaction/recovery、真实并发 mixed RW benchmark 和动态 Recall 抽样均已形成闭环。
 
 | 能力 | 当前状态 | 说明 |
 | --- | --- | --- |
-| SSD 主路径 | 已完成 SIFT1M 验证 | Recall@10 `0.9940`，resident ratio `0.199992` |
+| SSD 主路径 | 已完成 SIFT1M 平衡点单轮验证 | `search_width=156`：Recall@10 `0.9748`、avg `48.10 ms`、P99 `66.29 ms`、QPS `20.79`、reads/query `109.82` |
 | 高并发纯读 | 已完成 baseline | 8 reader 下 `56.55 read_qps`，P95 `178 ms` |
 | 混合读写 | 已完成最小闭环 | 4 reader + 1 writer 下 `23.50~28.86 read_qps`，`217~221 write_qps` |
 | 动态写入一致性 | 已完成基础版 | WAL/MemTable/SSTable/manifest/compaction/recovery 均有测试覆盖 |
 | 读侧锁优化 | 已完成 | `DynamicWriteManager` 使用 immutable read view 发布，`latest_record_lookup` P95 从秒级降至约 0.07ms |
 | XGBoost 预取排序 | 已完成闭环 | PQ+ADC 候选聚合、page-level 特征构造、XGBoost text-dump 推理、top-K/threshold/inflight 限流、trace 采集、离线 replay、在线 A/B（详见 `docs/design/09-XGBOOST_PREFETCH_PLAN.md`） |
-| Early trigger 提前触发 | 已完成 P0（pre-beam） | `--prefetch-early-trigger pre-beam` 在 beam selection 前触发预取，ready_hit_rate 提升、pending_hit_rate 下降（详见 `docs/design/07-prefetch-early-trigger-plan.md`） |
-| I/O 尾延迟量化 | 待推进 | reads/query、bytes/query、候选放大等指标补全和分阶段优化（详见 `docs/roadmap in future/recall-to-io-tail-latency-plan.md`） |
-| 后续重点 | 待推进 | 异步 flush queue、Delta memory graph、周期性 rebuild packed graph、系统参数矩阵、真实 NVMe 复测（详见 `docs/roadmap in future/defense-gap-closure-plan.md`） |
+| Early trigger 提前触发 | 阶段 2 实现完成，正式验收待运行 | Post-Expand 主预测，entry/pre-beam/rerank 补漏，共享去重与动态 inflight 限流（详见 `docs/design/07-prefetch-early-trigger-plan.md`） |
+| I/O 尾延迟量化 | 部分完成 | `128/156/192` 首轮扫描已完成，`156` 为当前平衡点；仍需三轮复验、bytes/query 和真实 NVMe 数据 |
+| 后续重点 | 待推进 | `156` 三轮复验与预取 A/B、异步 flush queue、Delta memory graph、周期性 rebuild packed graph、完整参数矩阵、真实 NVMe 复测（详见 `docs/roadmap in future/defense-gap-closure-plan.md`） |
 
 ## 1. 项目概述
 
@@ -60,9 +60,9 @@ Agent-aware 面向大模型 Agent 的长期记忆场景，设计一套在内存�
 | 指标 | 目标值 | 说明 |
 | --- | --- | --- |
 | 内存占用 | 数据集大小的 10%-20% | 赛题核心约束，默认以不超过 20% 为验收标准 |
-| Recall@10 | 不低于 85% | 当前路线目标为 SIFT 数据集上稳定达到 98% 以上 |
-| 查询吞吐 | SSD 模式下尽可能提升 QPS | 重点比较 O_DIRECT、BufferPool、io_uring、PQ 过滤的增益 |
-| 查询延迟 | 输出 avg、P95、P99、P99.9 | 用尾延迟评估读写混合负载稳定性 |
+| Recall@10 | 不低于 85% | 当前主展示护栏为 `>=0.95`；`search_width=156` 单轮达到 `0.9748` |
+| 查询吞吐 | SSD 单线程平衡点 QPS `>=20` | 当前 `search_width=156` 单轮为 `20.79`，后续以三轮中位数验收 |
+| 查询延迟 | 平衡点 avg `<60 ms`、P99 `<75 ms` | 当前单轮 avg `48.10 ms`、P99 `66.29 ms`；仍需真实 NVMe 复测 |
 | 缓存命中率 | Graph-Aware 2Q 显著优于 LRU | 以 hub 节点保护和 I/O 次数下降作为证据 |
 | 写入开销 | 随机写转顺序追加写 | 用 WAL、SSTable、Compaction 统计写放大和后台延迟 |
 
@@ -144,7 +144,7 @@ agent-aware/
 ├── CMakeLists.txt                         # 顶层构建入口，生成库和 benchmark 可执行文件
 ├── README.md                              # 项目入口、构建运行、实验结果和参数说明
 ├── PROJECT_PLAN.md                        # 总体计划、技术路线和验收标准
-├── include/                               # 对外头文件
+├── include/agent_aware/                   # 对外头文件
 │   ├── agent_aware.h                      # 聚合入口头
 │   ├── core/                              # 基础类型、距离计算、PQ、预取和异步 page reader
 │   │   ├── types.h
@@ -155,22 +155,20 @@ agent-aware/
 │   │   └── prefetch_planner.h
 │   ├── data/                              # SIFT/fvecs/ivecs 读取与 synthetic 数据生成
 │   ├── graph/                             # Vamana 构图、packed page 编码、SSD graph index
-│   ├── storage/                           # 4KB disk record、disk index reader/writer、LSM 基础组件
 │   ├── dynamic/                           # WAL、MemTable、SSTable、Manifest、Compaction
 │   └── engine/                            # StorageEngine / PackedGraphEngine 对外接口
 ├── src/                                   # C++ 实现
 │   ├── core/                              # PQ ADC、SIMD/L2、io_uring/pread/O_DIRECT 读路径
 │   ├── data/                              # 数据集加载实现
 │   ├── graph/                             # 图构建、entry selection、packed graph search
-│   ├── storage/                           # 磁盘 record 与索引读写实现
 │   ├── dynamic/                           # 动态写入、flush、recovery、compaction
 │   ├── engine/                            # base graph + delta merge 查询引擎
 │   ├── sift_search_benchmark.cpp          # 构建为 agent-aware，输出 SSD 检索 JSON
 │   └── mixed_rw_benchmark.cpp             # 构建为 bench_mixed_rw，输出混合读写 CSV/JSON
 ├── scripts/
-│   ├── run_sift1m_once.sh                 # SIFT1M 一键构建/运行/归档
-│   ├── run_agent_aware_sift.py            # 参数矩阵实验运行器
-│   └── plot_sift_matrix.py                # 参数矩阵结果汇总与图表生成
+│   ├── agent_aware.py                     # once/ab/tune 与工具统一入口
+│   ├── prefetch_trace.py                  # trace 分析与校验
+│   └── train_prefetch_ranker.py           # XGBoost 训练
 └── docs/
     ├── design/                            # 01-09 编号设计文档，覆盖 SSD、缓存、预取、动态写入
     ├── problem/                           # 赛题要求、问题背景和约束说明
@@ -323,7 +321,7 @@ PQ+ADC 候选生成 → page-level 候选聚合 → 构造排序特征 → XGBoo
 
 针对预取提交太晚导致 `pending_hit` 偏高的问题，引入 pre-beam frontier window 提前触发点。在 beam selection 前从 candidate heap 取 top window 候选进行 XGBoost 打分和预取提交，使高置信 page 在 demand 前至少提前一个搜索批次被提交。
 
-支持 `--prefetch-early-trigger off|pre-beam|all`，默认 `pre-beam`。entry warmup、post-expand 和 rerank lookahead 保留为后续触发点扩展方向。
+支持 `--prefetch-early-trigger off|entry-warmup|pre-beam|rerank|all`，默认 `all`。Post-Expand 合并新邻居与投影 frontier，entry warmup、pre-beam 和两页分块 rerank 只承担补漏；所有 trigger 共享 query 去重和 `min(8, io_depth/4)` inflight 硬限制。
 
 详见专项计划：`docs/design/07-prefetch-early-trigger-plan.md`
 
@@ -396,7 +394,7 @@ PQ+ADC 候选生成 → page-level 候选聚合 → 构造排序特征 → XGBoo
 | k | 10 | 1-100 | Top-K 返回规模 |
 | max_degree | 16 | 16-64 | 图质量、内存占用、搜索分支 |
 | ef_construction | 200 | 100-500 | 构图质量与构建时间 |
-| ef_search | 350 | 100-800 | Recall、延迟和 I/O 次数 |
+| ef_search / search_width | 350（代码默认） | 当前推荐 156；继续扫描 128-192 | Recall、延迟、rerank reads 和 I/O 次数 |
 | pq_m | 8 | 8-16 | PQ 压缩率和近似精度 |
 | pq_k | 256 | 128-256 | codebook 精度和训练成本 |
 | beam_width | 8 | 8-32 | 批量读取深度和 I/O 并行度 |
@@ -461,7 +459,7 @@ make -j$(nproc)
 
 # SIFT1M 主路径脚本入口
 cd ..
-bash scripts/linux/run_sift1m_once.sh
+python3 scripts/agent_aware.py once
 ```
 
 ### 10.5 最终验收标准
@@ -469,11 +467,11 @@ bash scripts/linux/run_sift1m_once.sh
 | 类别 | 标准 |
 | --- | --- |
 | 合规性 | SSD 主路径内存占用不超过数据集大小 20% |
-| 准确性 | Recall@10 不低于 85%，目标达到 98% 以上 |
+| 准确性 | Recall@10 不低于 85%，主展示配置目标不低于 95% |
 | I/O 优化 | 能证明 O_DIRECT、BufferPool、PQ 过滤、io_uring 各自产生收益 |
 | 动态写入 | 支持并发插入/更新，写入后可被查询路径访问 |
 | 稳定性 | 混合读写下无崩溃，P99/P99.9 有统计且无严重抖动 |
-| 可复现 | README 和脚本可复现实验结果 |
+| 可复现 | README 和实验记录可复现结果；最终候选至少三轮并报告中位数 |
 | 文档 | 架构、实现、测试、实验报告齐全 |
 
 ## 11. 风险与应对
@@ -530,9 +528,9 @@ bash scripts/linux/run_sift1m_once.sh
 
 ## 15. 结论
 
-Agent-aware 的计划重点是围绕赛题的真实约束构建系统，而不是绕开内存限制追求纯内存性能。通过“PQ 压缩导航 + SSD 全精度向量 + 用户态图感知缓存 + io_uring 异步预取 + LSM 顺序写入”的组合，系统能够在 10%-20% 内存预算下保持高召回率，并对高并发读写混合负载提供可解释、可复现、可调优的 I/O 优化能力。
+Agent-aware 的计划重点是围绕赛题的真实约束构建系统，而不是绕开内存限制追求纯内存性能。当前 `search_width=156` 在 WSL2 单轮实验中形成 Recall@10 `0.9748`、avg `48.10 ms`、P99 `66.29 ms` 的平衡点，为后续预取和混合读写实验提供统一 baseline。内存侧当前输出的是 PQ、目录和 cache 的 estimated resident ratio；正式验收还需补进程 RSS 与完整对象生命周期口径。
 
-后续工作应集中在三点：一是扩大 SIFT1M 与真实 NVMe 环境测试，二是完善 Compaction 与图连通性的一致性验证，三是将实验结果整理为图表化报告和答辩演示材料。
+后续工作应集中在三点：一是对 `search_width=156` 完成三轮复验、预取配对 A/B 和真实 NVMe 测试，二是完善 Compaction 与图连通性的一致性验证，三是将实验结果整理为图表化报告和答辩演示材料。
 
 ## 16. 文档指引与专项计划索引
 
@@ -558,7 +556,7 @@ Agent-aware 的计划重点是围绕赛题的真实约束构建系统，而不�
 | `docs/design/04-beam-width-io-uring.md` | beam_width 语义、beam batch 收集、io_uring 批量读取、page 去重 | 已落地 |
 | `docs/design/05-dynamic-write.md` | LSM 写入路径：WAL/MemTable/SSTable/manifest/compaction/recovery | 已落地 |
 | `docs/design/06-fresh-streaming-ann.md` | Streaming ANN 创新路线：LSM delta + immutable read view、Delta memory graph、周期性 rebuild | 部分已完成 |
-| `docs/design/07-prefetch-early-trigger-plan.md` | 预取提前触发点：pre-beam、post-expand、entry warmup、rerank lookahead、trace 字段、限流规则 | P0（pre-beam）已落地 |
+| `docs/design/07-prefetch-early-trigger-plan.md` | 预取提前触发点：Post-Expand 主线、pre-beam、entry warmup、rerank 流水线、trace 字段、限流规则 | 阶段 2 实现已落地，正式验收待运行 |
 | `docs/design/08-prefetch_timing.md` | 预取启用条件、当前节点邻居预取、batch 滚动窗口预取、CPU/I/O 重叠时机 | 已归档 |
 | `docs/design/09-XGBOOST_PREFETCH_PLAN.md` | 学习型预取排序：PQ+ADC 候选聚合、page-level 特征、XGBoost ranking、trace 采集、离线 replay、在线 A/B、评价体系 | 已落地闭环 |
 

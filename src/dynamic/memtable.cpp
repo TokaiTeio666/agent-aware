@@ -35,21 +35,6 @@ bool MemTable::insert(const DynamicRecord& record) {
   return true;
 }
 
-bool MemTable::get(NodeId node_id, DynamicRecord& out) const {
-  std::shared_lock<std::shared_mutex> lock(mutex_);
-  const auto found = records_.find(node_id);
-  if (found == records_.end()) {
-    return false;
-  }
-  out = found->second;
-  return true;
-}
-
-bool MemTable::contains(NodeId node_id) const {
-  std::shared_lock<std::shared_mutex> lock(mutex_);
-  return records_.find(node_id) != records_.end();
-}
-
 std::vector<DynamicRecord> MemTable::snapshot() const {
   std::shared_lock<std::shared_mutex> lock(mutex_);
   std::vector<DynamicRecord> records;
@@ -64,16 +49,6 @@ void MemTable::clear() {
   std::unique_lock<std::shared_mutex> lock(mutex_);
   records_.clear();
   current_bytes_ = 0;
-}
-
-std::size_t MemTable::size() const {
-  std::shared_lock<std::shared_mutex> lock(mutex_);
-  return records_.size();
-}
-
-std::size_t MemTable::bytes() const {
-  std::shared_lock<std::shared_mutex> lock(mutex_);
-  return current_bytes_;
 }
 
 bool MemTable::should_flush() const {

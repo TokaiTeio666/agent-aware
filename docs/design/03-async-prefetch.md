@@ -14,6 +14,8 @@
 
 说明：在搜索扩展集合不变时，预取只能把未来 demand read 提前提交；`submitted_reads` 的理论下界等于无预取时的读页集合。要让 `submitted_reads/query` 低于 no-prefetch 基线，需要进一步改变搜索层的候选扩展页集合，例如页感知 beam/coalesced expansion，而不是只调整预取候选。
 
+2026-07-11 更新：SIFT1M 无预取扫描已在 `128/156/192` 三个点完成首轮验证。当前推荐以 `search_width=156`、`beam_width=16`、cache=15000 pages、io_uring 作为预取 A/B baseline；该点 Recall@10 `0.9748`、avg `48.10 ms`、P99 `66.29 ms`、QPS `20.79`、reads/query `109.82`。预取实验不得再用 `search_width=350` 的历史结果与该点跨参数比较，详细记录见 `docs/experiments/search-width-tuning.md`。
+
 ## 设计背景
 
 本设计用于在现有 SSD 图搜索主路径上接入 `io_uring`，实现批量异步 I/O 提交，并结合图拓扑访问规律进行预取，降低随机读等待时间，提高查询吞吐量与尾延迟表现。
@@ -183,7 +185,7 @@ io_uring 接入与 batch submit 阶段：
 
 | 参数 | 建议取值 |
 | --- | --- |
-| `search_width` | 64 / 128 / 256 / 512 |
+| `search_width` | baseline 固定 `156`；补扫 `128 / 144 / 156 / 168 / 192` |
 | `io_depth` | 32 / 64 / 128 |
 | `io_batch_size` | 8 / 16 / 32 |
 | `prefetch_width` | 8 / 16 / 32 |
@@ -194,9 +196,9 @@ io_uring 接入与 batch submit 阶段：
 
 | 版本 | search_width | io_depth | batch_size | prefetch_width | Recall@10 | QPS | Avg Latency | P95 | P99 | SSD Reads / Query | Prefetch Hit Rate |
 | --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
-| sync-baseline | 128 | - | - | - |  |  |  |  |  |  | - |
-| uring-batch | 128 | 64 | 16 | 0 |  |  |  |  |  |  | - |
-| uring-prefetch | 128 | 64 | 16 | 16 |  |  |  |  |  |  |  |
+| sync-baseline | 156 | - | - | - |  |  |  |  |  |  | - |
+| uring-batch | 156 | 32 | 16 | 0 | `0.9748` | `20.79` | `48.10` | `62.39` | `66.29` | `109.82` | - |
+| uring-prefetch | 156 | 32 | 16 | 待调 |  |  |  |  |  |  |  |
 
 ## 七、风险与应对
 

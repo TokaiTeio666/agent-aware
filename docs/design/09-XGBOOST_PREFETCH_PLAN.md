@@ -9,17 +9,18 @@
 | PQ+ADC page-level ranking | 已完成 | `PrefetchPlanner` 候选聚合、特征构造、打分、限流 |
 | 预取统计 | 已完成 | `prefetch_ready_hit`、`prefetch_pending_hit`、`prefetch_unused`、`prefetch_evicted_before_use` |
 | group-wise trace | 已完成 | `--prefetch-trace <path>` 输出 CSV 并补齐 label |
-| 离线训练与 replay | 已完成可运行版 | `scripts/train_prefetch_ranker.py`、`scripts/replay_prefetch_policy.py` |
+| 离线训练与 replay | 已完成可运行版 | `scripts/agent_aware.py train`、`scripts/agent_aware.py replay` |
 | C++ 在线接入 | 已完成 | XGBoost text-dump 推理器和策略校验 |
 | Early trigger | 已完成 P0 | `--prefetch-early-trigger pre-beam`，详见 `docs/design/07-prefetch-early-trigger-plan.md` |
 | 在线 A/B | 进行中 | 继续验证 ready hit、tail latency 和 submitted reads |
 
 补充说明：
 
-1. `scripts/train_prefetch_ranker.py` 已支持真实 `xgboost` 包训练；缺少包时会导出兼容 text-dump 格式的 boosted-stump 模型，保证闭环 smoke 可运行。
-2. `scripts/replay_prefetch_policy.py` 已按 XGBoost 模型和 oracle 上界 replay，输出 ready/pending/unused 体系指标。
+1. `scripts/agent_aware.py train` 使用真实 `xgboost` 包训练，并输出兼容 C++ 推理器的 text-dump 模型。
+2. `scripts/agent_aware.py replay` 按 XGBoost 模型和 oracle 上界 replay，输出 ready/pending/unused 体系指标。
 3. `scripts/run_prefetch_closed_loop_smoke.sh` 已提供 PQ+ADC trace -> replay/train -> xgboost online 的闭环 smoke。
 4. `candidate_node_id` 在当前 trace 中保持空列，训练第一版以 page-level 特征为主。
+5. 2026-07-11 起，在线 A/B 统一固定 `search_width=156`、`beam_width=16`、cache=15000 pages、io_uring，并以关闭预取的 SIFT1M 结果作为 baseline；不得与 `search_width=350` 的历史单点结果跨参数归因。
 
 ## 设计背景
 
@@ -72,8 +73,8 @@ include/core/query_page_session.h
 src/core/query_page_session.cpp
 src/graph/disk_graph_index.cpp
 src/sift_search_benchmark.cpp
-scripts/train_prefetch_ranker.py
-scripts/replay_prefetch_policy.py
+scripts/agent_aware.py train
+scripts/agent_aware.py replay
 scripts/run_prefetch_closed_loop_smoke.sh
 ```
 

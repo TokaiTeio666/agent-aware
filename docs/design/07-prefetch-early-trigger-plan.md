@@ -2,15 +2,20 @@
 
 ## 当前实现状态（2026-06-25）
 
-该文档作为 XGBoost 预取提前触发点的设计归档。当前 P0 已落地 pre-beam 触发：在 beam selection 前对 frontier top window 做 XGBoost page-level 预取决策，trace 中记录 `trigger=pre_beam`，并通过 `--prefetch-early-trigger` 保留 `off/pre-beam/all` 对照入口。
+该文档作为 XGBoost 预取提前触发点的设计归档。阶段 2 已落地：Post-Expand 作为主预测入口，entry warmup、pre-beam 和两页分块 rerank 作为补漏，共享 page-level XGBoost、query 去重和动态 inflight 限流。
 
 | 项目 | 状态 | 当前对应实现 |
 | --- | --- | --- |
 | T1 pre-beam 触发 | 已完成 | `src/graph/disk_graph_index.cpp` 中 beam selection 前触发 |
 | 统一提交入口 | 已完成可运行版 | `QueryPageSession::submit_jit_prefetch(candidate_pages, "pre_beam")` |
-| CLI 入口 | 已完成 | `--prefetch-early-trigger off/pre-beam/all` |
-| trace trigger 字段 | 已完成 | 预取 trace 中记录 `trigger=pre_beam` |
-| T0/T2/T3 | 未完成 | 作为后续 warmup、post-expand、rerank lookahead 扩展 |
+| CLI 入口 | 已完成 | `--prefetch-early-trigger off/entry-warmup/pre-beam/rerank/all`，默认 `all` |
+| trace trigger 字段 | 已完成 | trace 区分 `warmup_entry/pre_beam/post_expand/rerank` |
+| T0 entry warmup | 已完成 | ADC table 建好后运行一次，最多提交 2 页 |
+| T2 Post-Expand | 已完成 | 合并新邻居与投影 frontier，默认候选池 `beam*4`、每轮 top-4 |
+| T3 rerank | 已完成 | 唯一页按 2 页分块，下一块 I/O 与当前块精排计算重叠 |
+| 三臂验收闭环 | 工具已完成，正式实验待运行 | no-prefetch / stage1-prebeam / stage2-composite，双基线门槛 |
+
+2026-07-10 的 200-query 调优 smoke 使用 top-K=4：overall waste-rate `19.12%`、useful-rate `80.88%`、pending/useful `57.25%`，trace 校验通过。该结果锁定 top-K=4 并提示继续优化提交时机，不能扩大 width；它不替代 5-seed、hot/cold、双基线正式验收。
 
 ## 设计背景
 
@@ -59,9 +64,9 @@ PQ+ADC 候选生成
 
 ```text
 src/graph/disk_graph_index.cpp
-include/core/query_page_session.h
+include/agent_aware/core/query_page_session.h
 src/core/query_page_session.cpp
-include/core/prefetch_planner.h
+include/agent_aware/core/prefetch_planner.h
 src/core/prefetch_planner.cpp
 src/sift_search_benchmark.cpp
 ```
@@ -326,7 +331,7 @@ top_k=2/max_inflight=2 会重新拉高 pending 和尾延迟
 | 文件 | 内容 |
 | --- | --- |
 | `src/graph/disk_graph_index.cpp` | `pre_beam_prefetch_enabled()`、pre-beam 触发逻辑、`submit_jit_prefetch` 调用 |
-| `include/core/query_page_session.h` | `submit_jit_prefetch(candidate_pages, "pre_beam")` 接口 |
+| `include/agent_aware/core/query_page_session.h` | `submit_jit_prefetch(candidate_pages, "pre_beam")` 接口 |
 | `src/sift_search_benchmark.cpp` | `--prefetch-early-trigger` CLI 参数解析、校验、JSON 输出 |
 
 P1：加入 T2 post-expand lookahead。
