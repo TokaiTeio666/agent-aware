@@ -3,6 +3,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <memory>
+#include <mutex>
 #include <string>
 #include <vector>
 
@@ -66,6 +67,9 @@ class PackedGraphEngine final : public StorageEngine {
   void insert(std::uint32_t id, const float* vector) override;
   void update(std::uint32_t id, const float* vector) override;
   void erase(std::uint32_t id) override;
+  void configure_runtime(std::size_t cache_pages, std::size_t io_depth,
+                         bool prefetch_enabled,
+                         std::size_t prefetch_top_k);
 
   const DiskGraphMetadata& metadata() const {
     return index_.metadata();
@@ -74,10 +78,18 @@ class PackedGraphEngine final : public StorageEngine {
   const DiskGraphIoStatus& io_status() const {
     return index_.io_status();
   }
+  std::size_t cache_capacity_pages() const {
+    return index_.cache_capacity_pages();
+  }
+  std::size_t cache_resident_pages() const {
+    return index_.cache_resident_pages();
+  }
+  const PqAdcModel& pq_model() const { return index_.pq_model(); }
 
  private:
   PackedGraphEngineConfig config_;
   PackedDiskGraphIndex index_;
+  mutable std::mutex config_mutex_;
 };
 
 }  // namespace agent_aware

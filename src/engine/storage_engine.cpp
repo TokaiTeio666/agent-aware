@@ -20,7 +20,11 @@ PackedGraphEngine::PackedGraphEngine(PackedGraphEngineConfig config)
 
 EngineSearchResult PackedGraphEngine::search_one(const float* query,
                                                  std::size_t top_k) {
-  DiskGraphSearchConfig search = config_.search;
+  DiskGraphSearchConfig search;
+  {
+    std::lock_guard<std::mutex> lock(config_mutex_);
+    search = config_.search;
+  }
   search.top_k = top_k;
 
   EngineSearchResult output;
@@ -107,6 +111,22 @@ void PackedGraphEngine::erase(std::uint32_t id) {
   if (!config_.dynamic_manager->erase(id)) {
     throw std::runtime_error("PackedGraphEngine erase failed");
   }
+}
+
+void PackedGraphEngine::configure_runtime(std::size_t cache_pages,
+                                          std::size_t io_depth,
+                                          bool prefetch_enabled,
+                                          std::size_t prefetch_top_k) {
+  std::lock_guard<std::mutex> lock(config_mutex_);
+  config_.cache_pages = cache_pages;
+  config_.io_depth = io_depth;
+  config_.search.prefetch_policy = prefetch_enabled ? "topology" : "none";
+  config_.search.prefetch_top_k = prefetch_enabled ? prefetch_top_k : 0;
+  config_.search.prefetch_max_inflight = prefetch_enabled ? io_depth : 0;
+  index_.configure_cache(config_.cache_policy, cache_pages,
+                         config_.protect_hot_pages,
+                         config_.hot_degree_threshold);
+  index_.configure_io(config_.io_mode, config_.io_batch_size, io_depth);
 }
 
 }  // namespace agent_aware

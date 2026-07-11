@@ -2,6 +2,7 @@
 
 #include <algorithm>
 #include <cstring>
+#include <fstream>
 #include <limits>
 #include <random>
 #include <stdexcept>
@@ -262,6 +263,18 @@ PQEncoder PQEncoder::read(std::istream& input) {
   }
   model.validate_trained();
   return model;
+}
+
+void PQEncoder::write_file(const std::string& path) const {
+  std::ofstream output(path, std::ios::binary | std::ios::trunc);
+  if (!output) throw std::runtime_error("Cannot create PQ model: " + path);
+  write(output);
+}
+
+PQEncoder PQEncoder::read_file(const std::string& path) {
+  std::ifstream input(path, std::ios::binary);
+  if (!input) throw std::runtime_error("Cannot open PQ model: " + path);
+  return read(input);
 }
 
 std::size_t PQEncoder::nearest_centroid(const float* vector,

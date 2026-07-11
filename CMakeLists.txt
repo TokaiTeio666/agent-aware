@@ -4,6 +4,9 @@ project(agent_aware VERSION 0.1.0 LANGUAGES CXX)
 
 option(ENABLE_DIRECT_IO "Enable Linux O_DIRECT support" ON)
 option(AGENT_AWARE_REQUIRE_LIBURING "Fail configure when liburing is unavailable" OFF)
+option(AGENT_AWARE_BUILD_NAPI "Build the agentAwareNative Node-API module" OFF)
+set(AGENT_AWARE_NAPI_INCLUDE_DIR "" CACHE PATH "Directory containing node_api.h")
+set(AGENT_AWARE_NAPI_LIBRARY "" CACHE FILEPATH "Optional HarmonyOS N-API library")
 
 set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
@@ -49,9 +52,13 @@ set(AGENT_AWARE_LIBRARY_SOURCES
   src/graph/disk_graph_index.cpp
   src/graph/disk_page_codec.cpp
   src/graph/vamana_builder.cpp
+  src/harmony/harmony_engine_facade.cpp
+  src/harmony/operation_scheduler.cpp
+  src/platform/page_io_backend.cpp
 )
 
 add_library(agent_aware STATIC ${AGENT_AWARE_LIBRARY_SOURCES})
+set_target_properties(agent_aware PROPERTIES POSITION_INDEPENDENT_CODE ON)
 add_library(agent_aware::agent_aware ALIAS agent_aware)
 
 target_include_directories(agent_aware
@@ -84,6 +91,20 @@ target_link_libraries(agent-aware-build PRIVATE agent_aware::agent_aware)
 add_executable(bench_mixed_rw src/mixed_rw_benchmark.cpp)
 target_link_libraries(bench_mixed_rw PRIVATE agent_aware::agent_aware)
 
+if(AGENT_AWARE_BUILD_NAPI)
+  if(NOT AGENT_AWARE_NAPI_INCLUDE_DIR)
+    message(FATAL_ERROR "AGENT_AWARE_BUILD_NAPI requires AGENT_AWARE_NAPI_INCLUDE_DIR")
+  endif()
+  add_library(agentAwareNative SHARED src/harmony/napi_module.cpp)
+  target_include_directories(agentAwareNative PRIVATE "${AGENT_AWARE_NAPI_INCLUDE_DIR}")
+  target_link_libraries(agentAwareNative PRIVATE agent_aware::agent_aware)
+  if(AGENT_AWARE_NAPI_LIBRARY)
+    target_link_libraries(agentAwareNative PRIVATE "${AGENT_AWARE_NAPI_LIBRARY}")
+  endif()
+  target_compile_definitions(agentAwareNative PRIVATE NAPI_VERSION=8)
+  set_target_properties(agentAwareNative PROPERTIES OUTPUT_NAME agentAwareNative)
+endif()
+
 include(CTest)
 if(BUILD_TESTING)
   find_package(Python3 REQUIRED COMPONENTS Interpreter)
@@ -107,6 +128,15 @@ if(BUILD_TESTING)
                         PRIVATE agent_aware::agent_aware)
   add_test(NAME prefetch_adaptive_controller
            COMMAND prefetch_adaptive_controller_test)
+  add_executable(harmony_facade_test tests/harmony_facade.cpp)
+  target_link_libraries(harmony_facade_test PRIVATE agent_aware::agent_aware)
+  add_test(NAME harmony_facade COMMAND harmony_facade_test)
+  add_executable(page_io_backend_test tests/page_io_backend.cpp)
+  target_link_libraries(page_io_backend_test PRIVATE agent_aware::agent_aware)
+  add_test(NAME page_io_backend COMMAND page_io_backend_test)
+  add_executable(operation_scheduler_test tests/operation_scheduler.cpp)
+  target_link_libraries(operation_scheduler_test PRIVATE agent_aware::agent_aware)
+  add_test(NAME operation_scheduler COMMAND operation_scheduler_test)
   add_test(
     NAME contract_smoke
     COMMAND "${Python3_EXECUTABLE}"

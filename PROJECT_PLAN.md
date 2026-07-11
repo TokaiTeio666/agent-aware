@@ -1,11 +1,5 @@
 # Agent-aware 项目计划书
 
-> 项目说明：面向 Agent 记忆的向量检索系统 I/O 优化  
-> 英文说明：I/O Optimization of Vector Retrieval Systems for Agent Memory  
-> 适用赛题：2026 年全国大学生计算机系统能力大赛操作系统设计赛 OS 功能挑战赛道  
-> 编写日期：2026-05-21  
-> 最后更新：2026-07-11
-
 ## 当前实现状态（2026-07-11）
 
 

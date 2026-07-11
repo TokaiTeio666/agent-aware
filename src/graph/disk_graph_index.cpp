@@ -329,6 +329,16 @@ const DiskGraphIoStatus& PackedDiskGraphIndex::io_status() const {
   return page_reader_->status();
 }
 
+std::size_t PackedDiskGraphIndex::cache_capacity_pages() const {
+  std::lock_guard<std::mutex> lock(cache_mutex_);
+  return cache_capacity_pages_;
+}
+
+std::size_t PackedDiskGraphIndex::cache_resident_pages() const {
+  std::lock_guard<std::mutex> lock(cache_mutex_);
+  return page_cache_.size();
+}
+
 const std::vector<std::uint32_t>& PackedDiskGraphIndex::node_in_degrees() {
   ensure_node_in_degrees();
   return node_in_degrees_;

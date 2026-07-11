@@ -21,6 +21,7 @@ struct Args {
   std::size_t synthetic_clusters = 16;
   std::uint32_t seed = 42;
   fs::path index_path = "indexes/sift.idx";
+  fs::path pq_path;
   fs::path manifest_path;
   bool rebuild = false;
   std::size_t graph_degree = 32;
@@ -55,6 +56,7 @@ Args parse(int argc, char** argv) {
     else if (n == "--synthetic-clusters") a.synthetic_clusters = number(i, argc, argv, n);
     else if (n == "--seed") a.seed = static_cast<std::uint32_t>(number(i, argc, argv, n));
     else if (n == "--index-path") a.index_path = value(i, argc, argv, n);
+    else if (n == "--pq-path") a.pq_path = value(i, argc, argv, n);
     else if (n == "--manifest") a.manifest_path = value(i, argc, argv, n);
     else if (n == "--rebuild") a.rebuild = number(i, argc, argv, n) != 0;
     else if (n == "--graph-degree") a.graph_degree = number(i, argc, argv, n);
@@ -72,7 +74,7 @@ void help() {
   std::cout << "Usage: agent-aware-build [options]\n"
             << "  --base PATH or --sift-dir PATH\n"
             << "  --synthetic 0|1 --base-limit N --synthetic-dim N\n"
-            << "  --index-path PATH --manifest PATH --rebuild 0|1\n"
+            << "  --index-path PATH --pq-path PATH --manifest PATH --rebuild 0|1\n"
             << "  --graph-degree N --page-size N\n"
             << "  --pq-subspaces N --pq-centroids N --pq-train-limit N --pq-iterations N\n";
 }
@@ -141,6 +143,11 @@ int main(int argc, char** argv) {
     if (!a.index_path.parent_path().empty()) fs::create_directories(a.index_path.parent_path());
     const auto build_result =
         PackedDiskGraphBuilder::build(base, a.index_path.string(), bc);
+    const fs::path pq_path = a.pq_path.empty()
+                                 ? fs::path(a.index_path.string() + ".pq")
+                                 : a.pq_path;
+    if (!pq_path.parent_path().empty()) fs::create_directories(pq_path.parent_path());
+    pq.write_file(pq_path.string());
     const fs::path manifest = a.manifest_path.empty() ? fs::path(a.index_path.string() + ".manifest.json") : a.manifest_path;
     PackedDiskGraphIndex index(a.index_path.string());
     write_manifest_atomically(manifest, index.metadata(), build_result.medoid);

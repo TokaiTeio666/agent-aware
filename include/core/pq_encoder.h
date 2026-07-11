@@ -5,6 +5,7 @@
 #include <istream>
 #include <ostream>
 #include <vector>
+#include <string>
 
 #include "core/types.h"
 
@@ -90,6 +91,8 @@ class PQEncoder {
 
   void write(std::ostream& output) const;
   static PQEncoder read(std::istream& input);
+  void write_file(const std::string& path) const;
+  static PQEncoder read_file(const std::string& path);
 
  private:
   std::size_t nearest_centroid(const float* vector, std::size_t subspace) const;

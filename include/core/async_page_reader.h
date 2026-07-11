@@ -18,6 +18,7 @@ class AsyncPageReader {
     std::uint32_t page_id = 0;
     std::uint64_t offset = 0;
     std::size_t bytes = 0;
+    bool prefetch = false;
   };
 
   struct SubmittedRead {

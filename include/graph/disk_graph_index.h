@@ -180,6 +180,8 @@ class PackedDiskGraphIndex {
 
   const DiskGraphIoStatus& io_status() const;
   const PqAdcModel& pq_model() const { return pq_model_; }
+  std::size_t cache_capacity_pages() const;
+  std::size_t cache_resident_pages() const;
 
   DiskGraphSearchResult search_one(const float* query,
                                    const DiskGraphSearchConfig& config);

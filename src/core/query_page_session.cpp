@@ -320,7 +320,7 @@ std::size_t QueryPageSession::submit_topology_prefetch(
       continue;
     }
     requests.push_back(AsyncPageReader::ReadRequest{
-        page_id, page_offset(page_id), index_.metadata_.page_size});
+        page_id, page_offset(page_id), index_.metadata_.page_size, true});
   }
   if (requests.empty()) return 0;
 

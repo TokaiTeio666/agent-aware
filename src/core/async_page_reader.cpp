@@ -11,8 +11,9 @@
 #include <utility>
 
 #include "graph/disk_graph_index.h"
+#include "platform/page_io_backend.h"
 
-#ifdef __linux__
+#if defined(__linux__) || defined(__OHOS__)
 #include <fcntl.h>
 #include <unistd.h>
 #endif
@@ -33,7 +34,7 @@ namespace {
 
 // AsyncPageReader 将平台 I/O 差异收束到同一套页读取 API：buffered
 // pread 作为基线，O_DIRECT 用于对齐同步读，io_uring 用于重叠 I/O。
-#ifdef __linux__
+#if defined(__linux__) || defined(__OHOS__)
 constexpr std::size_t kDirectIoAlignment = 4096;
 
 std::string errno_reason(const std::string& prefix) {
@@ -68,7 +69,7 @@ class AlignedBufferPool {
     free_list_.reserve(count);
     for (std::size_t i = 0; i < count; ++i) {
       void* block = nullptr;
-#ifdef __linux__
+#if defined(__linux__) || defined(__OHOS__)
       if (posix_memalign(&block, alignment_, bytes_) != 0) {
         clear();
         throw std::runtime_error("Failed to allocate aligned I/O buffer pool");
@@ -287,7 +288,8 @@ struct AsyncPageReader::Impl {
 
   void configure(const std::string& mode, std::size_t batch_size,
                  std::size_t io_depth) {
-    if (mode != "pread" && mode != "odirect" && mode != "io_uring") {
+    if (mode != "pread" && mode != "thread_pool_pread" &&
+        mode != "odirect" && mode != "io_uring") {
       throw std::runtime_error("Unsupported disk I/O mode: " + mode);
     }
     if (batch_size == 0) {
@@ -304,9 +306,19 @@ struct AsyncPageReader::Impl {
     status.batch_size = batch_size;
     status.depth = io_depth;
 
-#ifdef __linux__
+#if defined(__linux__) || defined(__OHOS__)
     if (mode == "pread") {
       open_linux_fd(O_RDONLY | O_CLOEXEC, "pread_open_failed_errno");
+      return;
+    }
+    if (mode == "thread_pool_pread") {
+      thread_pool_backend = platform::make_thread_pool_pread_backend();
+      std::string error;
+      if (!thread_pool_backend->open(path, page_size, io_depth, error)) {
+        fallback_to_pread(error);
+        return;
+      }
+      status.effective_mode = "thread_pool_pread";
       return;
     }
 
@@ -361,8 +373,9 @@ struct AsyncPageReader::Impl {
   }
 
   bool async_enabled() const {
-#ifdef __linux__
-    return status.effective_mode == "io_uring";
+#if defined(__linux__) || defined(__OHOS__)
+    return status.effective_mode == "io_uring" ||
+           status.effective_mode == "thread_pool_pread";
 #else
     return false;
 #endif
@@ -373,7 +386,9 @@ struct AsyncPageReader::Impl {
   }
 
   std::size_t pending_async_reads() const {
-    return async_buffers.size() + inline_completions.size();
+    const std::size_t platform_pending = thread_pool_backend
+        ? thread_pool_backend->status().pending : 0;
+    return async_buffers.size() + platform_pending + inline_completions.size();
   }
 
   std::uint64_t start_async_read(std::uint64_t offset, std::size_t bytes,
@@ -381,7 +396,20 @@ struct AsyncPageReader::Impl {
     if (!async_enabled()) {
       throw std::runtime_error("Async graph reads require io_uring mode");
     }
-#ifdef __linux__
+#if defined(__linux__) || defined(__OHOS__)
+    if (status.effective_mode == "thread_pool_pread") {
+      std::string error;
+      auto tokens = thread_pool_backend->submit(
+          {{0, offset, bytes, platform::IoPriority::kDemandRead}}, error);
+      if (tokens.size() != 1) {
+        throw std::runtime_error("Graph thread-pool read failed: " + error);
+      }
+      ++stats.io_submits;
+      ++stats.submitted_reads;
+      ++stats.io_submit_syscalls;
+      platform_tokens.push_back(tokens.front());
+      return tokens.front();
+    }
 #if AGENT_AWARE_ASYNC_CAN_USE_LIBURING
     if (status.direct_enabled &&
         (offset % kDirectIoAlignment != 0 || bytes % kDirectIoAlignment != 0)) {
@@ -433,6 +461,29 @@ struct AsyncPageReader::Impl {
       return queued;
     }
 
+    if (status.effective_mode == "thread_pool_pread") {
+      std::vector<platform::PageReadRequest> requests;
+      requests.reserve(read_requests.size());
+      for (const auto& request : read_requests) {
+        requests.push_back({request.page_id, request.offset, request.bytes,
+            request.prefetch ? platform::IoPriority::kPrefetch
+                             : platform::IoPriority::kDemandRead});
+      }
+      std::string error;
+      const auto tokens = thread_pool_backend->submit(requests, error);
+      if (tokens.size() != requests.size()) {
+        throw std::runtime_error("Graph thread-pool batch failed: " + error);
+      }
+      for (std::size_t i = 0; i < tokens.size(); ++i) {
+        queued.push_back({read_requests[i].page_id, tokens[i]});
+        platform_tokens.push_back(tokens[i]);
+        ++stats.io_submits;
+        ++stats.submitted_reads;
+        ++stats.io_submit_syscalls;
+      }
+      return queued;
+    }
+
     if (!async_enabled()) {
       // 非异步模式同步完成读取，但仍返回 token，让调用方复用同一条完成路径。
       for (const auto& request : read_requests) {
@@ -471,7 +522,10 @@ struct AsyncPageReader::Impl {
     if (!async_enabled()) {
       return;
     }
-#ifdef __linux__
+#if defined(__linux__) || defined(__OHOS__)
+    if (status.effective_mode == "thread_pool_pread") {
+      return;
+    }
 #if AGENT_AWARE_ASYNC_CAN_USE_LIBURING
     std::string reason;
     std::size_t submit_syscalls = 0;
@@ -498,7 +552,22 @@ struct AsyncPageReader::Impl {
     if (!async_enabled()) {
       return false;
     }
-#ifdef __linux__
+#if defined(__linux__) || defined(__OHOS__)
+    if (status.effective_mode == "thread_pool_pread") {
+      const auto pending = platform_tokens.empty() ? 0 : platform_tokens.front();
+      if (pending == 0) return false;
+      auto result = thread_pool_backend->wait(pending, wait ? UINT32_MAX : 0);
+      if (!result.ok && result.error == "io_wait_timeout") return false;
+      platform_tokens.pop_front();
+      if (!result.ok) {
+        throw std::runtime_error("Graph thread-pool read failed: " + result.error);
+      }
+      completed.token = result.token;
+      completed.data = std::move(result.data);
+      ++stats.io_completions;
+      ++stats.completed_reads;
+      return true;
+    }
 #if AGENT_AWARE_ASYNC_CAN_USE_LIBURING
     LibUring::Completion completion;
     std::string reason;
@@ -557,7 +626,14 @@ struct AsyncPageReader::Impl {
   std::vector<char> read(std::uint64_t offset, std::size_t bytes,
                          DiskGraphSearchStats& stats) {
     std::vector<char> output(bytes, 0);
-#ifdef __linux__
+#if defined(__linux__) || defined(__OHOS__)
+    if (status.effective_mode == "thread_pool_pread") {
+      auto result = thread_pool_backend->read(offset, bytes);
+      ++stats.io_submits; ++stats.submitted_reads; ++stats.io_submit_syscalls;
+      if (!result.ok) throw std::runtime_error("Graph page read failed: " + result.error);
+      ++stats.io_completions; ++stats.completed_reads;
+      return std::move(result.data);
+    }
     if (status.effective_mode == "odirect" ||
         status.effective_mode == "io_uring") {
       if (status.effective_mode == "io_uring" && !async_buffers.empty()) {
@@ -616,7 +692,7 @@ struct AsyncPageReader::Impl {
     return output;
   }
 
-#ifdef __linux__
+#if defined(__linux__) || defined(__OHOS__)
   bool direct_io_layout_supported() const {
     return page_size % kDirectIoAlignment == 0;
   }
@@ -647,23 +723,27 @@ struct AsyncPageReader::Impl {
 
   bool read_with_pread(void* buffer, std::size_t bytes, std::uint64_t offset,
                        DiskGraphSearchStats& stats, std::string& reason) {
-    const ssize_t result =
-        ::pread(fd, buffer, bytes, static_cast<off_t>(offset));
+    std::size_t completed = 0;
     ++stats.io_submits;
     ++stats.submitted_reads;
     ++stats.io_submit_syscalls;
-    if (status.requested_mode != status.effective_mode) {
-    }
-    if (result < 0) {
-      reason = errno_reason("pread_failed_errno");
-      return false;
+    while (completed < bytes) {
+      const ssize_t result = ::pread(
+          fd, static_cast<char*>(buffer) + completed, bytes - completed,
+          static_cast<off_t>(offset + completed));
+      if (result < 0 && errno == EINTR) continue;
+      if (result < 0) {
+        reason = errno_reason("pread_failed_errno");
+        return false;
+      }
+      if (result == 0) {
+        reason = "pread_short_read_" + std::to_string(completed);
+        return false;
+      }
+      completed += static_cast<std::size_t>(result);
     }
     ++stats.io_completions;
     ++stats.completed_reads;
-    if (result != static_cast<ssize_t>(bytes)) {
-      reason = "pread_short_read_" + std::to_string(result);
-      return false;
-    }
     return true;
   }
 #else
@@ -682,7 +762,10 @@ struct AsyncPageReader::Impl {
 #endif
 
   void close_native() {
-#ifdef __linux__
+#if defined(__linux__) || defined(__OHOS__)
+    if (thread_pool_backend) thread_pool_backend->close();
+    thread_pool_backend.reset();
+    platform_tokens.clear();
 #if AGENT_AWARE_ASYNC_CAN_USE_LIBURING
     // 销毁 ring 和文件描述符前先收割未完成 CQE，确保池中的 direct-I/O buffer 都被归还。
     bool queued_submitted = true;
@@ -729,10 +812,12 @@ struct AsyncPageReader::Impl {
   std::size_t page_size = 0;
   DiskGraphIoStatus status;
   std::unordered_map<std::uint64_t, AsyncBuffer> async_buffers;
+  std::unique_ptr<platform::PageIoBackend> thread_pool_backend;
+  std::deque<std::uint64_t> platform_tokens;
   std::deque<AsyncPageReader::CompletedRead> inline_completions;
   std::unique_ptr<AlignedBufferPool> async_buffer_pool;
   std::uint64_t next_async_token = 1;
-#ifdef __linux__
+#if defined(__linux__) || defined(__OHOS__)
   int fd = -1;
 #if AGENT_AWARE_ASYNC_CAN_USE_LIBURING
   LibUring ring;
