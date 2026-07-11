@@ -1,6 +1,6 @@
 # Topology-Aware Async Prefetch
 
-`agent-aware` exposes two online policies: `none` and `topology`. The default
+`agent-aware-search` exposes two online policies: `none` and `topology`. The default
 remains `none` until the SIFT1M paired acceptance suite passes.
 
 The topology policy runs after each beam batch is expanded. New neighbors and

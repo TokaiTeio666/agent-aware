@@ -30,21 +30,14 @@
 ```bash
 SW=156
 
-./build/agent-aware \
+./build/agent-aware-search \
   --sift-dir data/sift \
-  --base-limit 1000000 \
   --query-offset 5000 \
   --query-limit 1000 \
   --top-k 10 \
   --search-width "$SW" \
   --beam-width 16 \
-  --entry-count 64 \
-  --entry-strategy single-medoid \
   --enable-pq 1 \
-  --pq-subspaces 32 \
-  --pq-centroids 256 \
-  --pq-train-limit 100000 \
-  --pq-iterations 8 \
   --rerank-topk 100 \
   --cache-policy graph-aware-2q \
   --cache-pages 15000 \
@@ -53,9 +46,22 @@ SW=156
   --io-batch 16 \
   --io-depth 32 \
   --index-path indexes/sift.idx \
-  --rebuild-index 0 \
+  --manifest indexes/sift.idx.manifest.json \
   --run-id "search-width-${SW}-baseline" \
   --output-json "build/search_width_${SW}_baseline.json"
+```
+
+该命令只复用现有索引。若索引或 manifest 不存在，先运行：
+
+```bash
+./build/agent-aware-build \
+  --sift-dir data/sift \
+  --base-limit 1000000 \
+  --pq-subspaces 32 \
+  --pq-centroids 256 \
+  --pq-train-limit 100000 \
+  --pq-iterations 8 \
+  --index-path indexes/sift.idx
 ```
 
 ## 结果

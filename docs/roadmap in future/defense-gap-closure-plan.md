@@ -49,18 +49,19 @@
 
 ### 主路径命令模板
 
-`agent-aware` 支持 `--search-width`、`--beam-width`、`--memory-budget-ratio`、`--io-mode`、`--cache-policy` 和 `--output-json`。复用已有 packed index 时保持 `REBUILD_INDEX=0` 或不设置。
+`agent-aware-search` 支持 `--search-width`、`--beam-width`、`--memory-budget-ratio`、`--io-mode`、`--cache-policy` 和 `--output-json`。它只复用已有 packed index 与 manifest，不接受构建参数。
 
 ```bash
 for sw in 128 144 156 168 192; do
-  TAG="matrix_sw${sw}_bw16_cache020_iouring"
-  EXTRA_ARGS="--query-limit 1000 \
-    --search-width ${sw} \
-    --beam-width 16 \
-    --memory-budget-ratio 0.20 \
-    --io-mode io_uring \
-    --cache-policy graph-aware-2q" \
-  TAG="$TAG" bash scripts/linux/run_sift1m_once.sh
+  python3 scripts/agent_aware.py once \
+    --index indexes/sift.idx \
+    --output-dir "logs/sift_bench/matrix_sw${sw}_bw16_cache020_iouring" \
+    --extra-arg=--query-limit --extra-arg=1000 \
+    --extra-arg=--search-width --extra-arg="${sw}" \
+    --extra-arg=--beam-width --extra-arg=16 \
+    --extra-arg=--memory-budget-ratio --extra-arg=0.20 \
+    --extra-arg=--io-mode --extra-arg=io_uring \
+    --extra-arg=--cache-policy --extra-arg=graph-aware-2q
 done
 ```
 
@@ -131,7 +132,7 @@ done
 
 | case | 命令来源 | 目标 |
 | --- | --- | --- |
-| SIFT1M main path | `scripts/linux/run_sift1m_once.sh` | Recall、QPS、P95、resident ratio |
+| SIFT1M main path | `python3 scripts/agent_aware.py once` | Recall、QPS、P95、resident ratio |
 | pure read t1/t4/t8 | `bench_mixed_rw --write_threads 0` | 读并发扩展性 |
 | mixed no compaction | `bench_mixed_rw --enable_compaction 0` | 写入对读路径影响 |
 | mixed background compaction | `bench_mixed_rw --enable_compaction 1 --compaction_background 1` | 后台整理抖动 |

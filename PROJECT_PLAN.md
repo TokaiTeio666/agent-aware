@@ -127,6 +127,8 @@ Agent-aware 面向大模型 Agent 的长期记忆场景，设计一套在内存�
 │                                  ▼                                           │
 │  ┌────────────────────────────────────────────────────────────────────────┐  │
 │  │ Query Runtime                                                          │  │
+│  │ persisted medoid -> beam search -> QueryPageSession                    │  │
+│  │ post-expand topology ranking -> adaptive io_uring prefetch             │  │
 │  └────────────────────────────────────────────────────────────────────────┘  │
 │                                                                              │
 └──────────────────────────────────────────────────────────────────────────────┘
@@ -139,7 +141,7 @@ agent-aware/
 ├── CMakeLists.txt                         # 顶层构建入口，生成库和 benchmark 可执行文件
 ├── README.md                              # 项目入口、构建运行、实验结果和参数说明
 ├── PROJECT_PLAN.md                        # 总体计划、技术路线和验收标准
-├── include/agent_aware/                   # 对外头文件
+├── include/                               # 对外头文件根目录
 │   ├── agent_aware.h                      # 聚合入口头
 │   ├── core/                              # 基础类型、距离计算、PQ、预取和异步 page reader
 │   │   ├── types.h
@@ -147,6 +149,7 @@ agent-aware/
 │   │   ├── pq_encoder.h
 │   │   ├── async_page_reader.h
 │   │   ├── query_page_session.h
+│   │   └── prefetch_adaptive_controller.h
 │   ├── data/                              # SIFT/fvecs/ivecs 读取与 synthetic 数据生成
 │   ├── graph/                             # Vamana 构图、packed page 编码、SSD graph index
 │   ├── dynamic/                           # WAL、MemTable、SSTable、Manifest、Compaction
@@ -154,16 +157,16 @@ agent-aware/
 ├── src/                                   # C++ 实现
 │   ├── core/                              # PQ ADC、SIMD/L2、io_uring/pread/O_DIRECT 读路径
 │   ├── data/                              # 数据集加载实现
-│   ├── graph/                             # 图构建、entry selection、packed graph search
+│   ├── graph/                             # Vamana 构图、single-medoid、packed graph search
 │   ├── dynamic/                           # 动态写入、flush、recovery、compaction
 │   ├── engine/                            # base graph + delta merge 查询引擎
 │   ├── index_builder.cpp                  # 构建为 agent-aware-build，生成 V3 索引
 │   ├── sift_search_benchmark.cpp          # 构建为 agent-aware-search，仅执行检索
 │   └── mixed_rw_benchmark.cpp             # 构建为 bench_mixed_rw，输出混合读写 CSV/JSON
 ├── scripts/
-│   ├── agent_aware.py                     # once/ab/tune 与工具统一入口
+│   ├── agent_aware.py                     # once/ab benchmark 统一入口
 └── docs/
-    ├── design/                            # 01-09 编号设计文档，覆盖 SSD、缓存、预取、动态写入
+    ├── design/                            # 01-06 编号设计文档，覆盖 SSD、缓存、预取、动态写入
     ├── problem/                           # 赛题要求、问题背景和约束说明
     └── roadmap in future/                 # 后续优化计划、答辩补强和冲刺路线
 ```
@@ -421,8 +424,8 @@ cd build
 cmake .. -DCMAKE_BUILD_TYPE=Release
 make -j$(nproc)
 
-# 单元测试
-./agent_aware_tests
+# 单元测试与 CLI contract smoke
+ctest --test-dir . --output-on-failure
 
 # P5 混合读写 benchmark
 ./bench_mixed_rw --num_operations 10000 --topk 10
@@ -504,12 +507,14 @@ Agent-aware 的计划重点是围绕赛题的真实约束构建系统，而不�
 
 ## 16. 文档指引与专项计划索引
 
-本文档是项目总览，`docs/design/` 下的 01-09 编号文档是各模块的详细设计归档，`docs/roadmap in future/` 下的文档是后续优化和答辩补强路线。阅读时优先按照当前目录中的编号文件名引用，避免继续使用未编号的旧路径。
+本文档是项目总览，`docs/design/` 下的 01-06 编号文档是各模块的详细设计归档，`docs/roadmap in future/` 下的文档是后续优化和答辩补强路线。阅读时优先按照当前目录中的编号文件名引用，避免继续使用未编号的旧路径。
 
 ### 16.1 推荐阅读路径
 
 | 阅读目标 | 建议顺序 |
 | --- | --- |
+| 快速理解静态检索 | `README.md` -> `01-ssd-storage-path.md` -> `03-async-prefetch.md` -> `04-beam-width-io-uring.md` |
+| 预取验收 | `03-async-prefetch.md` -> `docs/roadmap in future/recall-to-io-tail-latency-plan.md` |
 | 动态写入与流式更新 | `05-dynamic-write.md` -> `docs/experiments/mixed-read-write.md` -> `06-fresh-streaming-ann.md` -> `docs/roadmap in future/next-sift1m-mixed-rw-optimization.md` |
 | 答辩前补强 | `docs/roadmap in future/defense-gap-closure-plan.md` -> 参数矩阵结果 -> 真实 NVMe/比赛环境复测记录 |
 
@@ -519,6 +524,7 @@ Agent-aware 的计划重点是围绕赛题的真实约束构建系统，而不�
 | --- | --- | --- |
 | `docs/design/01-ssd-storage-path.md` | SSD 4KB record 布局、DiskIndexReader/Writer、O_DIRECT、packed graph 文件格式 | 已落地 |
 | `docs/design/02-cache-zero-copy.md` | Graph-Aware 2Q BufferPool、同页复用、pin/unpin、compute_distance_direct | 已落地 |
+| `docs/design/03-async-prefetch.md` | post-expand topology 排序、自适应限流、io_uring-only 预取与 A/B 验收 | 已落地，正式五轮验收待运行 |
 | `docs/design/04-beam-width-io-uring.md` | beam_width 语义、beam batch 收集、io_uring 批量读取、page 去重 | 已落地 |
 | `docs/design/05-dynamic-write.md` | LSM 写入路径：WAL/MemTable/SSTable/manifest/compaction/recovery | 已落地 |
 | `docs/design/06-fresh-streaming-ann.md` | Streaming ANN 创新路线：LSM delta + immutable read view、Delta memory graph、周期性 rebuild | 部分已完成 |

@@ -45,7 +45,7 @@ Agent-aware 是一个面向大模型 Agent 长期记忆场景的向量检索 I/O
 ├──────────────────────────────────────────────────────────────────────────────┤
 │                                                                              │
 │  Benchmark / Agent API                                                       │
-│  agent-aware, bench_mixed_rw, StorageEngine                                  │
+│  agent-aware-build, agent-aware-search, bench_mixed_rw, StorageEngine        │
 │                                │                                             │
 │                                ▼                                             │
 │  ┌────────────────────────────────────────────────────────────────────────┐  │
@@ -79,8 +79,8 @@ Agent-aware 是一个面向大模型 Agent 长期记忆场景的向量检索 I/O
 │                                  ▼                                           │
 │  ┌────────────────────────────────────────────────────────────────────────┐  │
 │  │ Query Runtime                                                          │  │
-│  │ EntrySelector -> beam search -> QueryPageSession                       │  │
-│  │ expand: 邻居 PQ ADC 粗排 -> top beam*2 页面 -> io_uring 异步预取          │  │
+│  │ manifest single-medoid -> beam search -> QueryPageSession             │  │
+│  │ post-expand: PQ ADC 粗排 -> top beam*2 节点聚页 -> io_uring 异步预取      │  │
 │  └────────────────────────────────────────────────────────────────────────┘  │
 │                                                                              │
 └──────────────────────────────────────────────────────────────────────────────┘
@@ -101,6 +101,7 @@ agent-aware/
 │   │   ├── pq_encoder.h
 │   │   ├── async_page_reader.h
 │   │   ├── query_page_session.h
+│   │   └── prefetch_adaptive_controller.h
 │   ├── data/                              # SIFT/fvecs/ivecs 读取与 synthetic 数据生成
 │   ├── graph/                             # Vamana 构图、packed page 编码、SSD graph index
 │   ├── dynamic/                           # WAL、MemTable、SSTable、Manifest、Compaction
@@ -108,13 +109,14 @@ agent-aware/
 ├── src/                                   # C++ 实现
 │   ├── core/                              # PQ ADC、SIMD/L2、io_uring/pread/O_DIRECT 读路径
 │   ├── data/                              # 数据集加载实现
-│   ├── graph/                             # 图构建、entry selection、packed graph search
+│   ├── graph/                             # Vamana 构图、single-medoid、packed graph search
 │   ├── dynamic/                           # 动态写入、flush、recovery、compaction
 │   ├── engine/                            # base graph + delta merge 查询引擎
-│   ├── sift_search_benchmark.cpp          # 构建为 agent-aware，输出 SSD 检索 JSON
+│   ├── index_builder.cpp                  # 构建为 agent-aware-build，生成 V3 索引与 manifest
+│   ├── sift_search_benchmark.cpp          # 构建为 agent-aware-search，仅执行 SSD 检索
 │   └── mixed_rw_benchmark.cpp             # 构建为 bench_mixed_rw，输出混合读写 CSV/JSON
 ├── scripts/
-│   ├── agent_aware.py                      # once/ab/tune 与工具统一入口
+│   ├── agent_aware.py                      # once/ab benchmark 统一入口
 └── docs/
     ├── design/                            # SSD 存储、缓存、异步预取、动态写入设计
     ├── experiments/                       # SIFT1M、混合读写、参数调优实验报告
@@ -201,7 +203,7 @@ cmake --build build -j"$(nproc)"
 
 ###  SIFT 运行
 
-构建和 benchmark 是显式的两个阶段。Python 入口的 `once`、`ab` 和 `tune` 只运行 `agent-aware-search`，要求索引已经存在。
+构建和 benchmark 是显式的两个阶段。Python 入口的 `once` 和 `ab` 只运行 `agent-aware-search`，要求索引及其 manifest 已经存在。
 
 构建索引：
 
@@ -335,36 +337,38 @@ SSD mixed-RW 会在场景计时前使用 `--data_path` 加载的 base 和 PQ 参
 
 不要在吞吐轮次开启 O(N) exact Recall 回算；正确性证据应使用单独的抽样限速场景。
 
-## `agent-aware` 参数说明
+## 静态链路参数说明
 
-布尔参数接受 `1/0`、`true/false`、`on/off`、`yes/no`。多数参数同时支持连字符和下划线别名，例如 `--search-width` 与 `--search_width` 等价。下表的默认值按当前 `Args` 结构体和实际 JSON 输出整理。
+`agent-aware-build` 与 `agent-aware-search` 的参数边界是强制的：base、PQ 训练和图构建参数只属于构建阶段；在线检索只接受 query/truth、已有 index/manifest 和运行时搜索参数。搜索程序收到构建参数会直接报错。
 
-### 数据参数
-
-| 参数 | 默认值 | 可选范围 | 说明 |
-| --- | --- | --- | --- |
-| `--synthetic` | `0` | `0/1` | 是否使用 synthetic 数据；为 `0` 时加载 SIFT/fvecs |
-| `--sift-dir` | `data/sift` | 有效目录 | 自动解析 `sift_base.fvecs`、`sift_query.fvecs`、`sift_groundtruth.ivecs` |
-| `--base` | 空 | `.fvecs` 路径 | 手动指定 base 文件，会关闭 synthetic |
-| `--query` | 空 | `.fvecs` 路径 | 手动指定 query 文件，会关闭 synthetic |
-| `--truth` | 空 | `.ivecs` 路径 | 手动指定 ground truth；为空则不计算 Recall |
-| `--base-limit` | `1000000` | `>=1` | 加载 base 向量数 |
-| `--query-limit` | `100` | `>=1` | 加载 query 向量数 |
-| `--synthetic-dim` | `32` | `>=1` | synthetic 向量维度 |
-| `--synthetic-clusters` | `16` | `>=1`，实际不超过 `base-limit` | synthetic 簇数量 |
-| `--seed` | `42` | `>=0` | 随机种子，用于数据、PQ、构图和 entry selection |
-
-### 构图与索引参数
+### `agent-aware-build` 参数
 
 | 参数 | 默认值 | 可选范围 | 说明 |
 | --- | --- | --- | --- |
-| `--index-path` | `indexes/sift1m_vamana_pq100_p4096_sm.idx` | 可写路径 | packed graph index 文件 |
-| `--output-json` | `logs/sift_bench/result.json` | 可写路径 | benchmark 结果 JSON |
-| `--rebuild-index` | `0` | `0/1` | 是否强制重建索引；为 `0` 且 index 存在时复用 |
+| `--synthetic` | `0` | `0/1` | 使用 synthetic base；builder 的布尔值使用 `0/1` |
+| `--sift-dir` / `--base` | `data/sift` / 空 | 有效路径 | 选择 SIFT 目录或显式 base `.fvecs` |
+| `--base-limit` | `1000000` | `>=1` | 构建使用的 base 向量数 |
+| `--synthetic-dim`, `--synthetic-clusters` | `32`, `16` | `>=1` | synthetic 数据形状 |
+| `--seed` | `42` | `>=0` | PQ 训练和 Vamana 构图随机种子 |
+| `--index-path` | `indexes/sift.idx` | 可写路径 | V3 packed graph index |
+| `--manifest` | `<index>.manifest.json` | 可写路径 | 保存格式、规模和 global medoid 的侧车文件 |
+| `--rebuild` | `0` | `0/1` | 已存在索引是否允许覆盖；默认直接失败 |
 | `--graph-degree` | `32` | `>=1`，推荐 `16-64` | Vamana 图最大邻居数，影响 Recall、内存和构图时间 |
 | `--page-size` | `4096` | `>=4096` | packed graph page 大小；需要容纳 node record |
-| `--build-policy` | `vamana` | `vamana` | 仅保留主线 Vamana 构图；其他值返回 unsupported |
-| `--packing-strategy` | `bfs` | `bfs` | 仅保留 BFS page packing；其他值返回 unsupported |
+| `--pq-subspaces`, `--pq-centroids` | `32`, `256` | 与数据维度匹配 | PQ 模型结构，持久化进 V3 索引 |
+| `--pq-train-limit`, `--pq-iterations` | `100000`, `8` | `>=1` | PQ 训练规模与迭代数 |
+
+### `agent-aware-search` 数据与索引参数
+
+| 参数 | 默认值 | 可选范围 | 说明 |
+| --- | --- | --- | --- |
+| `--sift-dir` | `data/sift` | 有效目录 | 解析 query 和 ground truth，不加载 base |
+| `--query`, `--truth` | 空 | `.fvecs` / `.ivecs` 路径 | 覆盖 query 和可选 ground truth |
+| `--query-offset`, `--query-limit` | `0`, `1000` | `>=0`, `>=1` | 在线查询窗口 |
+| `--index-path` | `indexes/sift.idx` | 已有文件 | V3 packed graph index；缺失时直接失败 |
+| `--manifest` | `<index>.manifest.json` | 已有文件 | 与索引严格校验后提供 single-medoid |
+| `--output-json` | `logs/sift_bench/result.json` | 可写路径 | benchmark 结果 JSON |
+| `--seed` | `42` | `>=0` | 实验复现元数据 |
 
 ### 搜索参数
 
@@ -377,16 +381,14 @@ SSD mixed-RW 会在场景计时前使用 `--data_path` 加载的 base 和 PQ 参
 
 搜索入口固定为构建 manifest 中的 single-medoid，不提供 entry strategy/count 选择参数。
 
-### PQ/ADC 参数
+### PQ/ADC 与精排参数
 
 | 参数 | 默认值 | 可选范围 | 说明 |
 | --- | --- | --- | --- |
 | `--enable-pq` | `1` | `1` | 搜索主路径要求 PQ+ADC 候选生成；`0` 已不再支持 |
-| `--pq-subspaces` | `32` | `>=1`，有效值不超过向量维度 | PQ 子空间数；计划中常见调优范围为 `8-16`，当前 SIFT 默认用 `32` 提升近似精度 |
-| `--pq-centroids` | `256` | `2-256` | 每个子空间聚类中心数 |
-| `--pq-train-limit` | `100000` | `>=pq-centroids` | PQ 训练样本上限 |
-| `--pq-iterations` | `8` | `>=1` | PQ k-means 迭代次数 |
 | `--rerank-topk` | `100` | `0` 或 `>=top-k` | PQ 后精排候选池；`0` 表示关闭 exact rerank |
+
+PQ offsets、codebooks 和全量 codes 均从索引恢复。PQ 结构参数属于 `agent-aware-build`，不能在搜索阶段覆盖。
 
 ### 预取、缓存与 I/O 参数
 
@@ -413,6 +415,7 @@ SSD mixed-RW 会在场景计时前使用 `--data_path` 加载的 base 和 PQ 参
 
 ```bash
 python3 scripts/agent_aware.py ab --index indexes/sift.idx \
+  --query-offset 5000 --query-limit 1000
 ```
 
 脚本运行 `no_prefetch`、`topology_fixed`、`topology_adaptive` 三臂，默认在 cold/hot cache 下各执行 5 个 seed。`report.json` 只有在 P95/P99、Recall、demand wait、waste、读放大和 planner CPU 门槛全部满足时才输出 `acceptance_ok=true`。
@@ -553,16 +556,16 @@ CSV 字段含义：
 
 ### SSD 检索流程
 
-2. 只加载 query 和可选 truth；base 不进入在线 benchmark 进程。
-3. 从 V3 索引恢复 PQ offsets、codebooks 和全量 codes。
+1. 只加载 query 和可选 truth；base 不进入在线 benchmark 进程。
+2. 打开 V3 索引并恢复 PQ offsets、codebooks 和全量 codes。
+3. 索引不存在、格式不匹配或 manifest 校验失败时直接失败，提示先运行 `agent-aware-build`。
 4. 根据 `--memory-budget-ratio` 估算 resident memory，并在未手动设置 `--cache-pages` 时自动计算 cache 容量。
-5. 索引不存在或格式不匹配时直接失败，提示先运行 `agent-aware-build`。
-6. 打开 `PackedDiskGraphIndex`，配置 cache policy 和 I/O mode。
-7. 从经过索引一致性校验的 manifest 读取 single-medoid 入口节点。
-8. 每个 query 构造 `DiskGraphSearchConfig`，执行 graph beam search。
-9. 搜索时优先命中 BufferPool；miss 时通过 `pread`、`odirect` 或 `io_uring` 读取 4KB page。
-10. 命中 page 后直接从 page buffer 计算 L2 距离，并用 PQ/rerank 更新候选队列。
-12. 聚合所有 query 的 Recall、QPS、延迟、缓存、I/O、预取、内存预算统计，写入 JSON。
+5. 配置 `PackedDiskGraphIndex` 的 cache policy 和 I/O mode，从 manifest 读取 single-medoid。
+6. 每个 query 构造 `DiskGraphSearchConfig`，执行 graph beam search。
+7. 搜索优先命中 BufferPool；miss 时通过 `pread`、`odirect` 或 `io_uring` 读取 4KB page。
+8. 命中 page 后直接从 page buffer 计算 L2 距离，并用 PQ/rerank 更新候选队列。
+9. 开启 topology 策略时，在 post-expand 阶段聚合候选页；仅真实 io_uring 后端提交异步预取。
+10. 聚合 Recall、QPS、延迟、缓存、I/O、预取和内存预算统计，写入 JSON。
 
 ### 动态写入流程
 
