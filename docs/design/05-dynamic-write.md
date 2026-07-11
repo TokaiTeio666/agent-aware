@@ -1,15 +1,15 @@
 # 05 动态写入设计文档
 
-## 当前实现状态（2026-06-21）
+## 当前实现状态（2026-07-11）
 
-动态写入已经完成最小可交付闭环：WAL、MemTable、SSTable、manifest、manual/background compaction、recovery、base/delta Top-K merge、动态 Recall 抽样和真实并发 mixed RW benchmark 均已落地。本轮进一步把 `DynamicWriteManager` 读侧改为 immutable read view 发布，避免 reader 查询 base 覆盖记录时和 writer/flush/compaction 抢同一把全局 mutex。
+动态写入已经完成可复现实验闭环：WAL、MemTable、SSTable、manifest、manual/background compaction、recovery、base/delta Top-K merge、动态 Recall 抽样和真实并发 mixed RW benchmark 均已落地。`DynamicWriteManager` 读侧通过 immutable read view 发布，避免 reader 查询 base 覆盖记录时和 writer/flush/compaction 抢同一把全局 mutex。2026-07-11 的 SIFT1M 配对实验及三轮明细见 [动态混合读写对照实验](../experiments/mixed-read-write.md)。
 
 | 项目 | 状态 | 当前对应实现 |
 | --- | --- | --- |
 | MemTable/WAL/SSTable | 已完成 | `include/dynamic`、`src/dynamic` |
 | Manifest/recovery | 已完成 | `Manifest` + manager `open()` 重放 |
 | Compaction | 已完成可运行版 | `CompactionJob`、`DynamicWriteManager::compact_once` |
-| mixed RW benchmark | 已完成 | `src/mixed_rw_benchmark.cpp`，支持 JSON 和多线程 |
+| mixed RW benchmark | 已完成并完成三轮配对验证 | `src/mixed_rw_benchmark.cpp`，支持 JSON、多线程和受控读写比例 |
 | immutable read view | 已完成 | `DynamicWriteManager::DynamicReadView` + atomic `shared_ptr` |
 | 真正异步 flush queue | 未完成 | 当前仍沿用 manager flush 路径 |
 | 周期性 rebuild packed graph | 未完成 | 后续优化将 delta 批量吸收到 base |
@@ -382,15 +382,16 @@ Manifest 作用：
 
 ## 九、Benchmark 与验证场景
 
-混合读写 benchmark 场景：
+2026-07-11 已使用 SIFT1M、4 reader、1 writer、30 秒 workload 完成纯读、95/5 compaction 开/关和 80/20 compaction 开四组配对实验。每组预热一次、正式运行三次；写事件为 70/25/5 CRUD，吞吐轮次关闭 exact Recall。关键中位数如下，完整范围和逐轮数据见 [专项实验报告](../experiments/mixed-read-write.md)。
 
-| 场景 | 读比例 | 写比例 | 目标 |
-| --- | ---: | ---: | --- |
-| Read-heavy | 95% | 5% | 验证动态写入对查询延迟影响 |
-| Balanced | 70% | 30% | 验证混合负载稳定性 |
-| Write-heavy | 50% | 50% | 验证 WAL / MemTable / Flush 压力 |
-| Recovery | - | - | 验证崩溃恢复正确性 |
-| Compaction | - | - | 验证 Compaction 前后性能变化 |
+| 场景 | Read QPS | Write QPS | Read P95 | Delta search | Compaction |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| 纯读，compaction 关 | 703.18 | 0 | 6.70 ms | 0.002 ms/read | 0 |
+| 95/5，compaction 关 | 647.05 | 34.06 | 7.23 ms | 0.205 ms/read | 0 |
+| 95/5，compaction 开 | 653.09 | 34.39 | 7.16 ms | 0.206 ms/read | 每轮 1 次 |
+| 80/20，compaction 开 | 578.23 | 144.58 | 8.31 ms | 0.912 ms/read | 8-9 次 |
+
+定时并发 benchmark 的 operation 领取采用按读写比例生成的确定性槽位，避免实际比例由 reader/writer 相对速度决定。三轮实际比例与配置误差均小于 0.01 个百分点。独立 Recall 场景得到 29 个 exact 样本，Recall@10 为 0.9966，read sequence 覆盖 1-233，CRUD 写入无失败。
 
 指标：
 
@@ -436,15 +437,12 @@ Manifest 作用：
 10. 验证查询结果不变。
 ```
 
-Benchmark 需要覆盖：
+后续扩展实验仍需覆盖：
 
-1. 纯读 baseline。
-2. 读 95% / 写 5%。
-3. 读 70% / 写 30%。
-4. 读 50% / 写 50%。
-5. Flush 压力。
-6. Compaction 压力。
-7. Recovery 的大 WAL replay 时间。
+1. 读 70% / 写 30% 和读 50% / 写 50% 的更高写压场景。
+2. Flush 阈值矩阵和大 WAL recovery 压力。
+3. 真实 NVMe、clean commit 环境复测。
+4. 长时运行下 delta 增长与周期性 base rebuild。
 
 ## 十、风险与后续方向
 
@@ -467,7 +465,7 @@ Benchmark 需要覆盖：
 3. MemTable flush 到 SSTable。
 4. 查询时合并 base graph 和 delta records。
 5. 手动触发 Compaction。
-6. 混合读写 benchmark 能跑出结果。
+6. 混合读写 benchmark 已跑出三轮配对结果。
 
 暂时可以不做：
 
@@ -500,6 +498,6 @@ Benchmark 需要覆盖：
 5. SSTable 可被查询路径读取。
 6. 多个 SSTable 可以进行基础 Compaction。
 7. 查询结果可以合并 base graph 与 delta layer。
-8. 完成混合读写 benchmark。
+8. 完成混合读写 benchmark，并以三轮配对结果记录中位数和波动范围。
 9. 输出 Recall、QPS、P95、P99、写入吞吐、恢复时间等指标。
 10. 文档说明动态写入架构、文件格式、恢复流程和已知限制。

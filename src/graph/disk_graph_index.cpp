@@ -1,4 +1,4 @@
-#include "agent_aware/graph/disk_graph_index.h"
+#include "graph/disk_graph_index.h"
 
 #include <algorithm>
 #include <atomic>
@@ -6,6 +6,7 @@
 #include <cmath>
 #include <cstring>
 #include <deque>
+#include <filesystem>
 #include <limits>
 #include <mutex>
 #include <numeric>
@@ -16,12 +17,11 @@
 #include <unordered_set>
 #include <utility>
 
-#include "agent_aware/core/async_page_reader.h"
-#include "agent_aware/core/brute_force.h"
-#include "agent_aware/core/query_page_session.h"
-#include "agent_aware/graph/disk_page_codec.h"
-#include "agent_aware/graph/entry_selector.h"
-#include "agent_aware/graph/vamana_builder.h"
+#include "core/async_page_reader.h"
+#include "core/brute_force.h"
+#include "core/query_page_session.h"
+#include "graph/disk_page_codec.h"
+#include "graph/vamana_builder.h"
 
 namespace agent_aware {
 namespace {
@@ -64,50 +64,37 @@ std::vector<SearchResult> sorted_results(
   return results;
 }
 
-bool pre_beam_prefetch_enabled(const DiskGraphSearchConfig& config) {
-  return config.prefetch_policy == "xgboost" &&
-         (config.prefetch_early_trigger == "pre-beam" ||
-          config.prefetch_early_trigger == "all");
-}
-
-bool entry_warmup_prefetch_enabled(const DiskGraphSearchConfig& config) {
-  return config.prefetch_policy == "xgboost" &&
-         (config.prefetch_early_trigger == "entry-warmup" ||
-          config.prefetch_early_trigger == "all");
-}
-
-bool post_expand_prefetch_enabled(const DiskGraphSearchConfig& config) {
-  return config.prefetch_policy == "xgboost" &&
-         (config.prefetch_early_trigger == "off" ||
-          config.prefetch_early_trigger == "all");
-}
-
-bool rerank_prefetch_enabled(const DiskGraphSearchConfig& config) {
-  return config.prefetch_policy == "xgboost" &&
-         (config.prefetch_early_trigger == "rerank" ||
-          config.prefetch_early_trigger == "all");
-}
-
-std::size_t effective_post_expand_submit_top_k(
-    const DiskGraphSearchConfig& config) {
-  if (config.prefetch_submit_top_k > 0) {
-    return config.prefetch_submit_top_k;
-  }
-  if (config.prefetch_top_k > 0) {
-    return config.prefetch_top_k;
-  }
-  return 4;
-}
-
-std::size_t effective_post_expand_candidate_pool_size(
-    const DiskGraphSearchConfig& config, std::size_t beam) {
-  if (config.prefetch_candidate_pool_size > 0) {
-    return config.prefetch_candidate_pool_size;
-  }
-  return std::max<std::size_t>(1, beam * 4);
-}
-
 }  // namespace
+
+std::vector<TopologyPageCandidate> rank_topology_pages(
+    const std::vector<std::uint32_t>& ranked_page_ids,
+    std::size_t candidate_window) {
+  const std::size_t limit = std::min(ranked_page_ids.size(), candidate_window);
+  std::unordered_map<std::uint32_t, TopologyPageCandidate> pages;
+  pages.reserve(limit);
+  for (std::size_t rank = 0; rank < limit; ++rank) {
+    const auto page_id = ranked_page_ids[rank];
+    auto [it, inserted] = pages.emplace(
+        page_id, TopologyPageCandidate{page_id, rank, 0});
+    ++it->second.candidate_count;
+    if (!inserted) it->second.min_pq_rank = std::min(it->second.min_pq_rank, rank);
+  }
+  std::vector<TopologyPageCandidate> ranked;
+  ranked.reserve(pages.size());
+  for (const auto& entry : pages) ranked.push_back(entry.second);
+  std::sort(ranked.begin(), ranked.end(),
+            [](const TopologyPageCandidate& lhs,
+               const TopologyPageCandidate& rhs) {
+              if (lhs.min_pq_rank != rhs.min_pq_rank) {
+                return lhs.min_pq_rank < rhs.min_pq_rank;
+              }
+              if (lhs.candidate_count != rhs.candidate_count) {
+                return lhs.candidate_count > rhs.candidate_count;
+              }
+              return lhs.page_id < rhs.page_id;
+            });
+  return ranked;
+}
 
 struct PackedDiskGraphIndex::SearchState {
   SearchState(PackedDiskGraphIndex& index, const float* query,
@@ -173,18 +160,9 @@ struct PackedDiskGraphIndex::SearchState {
       candidates;
   std::priority_queue<SearchResult, std::vector<SearchResult>, WorseResultFirst>
       best;
-  std::vector<std::uint32_t> entry_seed_ids;
   std::vector<float> adc_table;
   std::size_t effective_k = 0;
   std::size_t result_capacity = 0;
-  std::size_t jit_prefetch_submitted_pages = 0;
-};
-
-struct PackedDiskGraphIndex::PostExpandPrefetchCandidates {
-  std::vector<std::uint32_t> ordered_page_sequence;
-  std::vector<std::uint32_t> ordered_unique_pages;
-  std::unordered_map<std::uint32_t, std::size_t>
-      estimated_demand_step_deltas;
 };
 
 PackedDiskGraphIndex::PackedDiskGraphIndex(const std::string& path)
@@ -197,13 +175,20 @@ PackedDiskGraphIndex::PackedDiskGraphIndex(const std::string& path)
   input_.read(magic, sizeof(magic));
   if (!input_ || std::memcmp(magic, kPackedGraphMagic.data(),
                              kPackedGraphMagic.size()) != 0) {
+    constexpr char kV2Magic[8] = {'A', 'M', 'F', 'P', 'V', '2', '\0', '\0'};
+    if (std::memcmp(magic, kV2Magic, sizeof(kV2Magic)) == 0) {
+      throw std::runtime_error(
+          "V2 packed index is obsolete; rebuild with --rebuild-index 1");
+    }
     throw std::runtime_error("Invalid packed graph index magic: " + path);
   }
 
   const auto version = read_value<std::uint32_t>(input_);
   if (version != kPackedGraphVersion) {
-    throw std::runtime_error("Unsupported packed graph index version");
+    throw std::runtime_error(
+        "Unsupported packed graph index version; rebuild with agent-aware-build");
   }
+  metadata_.format_version = version;
 
   metadata_.vector_count = read_value<std::uint64_t>(input_);
   metadata_.dim = read_value<std::uint32_t>(input_);
@@ -213,17 +198,61 @@ PackedDiskGraphIndex::PackedDiskGraphIndex(const std::string& path)
   metadata_.directory_offset = read_value<std::uint64_t>(input_);
   metadata_.page_count = read_value<std::uint64_t>(input_);
   metadata_.nodes_per_page = read_value<std::uint32_t>(input_);
-  metadata_.neighbor_pq_code_bytes = read_value<std::uint32_t>(input_);
+  metadata_.pq_subspaces = read_value<std::uint32_t>(input_);
+  metadata_.pq_centroids = read_value<std::uint32_t>(input_);
+  metadata_.pq_dim = read_value<std::uint32_t>(input_);
+  metadata_.pq_offset = read_value<std::uint64_t>(input_);
+  metadata_.pq_bytes = read_value<std::uint64_t>(input_);
+  metadata_.pq_offsets_offset = read_value<std::uint64_t>(input_);
+  metadata_.pq_offsets_bytes = read_value<std::uint64_t>(input_);
+  metadata_.pq_codebook_offset = read_value<std::uint64_t>(input_);
+  metadata_.pq_codebook_bytes = read_value<std::uint64_t>(input_);
+  metadata_.pq_codes_offset = read_value<std::uint64_t>(input_);
+  metadata_.pq_codes_bytes = read_value<std::uint64_t>(input_);
+  metadata_.index_bytes = std::filesystem::file_size(path_);
 
   if (metadata_.vector_count == 0 || metadata_.dim == 0 ||
       metadata_.degree == 0 || metadata_.page_size == 0 ||
       metadata_.page_count == 0 || metadata_.nodes_per_page == 0) {
     throw std::runtime_error("Packed graph index metadata is invalid");
   }
-  if (graph_record_bytes(metadata_.dim, metadata_.degree,
-                         metadata_.neighbor_pq_code_bytes) >
-      metadata_.page_size) {
+  if (graph_record_bytes(metadata_.dim, metadata_.degree) > metadata_.page_size) {
     throw std::runtime_error("Packed graph node payload exceeds page size");
+  }
+  const std::uint64_t directory_bytes =
+      metadata_.vector_count * sizeof(std::uint32_t);
+  const std::uint64_t records_bytes = metadata_.page_count * metadata_.page_size;
+  if (metadata_.directory_offset > metadata_.index_bytes ||
+      directory_bytes > metadata_.index_bytes - metadata_.directory_offset ||
+      metadata_.records_offset > metadata_.index_bytes ||
+      records_bytes > metadata_.index_bytes - metadata_.records_offset) {
+    throw std::runtime_error("Packed graph index sections exceed file bounds");
+  }
+  if (metadata_.pq_bytes == 0 || metadata_.pq_subspaces == 0 ||
+      metadata_.pq_centroids == 0 || metadata_.pq_dim != metadata_.dim ||
+      metadata_.pq_offset > metadata_.index_bytes ||
+      metadata_.pq_bytes > metadata_.index_bytes - metadata_.pq_offset ||
+      metadata_.pq_offsets_offset < metadata_.pq_offset ||
+      metadata_.pq_codebook_offset !=
+          metadata_.pq_offsets_offset + metadata_.pq_offsets_bytes ||
+      metadata_.pq_codes_offset !=
+          metadata_.pq_codebook_offset + metadata_.pq_codebook_bytes ||
+      metadata_.pq_codes_offset + metadata_.pq_codes_bytes !=
+          metadata_.pq_offset + metadata_.pq_bytes) {
+    throw std::runtime_error("Packed graph PQ section metadata is invalid");
+  }
+  input_.clear();
+  input_.seekg(static_cast<std::streamoff>(metadata_.pq_offset), std::ios::beg);
+  pq_model_ = PqAdcModel::read(input_);
+  if (pq_model_.dim() != metadata_.pq_dim ||
+      pq_model_.subspaces() != metadata_.pq_subspaces ||
+      pq_model_.centroids() != metadata_.pq_centroids ||
+      pq_model_.vector_count() != metadata_.vector_count ||
+      metadata_.pq_offsets_bytes !=
+          (pq_model_.subspaces() + 1) * sizeof(std::uint64_t) ||
+      pq_model_.codebook_bytes() != metadata_.pq_codebook_bytes ||
+      pq_model_.code_bytes() != metadata_.pq_codes_bytes) {
+    throw std::runtime_error("Packed graph PQ model does not match its header");
   }
 
   node_to_page_.resize(static_cast<std::size_t>(metadata_.vector_count));
@@ -595,10 +624,8 @@ PackedDiskGraphIndex::initialize_search_state(
   }
 
   const std::vector<std::uint32_t> entries =
-      config.seed_ids.empty()
-          ? select_evenly_spaced_entries(metadata_.vector_count,
-                                         config.entry_count)
-          : config.seed_ids;
+      config.seed_ids.empty() ? std::vector<std::uint32_t>{0}
+                              : config.seed_ids;
 
   std::vector<std::uint32_t> accepted_entries;
   accepted_entries.reserve(entries.size());
@@ -611,8 +638,6 @@ PackedDiskGraphIndex::initialize_search_state(
     }
     accepted_entries.push_back(entry);
   }
-  state->entry_seed_ids = accepted_entries;
-
   const auto adc_start = std::chrono::steady_clock::now();
   state->adc_table = config.pq_model->build_adc_table(query);
   const auto adc_end = std::chrono::steady_clock::now();
@@ -640,165 +665,22 @@ PackedDiskGraphIndex::initialize_search_state(
               return lhs.distance < rhs.distance;
             });
 
-  state->entry_seed_ids.clear();
-  state->entry_seed_ids.reserve(ranked_entries.size());
   // entry point 按 PQ 距离顺序入堆，避免第一批扩展被任意 id 顺序主导。
   for (const auto& result : ranked_entries) {
-    state->entry_seed_ids.push_back(result.id);
     state->candidates.push(result);
     state->add_best(result);
   }
   return state;
 }
 
-std::vector<std::uint32_t> PackedDiskGraphIndex::collect_jit_frontier_pages(
-    SearchState& state, std::size_t effective_beam_width) const {
-  const std::size_t window_multiplier =
-      std::max<std::size_t>(1, state.config.jit_window_multiplier);
-  const std::size_t scan_width =
-      std::max<std::size_t>(1, effective_beam_width * window_multiplier);
-  auto frontier = state.candidates;
-  std::vector<SearchResult> window;
-  window.reserve(scan_width);
-  while (!frontier.empty() && window.size() < scan_width) {
-    const auto next = frontier.top();
-    frontier.pop();
-    if (!state.session.is_node_materialized(next.id)) {
-      window.push_back(next);
-    }
-  }
-
-  std::vector<std::uint32_t> page_ids;
-  page_ids.reserve(window.size());
-  for (const auto& candidate : window) {
-    page_ids.push_back(state.session.page_for_node(candidate.id));
-  }
-  return page_ids;
-}
-
-std::vector<std::uint32_t>
-PackedDiskGraphIndex::collect_entry_warmup_pages(
-    const SearchState& state) const {
-  if (state.entry_seed_ids.empty()) {
-    return {};
-  }
-  const std::size_t requested_beam_width =
-      state.config.beam_width == 0 ? state.config.search_width
-                                   : state.config.beam_width;
-  const std::size_t warmup_window =
-      std::min(state.entry_seed_ids.size(),
-               std::clamp(requested_beam_width, std::size_t{1},
-                          state.config.search_width));
-  std::vector<std::uint32_t> page_ids;
-  page_ids.reserve(warmup_window);
-  for (std::size_t i = 0; i < warmup_window; ++i) {
-    const auto entry = state.entry_seed_ids[i];
-    if (!state.session.is_node_materialized(entry)) {
-      page_ids.push_back(state.session.page_for_node(entry));
-    }
-  }
-  return page_ids;
-}
-
-std::vector<std::uint32_t>
-PackedDiskGraphIndex::collect_post_expand_lookahead_pages(
-    const SearchState& state, std::size_t effective_beam_width) const {
-  const std::size_t batch_width = std::max<std::size_t>(1, effective_beam_width);
-  const std::size_t window_multiplier =
-      std::max<std::size_t>(2, state.config.jit_window_multiplier);
-  const std::size_t scan_width = batch_width * window_multiplier;
-
-  auto frontier = state.candidates;
-  std::vector<std::uint32_t> lookahead_pages;
-  lookahead_pages.reserve(scan_width);
-
-  while (!frontier.empty() && lookahead_pages.size() < scan_width) {
-    const auto next = frontier.top();
-    frontier.pop();
-    if (state.session.is_node_materialized(next.id)) {
-      continue;
-    }
-
-    lookahead_pages.push_back(state.session.page_for_node(next.id));
-  }
-  return lookahead_pages;
-}
-
-PackedDiskGraphIndex::PostExpandPrefetchCandidates
-PackedDiskGraphIndex::collect_post_expand_prefetch_candidates(
-    SearchState& state,
-    const std::vector<std::vector<SearchResult>>&
-        ranked_neighbors_by_candidate,
-    std::size_t candidate_pool_size) const {
-  PostExpandPrefetchCandidates output;
-  if (candidate_pool_size == 0 || ranked_neighbors_by_candidate.empty()) {
-    return output;
-  }
-
-  std::vector<SearchResult> projected_frontier;
-  auto current_frontier = state.candidates;
-  projected_frontier.reserve(current_frontier.size());
-  while (!current_frontier.empty()) {
-    projected_frontier.push_back(current_frontier.top());
-    current_frontier.pop();
-  }
-  for (const auto& ranked_neighbors : ranked_neighbors_by_candidate) {
-    projected_frontier.insert(projected_frontier.end(),
-                              ranked_neighbors.begin(),
-                              ranked_neighbors.end());
-  }
-  std::sort(projected_frontier.begin(), projected_frontier.end(),
-            [](const SearchResult& lhs, const SearchResult& rhs) {
-              return lhs.distance == rhs.distance ? lhs.id < rhs.id
-                                                  : lhs.distance < rhs.distance;
-            });
-  if (projected_frontier.empty()) {
-    return output;
-  }
-
-  std::unordered_set<std::uint32_t> seen_pages;
-  seen_pages.reserve(candidate_pool_size);
-  output.ordered_page_sequence.reserve(candidate_pool_size);
-  output.ordered_unique_pages.reserve(candidate_pool_size);
-
-  const std::size_t beam = std::max<std::size_t>(
-      1, state.config.beam_width == 0 ? state.config.search_width
-                                      : state.config.beam_width);
-  for (std::size_t rank = 0; rank < projected_frontier.size(); ++rank) {
-    const std::uint32_t page_id =
-        state.session.page_for_node(projected_frontier[rank].id);
-    if (state.session.page_available_for_scheduling(page_id)) {
-      continue;
-    }
-
-    const auto seen = seen_pages.find(page_id);
-    if (seen == seen_pages.end() &&
-        output.ordered_unique_pages.size() >= candidate_pool_size) {
-      break;
-    }
-    output.ordered_page_sequence.push_back(page_id);
-    if (seen_pages.insert(page_id).second) {
-      output.ordered_unique_pages.push_back(page_id);
-      output.estimated_demand_step_deltas.emplace(
-          page_id, std::size_t{1} + rank / beam);
-    }
-  }
-
-  return output;
-}
-
-std::vector<std::uint32_t>
-PackedDiskGraphIndex::collect_rerank_lookahead_pages(
+std::vector<std::uint32_t> PackedDiskGraphIndex::collect_rerank_pages(
     const SearchState& state) const {
   std::vector<std::uint32_t> page_ids;
   if (state.output.topk.empty() || state.config.rerank_topk == 0) {
     return page_ids;
   }
-
-  const std::size_t rerank_limit = state.output.topk.size();
-  page_ids.reserve(rerank_limit);
-  for (std::size_t i = 0; i < rerank_limit; ++i) {
-    const auto& candidate = state.output.topk[i];
+  page_ids.reserve(state.output.topk.size());
+  for (const auto& candidate : state.output.topk) {
     const std::uint32_t page_id = state.session.page_for_node(candidate.id);
     if (std::find(page_ids.begin(), page_ids.end(), page_id) ==
         page_ids.end()) {
@@ -807,158 +689,6 @@ PackedDiskGraphIndex::collect_rerank_lookahead_pages(
   }
   return page_ids;
 }
-
-void PackedDiskGraphIndex::maybe_issue_prefetch(SearchState& state) const {
-  if (!post_expand_prefetch_enabled(state.config)) {
-    return;
-  }
-  const std::size_t prefetch_top_k =
-      state.config.prefetch_top_k == 0 ? state.config.prefetch_width
-                                       : state.config.prefetch_top_k;
-  if (pre_beam_prefetch_enabled(state.config) &&
-      state.config.prefetch_max_inflight <= prefetch_top_k) {
-    return;
-  }
-  if (state.session.async_prefetch_enabled()) {
-    state.session.drain_ready_pages();
-  }
-  if (!state.session.candidate_prefetch_enabled() ||
-      state.candidates.empty()) {
-    return;
-  }
-
-  const std::size_t requested_beam_width =
-      state.config.beam_width == 0 ? state.config.search_width
-                                   : state.config.beam_width;
-  const std::size_t effective_beam_width =
-      std::clamp(requested_beam_width, std::size_t{1},
-                 state.config.search_width);
-  const auto page_ids =
-      collect_post_expand_lookahead_pages(state, effective_beam_width);
-  state.session.submit_candidate_prefetch(page_ids, "post_expand");
-}
-
-std::size_t PackedDiskGraphIndex::maybe_issue_entry_warmup(
-    SearchState& state) const {
-  if (!entry_warmup_prefetch_enabled(state.config) ||
-      !state.session.async_prefetch_enabled() ||
-      state.entry_seed_ids.empty()) {
-    return 0;
-  }
-
-  const std::size_t max_jit_pages =
-      state.config.jit_prefetch_max_pages_per_query;
-  if (max_jit_pages > 0 &&
-      state.jit_prefetch_submitted_pages >= max_jit_pages) {
-    ++state.output.stats.jit_prefetch_budget_exhausted;
-    return 0;
-  }
-
-  const auto page_ids = collect_entry_warmup_pages(state);
-  if (page_ids.empty()) {
-    return 0;
-  }
-
-  std::vector<std::uint32_t> capped_pages;
-  if (max_jit_pages == 0) {
-    capped_pages = page_ids;
-  } else {
-    const std::size_t remaining_budget =
-        max_jit_pages - state.jit_prefetch_submitted_pages;
-    capped_pages.reserve(std::min(remaining_budget, page_ids.size()));
-    std::unordered_set<std::uint32_t> accepted_pages;
-    accepted_pages.reserve(page_ids.size());
-    for (const auto page_id : page_ids) {
-      if (accepted_pages.find(page_id) == accepted_pages.end() &&
-          accepted_pages.size() >= remaining_budget) {
-        ++state.output.stats.jit_prefetch_candidates_capped;
-        continue;
-      }
-      accepted_pages.insert(page_id);
-      capped_pages.push_back(page_id);
-    }
-  }
-
-  const std::size_t submitted =
-      state.session.submit_jit_prefetch(
-          capped_pages, "warmup_entry",
-          std::min<std::size_t>(2, capped_pages.size()), 1);
-  state.jit_prefetch_submitted_pages += submitted;
-  return submitted;
-}
-
-std::size_t PackedDiskGraphIndex::maybe_issue_rerank_prefetch(
-    SearchState& state,
-    const std::vector<std::uint32_t>& page_ids) const {
-  if (!rerank_prefetch_enabled(state.config) ||
-      !state.session.async_prefetch_enabled() ||
-      state.config.rerank_topk == 0 || state.output.topk.empty()) {
-    return 0;
-  }
-
-  if (page_ids.empty()) {
-    return 0;
-  }
-  return state.session.submit_jit_prefetch(page_ids, "rerank", 2, 1);
-}
-
-std::size_t PackedDiskGraphIndex::maybe_issue_jit_prefetch(
-    SearchState& state, std::size_t effective_beam_width) const {
-  if (!pre_beam_prefetch_enabled(state.config) ||
-      !state.session.async_prefetch_enabled() || state.candidates.empty()) {
-    return 0;
-  }
-  const std::size_t max_jit_pages =
-      state.config.jit_prefetch_max_pages_per_query;
-  if (max_jit_pages > 0 &&
-      state.jit_prefetch_submitted_pages >= max_jit_pages) {
-    ++state.output.stats.jit_prefetch_budget_exhausted;
-    return 0;
-  }
-  const std::size_t interval =
-      std::max<std::size_t>(1, state.config.jit_prefetch_interval_batches);
-  if (state.output.stats.batch_count % interval != 0) {
-    ++state.output.stats.jit_prefetch_skipped_by_interval;
-    return 0;
-  }
-  const auto page_ids = collect_jit_frontier_pages(state, effective_beam_width);
-  if (page_ids.empty()) {
-    return 0;
-  }
-  const std::size_t remaining_budget =
-      max_jit_pages == 0
-          ? std::numeric_limits<std::size_t>::max()
-          : max_jit_pages - state.jit_prefetch_submitted_pages;
-  std::vector<std::uint32_t> capped_pages;
-  capped_pages.reserve(std::min(remaining_budget, page_ids.size()));
-  std::unordered_set<std::uint32_t> seen_pages;
-  seen_pages.reserve(page_ids.size());
-  for (std::size_t i = 0; i < page_ids.size(); ++i) {
-    const std::uint32_t page_id = page_ids[i];
-    if (!seen_pages.insert(page_id).second ||
-        state.session.page_available_for_scheduling(page_id)) {
-      continue;
-    }
-    capped_pages.push_back(page_id);
-    if (capped_pages.size() >= remaining_budget) {
-      if (i + 1 < page_ids.size()) {
-        state.output.stats.jit_prefetch_candidates_capped +=
-            page_ids.size() - i - 1;
-      }
-      break;
-    }
-  }
-  if (capped_pages.empty()) {
-    return 0;
-  }
-  ++state.output.stats.jit_prefetch_windows;
-  const std::size_t submitted = state.session.submit_jit_prefetch(
-      capped_pages, "pre_beam",
-      std::min<std::size_t>(2, remaining_budget));
-  state.jit_prefetch_submitted_pages += submitted;
-  return submitted;
-}
-
 std::vector<SearchResult> PackedDiskGraphIndex::select_candidate_batch(
     SearchState& state, std::size_t effective_beam_width) const {
   std::vector<SearchResult> window;
@@ -985,60 +715,20 @@ std::vector<SearchResult> PackedDiskGraphIndex::select_candidate_batch(
   for (const auto& candidate : window) {
     const std::uint32_t page_id = state.session.page_for_node(candidate.id);
     batch_pages.insert(page_id);
-    if (state.session.page_available_for_scheduling(page_id)) {
+    if (state.session.page_available(page_id)) {
       available_pages.insert(page_id);
     }
   }
   state.output.stats.beam_unique_pages += batch_pages.size();
-  state.output.stats.beam_cached_or_pending_pages += available_pages.size();
+  state.output.stats.beam_cached_pages += available_pages.size();
   return window;
 }
 
-void PackedDiskGraphIndex::expand_candidate(SearchState& state,
-                                            const SearchResult& current) {
-  const DiskNode& node = state.load_node(current.id);
-  (void)state.session.pin_page(state.session.page_for_node(current.id));
-  ++state.output.stats.expanded;
-
-  std::vector<std::uint32_t> new_neighbors;
-  new_neighbors.reserve(node.neighbors.size());
-  for (const auto neighbor_id : node.neighbors) {
-    if (neighbor_id >= metadata_.vector_count ||
-        !state.visited.insert(neighbor_id).second) {
-      continue;
-    }
-    new_neighbors.push_back(neighbor_id);
-  }
-
-  std::vector<SearchResult> ranked_neighbors;
-  ranked_neighbors = state.rank_neighbors_by_distance(new_neighbors);
-  new_neighbors.clear();
-  new_neighbors.reserve(ranked_neighbors.size());
-  for (const auto& neighbor : ranked_neighbors) {
-    new_neighbors.push_back(neighbor.id);
-  }
-
-  for (const auto& candidate : ranked_neighbors) {
-    state.candidates.push(candidate);
-    state.add_best(candidate);
-  }
-}
-
 void PackedDiskGraphIndex::expand_candidate_batch(
-    SearchState& state, const std::vector<SearchResult>& batch) {
+    SearchState& state, const std::vector<SearchResult>& batch,
+    std::size_t effective_beam_width) {
   std::vector<std::vector<SearchResult>> ranked_neighbors_by_candidate;
   ranked_neighbors_by_candidate.reserve(batch.size());
-
-  const std::size_t beam =
-      state.config.beam_width == 0 ? state.config.search_width
-                                   : state.config.beam_width;
-  const std::size_t candidate_pool_size =
-      effective_post_expand_candidate_pool_size(state.config, beam);
-  const std::size_t submit_top_k =
-      effective_post_expand_submit_top_k(state.config);
-  const bool neighbor_prefetch_enabled =
-      !state.session.has_prefetch_model() ||
-      post_expand_prefetch_enabled(state.config);
 
   for (const auto& current : batch) {
     const DiskNode& node = state.load_node(current.id);
@@ -1061,25 +751,37 @@ void PackedDiskGraphIndex::expand_candidate_batch(
     ranked_neighbors_by_candidate.push_back(std::move(ranked_neighbors));
   }
 
-  if (neighbor_prefetch_enabled &&
-      state.session.async_prefetch_enabled() && submit_top_k > 0) {
-    const auto prefetch_candidates = collect_post_expand_prefetch_candidates(
-        state, ranked_neighbors_by_candidate, candidate_pool_size);
-    if (state.session.has_prefetch_model()) {
-      // ML 路径：XGBoost 二次精选（页面聚合 + 特征打分 + 限流）
-      state.session.submit_candidate_prefetch(
-          prefetch_candidates.ordered_page_sequence, "post_expand",
-          submit_top_k,
-          prefetch_candidates.estimated_demand_step_deltas);
-    } else if (!prefetch_candidates.ordered_unique_pages.empty()) {
-      // 纯 PQ 路径：直接提交（Agent-Mem-IO 风格，已验证超过 baseline）
-      std::vector<std::uint32_t> pages =
-          prefetch_candidates.ordered_unique_pages;
-      if (pages.size() > submit_top_k) {
-        pages.resize(submit_top_k);
-      }
-      state.session.submit_pages_direct(pages);
+  if (state.config.prefetch_policy == "topology") {
+    const auto planner_start = std::chrono::steady_clock::now();
+    const std::size_t candidate_limit =
+        std::max<std::size_t>(1, effective_beam_width) * 2;
+    std::priority_queue<SearchResult, std::vector<SearchResult>, CloserFirst>
+        projected_frontier = state.candidates;
+    for (const auto& ranked : ranked_neighbors_by_candidate) {
+      for (const auto& candidate : ranked) projected_frontier.push(candidate);
     }
+    const std::size_t scan_limit =
+        std::min(projected_frontier.size(), candidate_limit);
+    state.output.stats.prefetch_candidate_nodes += scan_limit;
+    std::vector<std::uint32_t> ranked_page_ids;
+    ranked_page_ids.reserve(scan_limit);
+    for (std::size_t rank = 0; rank < scan_limit; ++rank) {
+      const auto candidate = projected_frontier.top();
+      projected_frontier.pop();
+      if (state.session.is_node_materialized(candidate.id)) continue;
+      const std::uint32_t page_id = state.session.page_for_node(candidate.id);
+      ranked_page_ids.push_back(page_id);
+    }
+    const auto ranked_pages = rank_topology_pages(ranked_page_ids, scan_limit);
+    state.session.record_topology_candidates(ranked_pages);
+    std::vector<std::uint32_t> page_ids;
+    page_ids.reserve(ranked_pages.size());
+    for (const auto& page : ranked_pages) page_ids.push_back(page.page_id);
+    state.output.stats.prefetch_candidate_pages += page_ids.size();
+    (void)state.session.submit_topology_prefetch(page_ids);
+    state.output.stats.prefetch_planner_cpu_us +=
+        std::chrono::duration<double, std::micro>(
+            std::chrono::steady_clock::now() - planner_start).count();
   }
 
   // 将 PQ 排序后的邻居推入候选堆（CPU 计算已在 rank_neighbors_by_distance 中完成）
@@ -1095,16 +797,8 @@ void PackedDiskGraphIndex::finalize_topk(SearchState& state) {
   state.output.stats.visited = state.visited.size();
   state.output.topk = sorted_results(state.best);
   if (!state.adc_table.empty() && state.config.rerank_topk > 0) {
-    // 以两页为一组滚动预取；下一组 I/O 与当前组 exact distance 计算重叠。
-    const auto rerank_pages = collect_rerank_lookahead_pages(state);
+    const auto rerank_pages = collect_rerank_pages(state);
     constexpr std::size_t kRerankChunkPages = 2;
-    if (!rerank_pages.empty()) {
-      const std::size_t first_end =
-          std::min(kRerankChunkPages, rerank_pages.size());
-      (void)maybe_issue_rerank_prefetch(
-          state, std::vector<std::uint32_t>(rerank_pages.begin(),
-                                           rerank_pages.begin() + first_end));
-    }
     const std::size_t reads_before_rerank = state.output.stats.node_reads;
     for (std::size_t begin = 0; begin < rerank_pages.size();
          begin += kRerankChunkPages) {
@@ -1113,14 +807,6 @@ void PackedDiskGraphIndex::finalize_topk(SearchState& state) {
       const std::vector<std::uint32_t> current_pages(
           rerank_pages.begin() + begin, rerank_pages.begin() + end);
       state.session.ensure_pages_loaded_batch(current_pages);
-
-      const std::size_t next_end =
-          std::min(end + kRerankChunkPages, rerank_pages.size());
-      if (end < next_end) {
-        (void)maybe_issue_rerank_prefetch(
-            state, std::vector<std::uint32_t>(rerank_pages.begin() + end,
-                                             rerank_pages.begin() + next_end));
-      }
 
       const std::unordered_set<std::uint32_t> current_page_set(
           current_pages.begin(), current_pages.end());
@@ -1161,6 +847,25 @@ DiskGraphSearchResult PackedDiskGraphIndex::search_one(
       config.entry_count == 0) {
     throw std::runtime_error("Packed graph search top_k, search_width, and entry_count must be positive");
   }
+  if (config.prefetch_policy != "none" &&
+      config.prefetch_policy != "topology") {
+    throw std::runtime_error(
+        "Packed graph prefetch policy must be none or topology");
+  }
+  DiskGraphSearchConfig effective_config = config;
+  if (effective_config.pq_model != nullptr) {
+    const auto& external = *effective_config.pq_model;
+    if (!external.enabled() || external.dim() != pq_model_.dim() ||
+        external.subspaces() != pq_model_.subspaces() ||
+        external.centroids() != pq_model_.centroids() ||
+        external.vector_count() != pq_model_.vector_count()) {
+      throw std::runtime_error(
+          "External PQ model does not match the packed V3 index");
+    }
+  } else {
+    effective_config.pq_model = &pq_model_;
+  }
+  effective_config.adc_enable = true;
   const std::size_t effective_beam_width =
       std::clamp(config.beam_width == 0 ? config.search_width
                                          : config.beam_width,
@@ -1168,17 +873,9 @@ DiskGraphSearchResult PackedDiskGraphIndex::search_one(
 
   DiskGraphSearchResult output;
   output.stats.search_mutex_wait_us = search_mutex_wait_us;
-  auto state = initialize_search_state(query, config, output);
-  state->session.set_search_step(0);
-  (void)maybe_issue_entry_warmup(*state);
+  auto state = initialize_search_state(query, effective_config, output);
   while (!state->candidates.empty() &&
          output.stats.expanded < config.search_width) {
-    state->session.set_search_step(output.stats.batch_count);
-    // 收割上一轮 expand 期间完成的预取
-    if (state->session.async_prefetch_enabled()) {
-      state->session.drain_ready_pages();
-    }
-    (void)maybe_issue_jit_prefetch(*state, effective_beam_width);
     std::vector<SearchResult> batch =
         select_candidate_batch(*state, effective_beam_width);
     if (batch.empty()) {
@@ -1190,7 +887,6 @@ DiskGraphSearchResult PackedDiskGraphIndex::search_one(
     for (const auto& candidate : batch) {
       page_ids.push_back(state->session.page_for_node(candidate.id));
     }
-    // 加载当前 batch：上一轮 expand 结束时提交的预取 I/O 在此完成 → ready_hit
     state->session.ensure_pages_loaded_batch(page_ids);
 
     ++output.stats.batch_count;
@@ -1198,11 +894,8 @@ DiskGraphSearchResult PackedDiskGraphIndex::search_one(
     output.stats.max_batch_size =
         std::max(output.stats.max_batch_size, batch.size());
 
-    // expand：加载邻居 → PQ ADC 排序 → 收集 top beam_width*2 页面 → 提交预取
-    // 滚动流水线：下一轮 load_pages 时 I/O 已完成
-    expand_candidate_batch(*state, batch);
+    expand_candidate_batch(*state, batch, effective_beam_width);
   }
-  state->session.set_search_step(output.stats.batch_count);
   finalize_topk(*state);
   return output;
 }

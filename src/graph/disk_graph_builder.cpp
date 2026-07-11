@@ -1,4 +1,4 @@
-#include "agent_aware/graph/disk_graph_builder.h"
+#include "graph/disk_graph_builder.h"
 
 #include <algorithm>
 #include <deque>
@@ -7,17 +7,16 @@
 #include <stdexcept>
 #include <vector>
 
-#include "agent_aware/graph/disk_page_codec.h"
-#include "agent_aware/graph/vamana_builder.h"
+#include "graph/disk_page_codec.h"
+#include "graph/vamana_builder.h"
 
 namespace agent_aware {
 namespace {
 
-constexpr char kPackedMagic[8] = {'A', 'M', 'F', 'P', 'V', '2', '\0', '\0'};
-constexpr std::uint32_t kPackedVersion = 2;
 constexpr std::uint64_t kRecordsOffset = 4096;
+constexpr std::uint64_t kSerializedPqHeaderBytes = 48;
 
-std::vector<std::vector<std::uint32_t>> build_vamana_graph(
+VamanaGraph build_vamana_graph(
     const VectorSet& base, const DiskGraphBuildConfig& config) {
   VamanaBuildConfig options;
   options.max_degree = config.degree;
@@ -26,7 +25,7 @@ std::vector<std::vector<std::uint32_t>> build_vamana_graph(
   options.seed = config.random_seed;
   options.add_reverse_edges = true;
   options.deleted_ids = config.deleted_ids;
-  return VamanaBuilder(options).build(base).adjacency;
+  return VamanaBuilder(options).build(base);
 }
 
 std::vector<std::uint32_t> bfs_order(
@@ -75,31 +74,29 @@ void validate_build(const VectorSet& base,
 
 }  // namespace
 
-void PackedDiskGraphBuilder::build(const VectorSet& base,
-                                   const std::string& path,
-                                   const DiskGraphBuildConfig& config) {
+DiskGraphBuildResult PackedDiskGraphBuilder::build(
+    const VectorSet& base, const std::string& path,
+    const DiskGraphBuildConfig& config) {
   validate_build(base, config);
-  const std::size_t pq_code_bytes =
-      config.pq_model != nullptr && config.pq_model->enabled()
-          ? config.pq_model->subspaces()
-          : 0;
-  if (pq_code_bytes > 0 && config.pq_model->vector_count() < base.size()) {
+  const bool has_pq = config.pq_model != nullptr && config.pq_model->enabled();
+  if (has_pq && config.pq_model->vector_count() != base.size()) {
     throw std::runtime_error("PQ model does not cover packed graph base vectors");
   }
 
   const std::size_t nodes_per_page = packed_nodes_per_page(
-      base.dim, config.degree, config.page_size, pq_code_bytes);
+      base.dim, config.degree, config.page_size);
   if (nodes_per_page == 0) {
     throw std::runtime_error("Packed page cannot hold even one node");
   }
 
-  const auto graph = build_vamana_graph(base, config);
+  const auto built_graph = build_vamana_graph(base, config);
+  const auto& graph = built_graph.adjacency;
   const auto order = bfs_order(graph);
   const std::uint64_t page_count =
       (static_cast<std::uint64_t>(base.size()) + nodes_per_page - 1) /
       nodes_per_page;
   if (page_count > std::numeric_limits<std::uint32_t>::max()) {
-    throw std::runtime_error("Too many packed pages for V2 directory");
+    throw std::runtime_error("Too many packed pages for V3 directory");
   }
 
   const std::uint64_t directory_offset = kRecordsOffset;
@@ -107,6 +104,24 @@ void PackedDiskGraphBuilder::build(const VectorSet& base,
       static_cast<std::uint64_t>(base.size()) * sizeof(std::uint32_t);
   const std::uint64_t records_offset =
       align_up(directory_offset + directory_bytes, config.page_size);
+  const std::uint64_t records_bytes = page_count * config.page_size;
+  const std::uint64_t pq_offset = records_offset + records_bytes;
+  const std::uint64_t pq_offsets_bytes =
+      has_pq ? (config.pq_model->offsets().size() * sizeof(std::uint64_t)) : 0;
+  const std::uint64_t pq_codebook_bytes =
+      has_pq ? config.pq_model->codebook_bytes() : 0;
+  const std::uint64_t pq_codes_bytes =
+      has_pq ? config.pq_model->code_bytes() : 0;
+  const std::uint64_t pq_bytes =
+      has_pq ? kSerializedPqHeaderBytes + pq_offsets_bytes +
+                   pq_codebook_bytes + pq_codes_bytes
+             : 0;
+  const std::uint64_t pq_offsets_offset =
+      has_pq ? pq_offset + kSerializedPqHeaderBytes : 0;
+  const std::uint64_t pq_codebook_offset =
+      has_pq ? pq_offsets_offset + pq_offsets_bytes : 0;
+  const std::uint64_t pq_codes_offset =
+      has_pq ? pq_codebook_offset + pq_codebook_bytes : 0;
 
   std::vector<std::uint32_t> node_to_page(base.size(), 0);
   for (std::size_t position = 0; position < order.size(); ++position) {
@@ -119,8 +134,8 @@ void PackedDiskGraphBuilder::build(const VectorSet& base,
     throw std::runtime_error("Cannot create packed graph index: " + path);
   }
 
-  output.write(kPackedMagic, sizeof(kPackedMagic));
-  write_value(output, kPackedVersion);
+  output.write(kPackedGraphMagic.data(), kPackedGraphMagic.size());
+  write_value(output, kPackedGraphVersion);
   write_value(output, static_cast<std::uint64_t>(base.size()));
   write_value(output, static_cast<std::uint32_t>(base.dim));
   write_value(output, static_cast<std::uint32_t>(config.degree));
@@ -129,7 +144,17 @@ void PackedDiskGraphBuilder::build(const VectorSet& base,
   write_value(output, directory_offset);
   write_value(output, page_count);
   write_value(output, static_cast<std::uint32_t>(nodes_per_page));
-  write_value(output, static_cast<std::uint32_t>(pq_code_bytes));
+  write_value(output, static_cast<std::uint32_t>(has_pq ? config.pq_model->subspaces() : 0));
+  write_value(output, static_cast<std::uint32_t>(has_pq ? config.pq_model->centroids() : 0));
+  write_value(output, static_cast<std::uint32_t>(has_pq ? config.pq_model->dim() : 0));
+  write_value(output, has_pq ? pq_offset : std::uint64_t{0});
+  write_value(output, pq_bytes);
+  write_value(output, pq_offsets_offset);
+  write_value(output, pq_offsets_bytes);
+  write_value(output, pq_codebook_offset);
+  write_value(output, pq_codebook_bytes);
+  write_value(output, pq_codes_offset);
+  write_value(output, pq_codes_bytes);
 
   const auto header_pos = static_cast<std::uint64_t>(output.tellp());
   if (header_pos > kRecordsOffset) {
@@ -154,12 +179,19 @@ void PackedDiskGraphBuilder::build(const VectorSet& base,
   for (std::uint64_t page_id = 0; page_id < page_count; ++page_id) {
     const auto page = DiskPageCodec::encode_packed_page(
         static_cast<std::uint32_t>(page_id), base, graph, order,
-        nodes_per_page, config.page_size, config.degree, config.pq_model);
+        nodes_per_page, config.page_size, config.degree);
     output.write(page.data(), static_cast<std::streamsize>(page.size()));
     if (!output) {
       throw std::runtime_error("Failed while writing packed graph page");
     }
   }
+  if (has_pq) {
+    config.pq_model->write(output);
+  }
+  if (!output) {
+    throw std::runtime_error("Failed while finalizing packed graph index");
+  }
+  return DiskGraphBuildResult{built_graph.medoid};
 }
 
 }  // namespace agent_aware

@@ -1,4 +1,4 @@
-#include "agent_aware/engine/storage_engine.h"
+#include "engine/storage_engine.h"
 
 #include <chrono>
 #include <stdexcept>
@@ -8,6 +8,9 @@ namespace agent_aware {
 
 PackedGraphEngine::PackedGraphEngine(PackedGraphEngineConfig config)
     : config_(std::move(config)), index_(config_.index_path) {
+  config_.search.pq_model =
+      config_.pq_model ? config_.pq_model.get() : &index_.pq_model();
+  config_.search.adc_enable = true;
   index_.configure_cache(config_.cache_policy, config_.cache_pages,
                          config_.protect_hot_pages,
                          config_.hot_degree_threshold);

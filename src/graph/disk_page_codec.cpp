@@ -1,4 +1,4 @@
-#include "agent_aware/graph/disk_page_codec.h"
+#include "graph/disk_page_codec.h"
 
 #include <algorithm>
 #include <limits>
@@ -7,12 +7,11 @@
 namespace agent_aware {
 
 // Packed page 使用 SoA 布局：
-// page header -> ids -> degrees -> vectors -> neighbor ids -> neighbor PQ codes。
+// page header -> ids -> degrees -> vectors -> neighbor ids。
 // decode 必须严格按 encode 的顺序消费字段。
-std::size_t graph_record_bytes(std::size_t dim, std::size_t degree,
-                               std::size_t neighbor_pq_code_bytes) {
+std::size_t graph_record_bytes(std::size_t dim, std::size_t degree) {
   return sizeof(std::uint32_t) * 2 + dim * sizeof(float) +
-         degree * sizeof(std::uint32_t) + degree * neighbor_pq_code_bytes;
+         degree * sizeof(std::uint32_t);
 }
 
 std::uint64_t align_up(std::uint64_t value, std::uint64_t alignment) {
@@ -24,15 +23,13 @@ std::uint64_t align_up(std::uint64_t value, std::uint64_t alignment) {
 }
 
 std::size_t packed_nodes_per_page(std::size_t dim, std::size_t degree,
-                                  std::size_t page_size,
-                                  std::size_t neighbor_pq_code_bytes) {
+                                  std::size_t page_size) {
   if (page_size <= sizeof(std::uint32_t) * 2) {
     return 0;
   }
   const std::size_t per_node = sizeof(std::uint32_t) * 2 +
                                dim * sizeof(float) +
-                               degree * sizeof(std::uint32_t) +
-                               degree * neighbor_pq_code_bytes;
+                               degree * sizeof(std::uint32_t);
   return (page_size - sizeof(std::uint32_t) * 2) / per_node;
 }
 
@@ -40,13 +37,7 @@ std::vector<char> DiskPageCodec::encode_packed_page(
     std::uint32_t page_id, const VectorSet& base,
     const std::vector<std::vector<std::uint32_t>>& graph,
     const std::vector<std::uint32_t>& order, std::size_t nodes_per_page,
-    std::size_t page_size, std::size_t degree,
-    const PqAdcModel* pq_model) {
-  const std::size_t pq_code_bytes =
-      pq_model != nullptr && pq_model->enabled() ? pq_model->subspaces() : 0;
-  if (pq_code_bytes > 0 && pq_model->vector_count() < base.size()) {
-    throw std::runtime_error("PQ model does not cover packed graph base vectors");
-  }
+    std::size_t page_size, std::size_t degree) {
   const std::size_t begin = static_cast<std::size_t>(page_id) * nodes_per_page;
   const std::size_t end = std::min(begin + nodes_per_page, order.size());
   const auto node_count = static_cast<std::uint32_t>(end - begin);
@@ -93,31 +84,6 @@ std::vector<char> DiskPageCodec::encode_packed_page(
         neighbor = graph[node_id][n];
       }
       put_bytes(page, offset, neighbor);
-    }
-  }
-
-  if (pq_code_bytes > 0) {
-    const auto& codes = pq_model->codes();
-    // 邻居 PQ code 与边表相邻存储，扩展时可先用 ADC 排序，再决定是否读取邻居向量页。
-    for (std::size_t slot = 0; slot < nodes_per_page; ++slot) {
-      const std::uint32_t node_id =
-          slot < node_count ? order[begin + slot]
-                            : std::numeric_limits<std::uint32_t>::max();
-      for (std::size_t n = 0; n < degree; ++n) {
-        const bool has_neighbor =
-            slot < node_count && n < graph[node_id].size() &&
-            graph[node_id][n] != std::numeric_limits<std::uint32_t>::max();
-        const std::uint32_t neighbor =
-            has_neighbor ? graph[node_id][n]
-                         : std::numeric_limits<std::uint32_t>::max();
-        for (std::size_t b = 0; b < pq_code_bytes; ++b) {
-          std::uint8_t code = 0;
-          if (has_neighbor) {
-            code = codes[static_cast<std::size_t>(neighbor) * pq_code_bytes + b];
-          }
-          put_bytes(page, offset, code);
-        }
-      }
     }
   }
 
@@ -174,28 +140,6 @@ PackedDiskGraphIndex::DecodedPage DiskPageCodec::decode_packed_page(
     }
     if (slot < node_count) {
       decoded.nodes[slot].neighbors = std::move(neighbors);
-    }
-  }
-
-  const std::size_t pq_code_bytes = metadata.neighbor_pq_code_bytes;
-  if (pq_code_bytes > 0) {
-    for (std::uint32_t slot = 0; slot < metadata.nodes_per_page; ++slot) {
-      std::vector<std::uint8_t> codes;
-      if (slot < node_count) {
-        codes.resize(static_cast<std::size_t>(degrees[slot]) * pq_code_bytes);
-      }
-      std::size_t written = 0;
-      for (std::uint32_t n = 0; n < metadata.degree; ++n) {
-        for (std::size_t b = 0; b < pq_code_bytes; ++b) {
-          const auto code = get_bytes<std::uint8_t>(decoded.bytes, cursor);
-          if (slot < node_count && n < degrees[slot]) {
-            codes[written++] = code;
-          }
-        }
-      }
-      if (slot < node_count) {
-        decoded.nodes[slot].neighbor_pq_codes = std::move(codes);
-      }
     }
   }
 

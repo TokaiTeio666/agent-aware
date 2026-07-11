@@ -5,7 +5,6 @@
 
 ## 实验目标
 
-在 Recall@10 不低于 `0.95` 的前提下，降低单查询延迟、尾延迟和 SSD 读取量。该实验关闭预取，避免把搜索预算变化和预取策略收益混在一起；选出的参数用于后续 no-prefetch / PQ-direct / XGBoost 三臂 A/B。
 
 ## 固定条件
 
@@ -20,7 +19,6 @@
 | exact rerank top-k | `100` |
 | cache | `graph-aware-2q`，15,000 pages |
 | I/O | io_uring，batch 16，depth 32，O_DIRECT effective |
-| prefetch | disabled |
 | index | `indexes/sift.idx`，不重建 |
 | binary commit | `91406a839e42500f11e8c13b9073aa46a6b5775a`，dirty worktree |
 | environment | WSL2 开发环境 |
@@ -48,7 +46,6 @@ SW=156
   --pq-train-limit 100000 \
   --pq-iterations 8 \
   --rerank-topk 100 \
-  --enable-prefetch 0 \
   --cache-policy graph-aware-2q \
   --cache-pages 15000 \
   --memory-budget-ratio 0.20 \
@@ -92,6 +89,5 @@ io_mode=io_uring
 
 1. 对 `156` 再运行两轮，报告 Avg/P95/P99/QPS 的中位数与波动范围。
 2. 补测 `144` 和 `168`，确认局部拐点不是离散采样造成。
-3. 在固定 `156` 的条件下运行 no-prefetch / PQ-direct / XGBoost 配对 A/B。
 4. 在真实 NVMe 或比赛环境复跑，WSL2 数据只作为开发验证。
 5. 记录进程真实 RSS；当前 `estimated_resident_ratio=0.198505` 只统计模型、目录和 cache 的预算估算，不等同于进程总常驻内存。

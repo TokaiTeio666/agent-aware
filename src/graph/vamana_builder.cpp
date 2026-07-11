@@ -1,4 +1,4 @@
-#include "agent_aware/graph/vamana_builder.h"
+#include "graph/vamana_builder.h"
 
 #include <algorithm>
 #include <limits>
@@ -9,7 +9,7 @@
 #include <unordered_set>
 #include <utility>
 
-#include "agent_aware/core/simd_distance.h"
+#include "core/simd_distance.h"
 
 namespace agent_aware {
 namespace {

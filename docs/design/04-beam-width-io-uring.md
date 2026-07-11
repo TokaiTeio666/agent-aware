@@ -29,7 +29,6 @@
 4. `SearchConfig` 中已经分别有 `search_width` 和 `beam_width`。
 5. packed 搜索逻辑在 `disk_graph_index.cpp` 中。
 6. naive 搜索逻辑在 `naive_disk_graph_index.cpp` 中。
-7. 之前已经拆分过 `QueryPageSession`，负责 query-level page/cache/prefetch 生命周期。
 8. 项目目标是降低 P99，同时保持 `SIFT1M Recall@10 >= 0.95`，并通过 `memory_budget_pass=1`。
 
 2026-07-11 的 SIFT1M 首轮扫描表明，`search_width=156`、`beam_width=16` 是当前已测点中的推荐平衡口径：Recall@10 `0.9748`、avg `48.10 ms`、P99 `66.29 ms`、QPS `20.79`。`128` 的 Recall 为 `0.9610`，但 exact rerank reads 为 `28.68/query`，高于 `156` 的 `6.36/query`；因此不能只按总扩展预算推断端到端延迟。完整数据见 `docs/experiments/search-width-tuning.md`。

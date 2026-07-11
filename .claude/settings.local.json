@@ -1,12 +1,6 @@
 {
   "permissions": {
     "allow": [
-      "Bash(awk -F, 'NR>1{labels[$NF]++} END{for\\(l in labels\\) print \"label=\"l, \"count=\"labels[l]}' /home/liang/agent-aware/build/sift_train_q0_99_trace.csv)",
-      "Bash(awk -F, 'NR>1{triggers[$3]++} END{for\\(t in triggers\\) print \"trigger=\"t, \"count=\"triggers[t]}' /home/liang/agent-aware/build/sift_train_q0_99_trace.csv)",
-      "Bash(awk -F, 'NR>1{p[$13]++} END{for\\(k in p\\) print \"was_prefetched=\"k, \"count=\"p[k]}' /home/liang/agent-aware/build/sift_train_q0_99_trace.csv)",
-      "Bash(awk -F, 'NR>1{d[$15]++} END{for\\(k in d\\) print \"was_demanded=\"k, \"count=\"d[k]}' /home/liang/agent-aware/build/sift_train_q0_99_trace.csv)",
-      "Bash(awk -F, 'NR>1{s[$12]++} END{for\\(k in s\\) print \"selected=\"k, \"count=\"s[k]}' /home/liang/agent-aware/build/sift_train_q0_99_trace.csv)",
-      "Bash(awk -F, 'NR>1{if\\($12==0\\)s[$11]++} END{for\\(k in s\\) print \"skip=\"k, \"count=\"s[k]}' /home/liang/agent-aware/build/sift_train_q0_99_trace.csv)",
       "Bash(mkdir -p build)",
       "Bash(cmake .. -DCMAKE_BUILD_TYPE=Release)",
       "WebSearch",

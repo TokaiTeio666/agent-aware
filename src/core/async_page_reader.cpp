@@ -1,4 +1,4 @@
-#include "agent_aware/core/async_page_reader.h"
+#include "core/async_page_reader.h"
 
 #include <algorithm>
 #include <cerrno>
@@ -10,7 +10,7 @@
 #include <unordered_map>
 #include <utility>
 
-#include "agent_aware/graph/disk_graph_index.h"
+#include "graph/disk_graph_index.h"
 
 #ifdef __linux__
 #include <fcntl.h>
@@ -424,46 +424,44 @@ struct AsyncPageReader::Impl {
 #endif
   }
 
-  std::vector<AsyncPageReader::SubmittedRead> batch_submit(
+  std::vector<AsyncPageReader::SubmittedRead> queue_reads(
       const std::vector<AsyncPageReader::ReadRequest>& read_requests,
       DiskGraphSearchStats& stats) {
-    std::vector<AsyncPageReader::SubmittedRead> submitted;
-    submitted.reserve(read_requests.size());
+    std::vector<AsyncPageReader::SubmittedRead> queued;
+    queued.reserve(read_requests.size());
     if (read_requests.empty()) {
-      return submitted;
+      return queued;
     }
 
     if (!async_enabled()) {
-      // 非异步模式也返回 SubmittedRead token，让批量调用方复用同一条完成路径。
+      // 非异步模式同步完成读取，但仍返回 token，让调用方复用同一条完成路径。
       for (const auto& request : read_requests) {
         const std::uint64_t token = next_async_token++;
         inline_completions.push_back(
             AsyncPageReader::CompletedRead{token,
                                            read(request.offset, request.bytes,
                                                 stats)});
-        submitted.push_back(AsyncPageReader::SubmittedRead{request.page_id,
-                                                           token});
+        queued.push_back(
+            AsyncPageReader::SubmittedRead{request.page_id, token});
       }
-      return submitted;
+      return queued;
     }
 
-    const std::size_t batch_limit =
-        std::max<std::size_t>(1, std::min(status.batch_size,
-                                          std::max<std::size_t>(
-                                              1, max_pending_reads())));
-    std::size_t queued_in_batch = 0;
     for (const auto& request : read_requests) {
       const std::uint64_t token =
           start_async_read(request.offset, request.bytes, stats);
-      submitted.push_back(AsyncPageReader::SubmittedRead{request.page_id,
-                                                         token});
-      ++queued_in_batch;
-      if (queued_in_batch >= batch_limit) {
-        submit_async_reads(stats);
-        queued_in_batch = 0;
-      }
+      queued.push_back(
+          AsyncPageReader::SubmittedRead{request.page_id, token});
     }
-    if (queued_in_batch > 0) {
+
+    return queued;
+  }
+
+  std::vector<AsyncPageReader::SubmittedRead> batch_submit(
+      const std::vector<AsyncPageReader::ReadRequest>& read_requests,
+      DiskGraphSearchStats& stats) {
+    auto submitted = queue_reads(read_requests, stats);
+    if (!submitted.empty()) {
       submit_async_reads(stats);
     }
     return submitted;
@@ -687,7 +685,12 @@ struct AsyncPageReader::Impl {
 #ifdef __linux__
 #if AGENT_AWARE_ASYNC_CAN_USE_LIBURING
     // 销毁 ring 和文件描述符前先收割未完成 CQE，确保池中的 direct-I/O buffer 都被归还。
-    while (!async_buffers.empty()) {
+    bool queued_submitted = true;
+    if (!async_buffers.empty()) {
+      std::string reason;
+      queued_submitted = ring.submit_queued(reason);
+    }
+    while (queued_submitted && !async_buffers.empty()) {
       LibUring::Completion completion;
       std::string reason;
       if (!ring.pop_completion(completion, true, reason)) {
@@ -775,6 +778,12 @@ std::vector<char> AsyncPageReader::read(std::uint64_t offset,
 std::uint64_t AsyncPageReader::start_async_read(
     std::uint64_t offset, std::size_t bytes, DiskGraphSearchStats& stats) {
   return impl_->start_async_read(offset, bytes, stats);
+}
+
+std::vector<AsyncPageReader::SubmittedRead> AsyncPageReader::queue_reads(
+    const std::vector<ReadRequest>& read_requests,
+    DiskGraphSearchStats& stats) {
+  return impl_->queue_reads(read_requests, stats);
 }
 
 std::vector<AsyncPageReader::SubmittedRead> AsyncPageReader::batch_submit(

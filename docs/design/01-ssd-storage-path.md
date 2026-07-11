@@ -60,7 +60,6 @@ static constexpr size_t kPageSize = 4096;
 
 1. `node_id -> 文件偏移` 可以直接计算：`offset = header_size + node_id * 4096`。
 2. 适合 SSD page-level 随机读。
-3. 后续可以直接接入 `pread`、`io_uring`、page cache、block cache、prefetch。
 
 建议一个 4KB record 包含：
 

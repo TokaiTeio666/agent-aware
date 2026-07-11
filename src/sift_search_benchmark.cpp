@@ -11,6 +11,7 @@
 #include <iostream>
 #include <limits>
 #include <optional>
+#include <regex>
 #include <sstream>
 #include <stdexcept>
 #include <string>
@@ -23,13 +24,12 @@
 #include <sys/stat.h>
 #endif
 
-#include "agent_aware/data/dataset.h"
-#include "agent_aware/graph/disk_graph_index.h"
-#include "agent_aware/graph/entry_selector.h"
+#include "data/dataset.h"
+#include "graph/disk_graph_index.h"
 
 namespace {
 
-// SIFT benchmark 负责构建或打开 packed graph 索引、执行 ANN 搜索，并输出包含 recall、latency、I/O、cache、prefetch 的 JSON。
+// SIFT benchmark 负责构建或打开 packed graph 索引、执行 ANN 搜索，并输出 recall、latency、I/O 和 cache JSON。
 namespace fs = std::filesystem;
 using Clock = std::chrono::steady_clock;
 
@@ -52,6 +52,7 @@ struct Args {
   std::size_t warmup_query_limit = 0;
 
   fs::path index_path = "indexes/sift.idx";
+  fs::path manifest_path;
   fs::path output_json = "logs/sift_bench/result.json";
   bool rebuild_index = false;
   std::size_t graph_degree = 32;
@@ -68,36 +69,9 @@ struct Args {
 
   std::size_t top_k = 10;
   std::size_t search_width = 156;
-  std::size_t entry_count = 64;
-  std::string entry_strategy = "single-medoid";
-  std::size_t entry_hub_count = 15;
-  std::size_t entry_cluster_count = 0;
-  std::size_t entry_cluster_train_limit = 100000;
-  std::size_t entry_cluster_iterations = 4;
   bool beam_width_requested = false;
   std::size_t requested_beam_width = 0;
   std::size_t effective_beam_width = 16;
-
-  bool enable_prefetch = true;
-  bool enable_prefetch_explicit = false;
-  bool prefetch_depth_requested = false;
-  std::size_t requested_prefetch_depth = 0;
-  std::optional<std::size_t> effective_prefetch_depth = 1;
-  std::size_t prefetch_width = 4;
-  std::size_t prefetch_min_candidates_per_page = 2;
-  std::size_t prefetch_candidate_pool_size = 0;
-  std::size_t prefetch_submit_top_k = 0;
-  std::size_t jit_window_multiplier = 2;
-  std::size_t jit_prefetch_interval_batches = 1;
-  std::size_t jit_prefetch_max_pages_per_query = 16;
-  std::string prefetch_early_trigger = "pre-beam";
-  std::string prefetch_policy = "xgboost";
-  std::string prefetch_model_path = "build/prefetch_closed_loop_xgboost.txt";
-  fs::path prefetch_trace_path;
-  std::size_t prefetch_top_k = 0;
-  double prefetch_score_threshold =
-      -std::numeric_limits<double>::infinity();
-  std::size_t prefetch_max_inflight = 0;
 
   std::string io_mode = "io_uring";
   std::size_t io_batch = 16;
@@ -109,6 +83,15 @@ struct Args {
   bool protect_hot_pages = true;
   std::size_t hot_degree_threshold = 0;
   std::size_t num_search_threads = 1;
+  bool enable_prefetch = false;
+  bool enable_prefetch_explicit = false;
+  std::string prefetch_policy = "none";
+  bool prefetch_policy_explicit = false;
+  bool prefetch_adaptive = true;
+  std::size_t prefetch_top_k = 2;
+  std::size_t prefetch_max_inflight = 2;
+  std::size_t prefetch_max_pages_per_query = 0;
+  std::string prefetch_trace_path;
 };
 
 struct MemoryBudgetReport {
@@ -183,6 +166,15 @@ bool parse_bool_value(const std::string& value, const std::string& option) {
 
 void print_help() {
   std::cout
+      << "Usage: agent-aware-search [options]\n"
+      << "  --sift-dir PATH | --query PATH [--truth PATH]\n"
+      << "  --index-path PATH --query-offset N --query-limit N\n"
+      << "  --manifest PATH (default <index-path>.manifest.json)\n"
+      << "  --top-k N --search-width N --beam-width N\n"
+      << "  --io-mode NAME --cache-policy NAME --cache-pages N\n"
+      << "  --output-json PATH\n";
+  return;
+  std::cout
       << "Usage: agent-aware [options]\n"
       << "Dataset:\n"
       << "  --synthetic 0|1              Use synthetic data, default 0\n"
@@ -199,13 +191,8 @@ void print_help() {
       << "  --cache-condition NAME       Experiment cache condition metadata\n"
       << "Search:\n"
       << "  --top-k N, --k N             Result count, default 10\n"
-      << "  --search-width N             Total expansion budget, default 350\n"
-      << "  --entry-count N              Entry points, default 64\n"
-      << "  --entry-strategy NAME        single-medoid/evenly-spaced/hybrid, default single-medoid\n"
-      << "  --entry-hub-count N          Hybrid hub entries, default 15\n"
-      << "  --entry-cluster-count N      Hybrid cluster medoids, default fill remaining\n"
-      << "  --entry-cluster-train-limit N Hybrid cluster training sample, default 100000\n"
-      << "  --entry-cluster-iterations N Hybrid cluster k-means iterations, default 4\n"
+      << "  --search-width N             Total expansion budget, default 156\n"
+      << "  (Entry point is fixed to the persisted global medoid)\n"
       << "  --beam-width N               Per-round candidate expansions, default 16\n"
       << "  --beam_width N               Compatibility alias for --beam-width\n"
       << "  --num-search-threads N       Query workers, default 1\n"
@@ -216,35 +203,26 @@ void print_help() {
       << "  --pq-train-limit N           PQ training vectors, default 100000\n"
       << "  --pq-iterations N            PQ k-means iterations, default 8\n"
       << "  --rerank-topk N              Exact rerank pool after PQ, default 100\n"
-      << "Prefetch/cache/I/O:\n"
-      << "  --enable-prefetch 0|1        Disable/enable async prefetch (enabled = xgboost)\n"
-      << "  --prefetch-depth N           Prefetch depth; 0 disables prefetch, default 1\n"
-      << "  --prefetch-width N           Prefetch page submit width per round, default 4\n"
-      << "  --prefetch-min-candidates-per-page N Candidate page reuse threshold, default 2\n"
-      << "  --prefetch-candidate-pool-size N Post-expand unique pages visible to planner, 0 uses beam*4\n"
-      << "  --prefetch-submit-top-k N    Post-expand pages to submit, 0 uses --prefetch-top-k or 4\n"
-      << "  --prefetch-early-trigger NAME off/entry-warmup/pre-beam/rerank/all, default pre-beam\n"
-      << "  --jit-window-multiplier N    Pre-beam frontier window = beam*N, default 2\n"
-      << "  --jit-prefetch-interval-batches N Issue pre-beam every N batches, default 1\n"
-      << "  --jit-prefetch-max-pages-per-query N Max pre-beam submissions per query, 0 disables cap, default 16\n"
-      << "  --prefetch-policy NAME       none/xgboost, default xgboost\n"
-      << "  --prefetch-model PATH        Optional XGBoost text-dump ranker; empty uses PQ-direct\n"
-      << "  --prefetch-top-k N           Ranking top-K cap, 0 uses --prefetch-width\n"
-      << "  --prefetch-score-threshold R Drop ranked pages below score threshold\n"
-      << "  --prefetch-max-inflight N    Max prefetch inflight/ready pages, 0 uses query budget\n"
-      << "  --prefetch-trace PATH        Write group-wise prefetch ranking CSV\n"
+      << "Cache/I/O:\n"
       << "  --cache-policy NAME          none/lru/2q/graph-aware-2q/agent, default graph-aware-2q\n"
       << "  --cache-pages N              Page cache capacity, default auto within memory budget\n"
       << "  --memory-budget-ratio R      Resident memory budget ratio, default 0.20\n"
       << "  --io-mode NAME               pread, odirect, or io_uring, default io_uring\n"
       << "  --io-batch N                 I/O batch size, default 16\n"
       << "  --io-depth N                 I/O depth for io_uring, default 32\n"
+      << "  --enable-prefetch 0|1        Enable topology prefetch, default 0\n"
+      << "  --prefetch-policy NAME       none/topology, default none\n"
+      << "  --prefetch-adaptive 0|1      Adaptive top-K/inflight control, default 1\n"
+      << "  --prefetch-top-k N           Maximum pages submitted per window, default 2\n"
+      << "  --prefetch-max-inflight N    Maximum pending prefetch pages, default 2\n"
+      << "  --prefetch-max-pages-per-query N  Query budget, 0 means unlimited\n"
+      << "  --prefetch-trace PATH        Append post-expand page decisions as CSV\n"
       << "Output/build:\n"
       << "  --graph-degree N             Vamana graph degree, default 32\n"
       << "  --page-size N                Packed graph page size, default 4096\n"
       << "  --build-policy NAME          Graph build policy, default vamana\n"
       << "  --packing-strategy NAME      Graph packing strategy, default bfs\n"
-      << "  --index-path PATH            Packed graph index path, default indexes/sift1m_vamana_pq100_p4096_sm.idx\n"
+      << "  --index-path PATH            Packed graph index path, default indexes/sift.idx\n"
       << "  --rebuild-index 0|1          Rebuild index before search, default 0\n"
       << "  --output-json PATH           Write result JSON to path, default logs/sift_bench/result.json\n";
 }
@@ -254,6 +232,26 @@ Args parse_args(int argc, char** argv) {
   for (int i = 1; i < argc; ++i) {
     const std::string option = argv[i];
     const std::string name = option.substr(0, option.find('='));
+    if (name == "--synthetic" || name == "--base" ||
+        name == "--base-limit" || name == "--rebuild-index" ||
+        name == "--graph-degree" || name == "--page-size" ||
+        name == "--build-policy" || name == "--packing-strategy" ||
+        name == "--pq-subspaces" || name == "--pq_subspaces" ||
+        name == "--pq-centroids" || name == "--pq_centroids" ||
+        name == "--pq-train-limit" || name == "--pq_train_limit" ||
+        name == "--pq-iterations" || name == "--pq_iterations" ||
+        name == "--entry-count" || name == "--entry_count" ||
+        name == "--entry-strategy" || name == "--entry_strategy" ||
+        name == "--entry-hub-count" || name == "--entry_hub_count" ||
+        name == "--entry-cluster-count" || name == "--entry_cluster_count" ||
+        name == "--entry-cluster-train-limit" ||
+        name == "--entry_cluster_train_limit" ||
+        name == "--entry-cluster-iterations" ||
+        name == "--entry_cluster_iterations") {
+      throw std::runtime_error(
+          "Build option is not accepted by agent-aware-search; run agent-aware-build first: " +
+          name);
+    }
     if (name == "--help" || name == "-h") {
       args.help = true;
     } else if (name == "--synthetic") {
@@ -298,6 +296,8 @@ Args parse_args(int argc, char** argv) {
           parse_size_value(require_value(i, argc, argv, name), name, 0));
     } else if (name == "--index-path") {
       args.index_path = require_value(i, argc, argv, name);
+    } else if (name == "--manifest") {
+      args.manifest_path = require_value(i, argc, argv, name);
     } else if (name == "--output-json") {
       args.output_json = require_value(i, argc, argv, name);
     } else if (name == "--rebuild-index") {
@@ -338,88 +338,10 @@ Args parse_args(int argc, char** argv) {
     } else if (name == "--search-width" || name == "--search_width") {
       args.search_width = parse_size_value(require_value(i, argc, argv, name),
                                            name, 1);
-    } else if (name == "--entry-count" || name == "--entry_count") {
-      args.entry_count = parse_size_value(require_value(i, argc, argv, name),
-                                          name, 1);
-    } else if (name == "--entry-strategy" || name == "--entry_strategy") {
-      args.entry_strategy = require_value(i, argc, argv, name);
-    } else if (name == "--entry-hub-count" ||
-               name == "--entry_hub_count") {
-      args.entry_hub_count =
-          parse_size_value(require_value(i, argc, argv, name), name, 0);
-    } else if (name == "--entry-cluster-count" ||
-               name == "--entry_cluster_count") {
-      args.entry_cluster_count =
-          parse_size_value(require_value(i, argc, argv, name), name, 0);
-    } else if (name == "--entry-cluster-train-limit" ||
-               name == "--entry_cluster_train_limit") {
-      args.entry_cluster_train_limit =
-          parse_size_value(require_value(i, argc, argv, name), name, 1);
-    } else if (name == "--entry-cluster-iterations" ||
-               name == "--entry_cluster_iterations") {
-      args.entry_cluster_iterations =
-          parse_size_value(require_value(i, argc, argv, name), name, 1);
     } else if (name == "--beam-width" || name == "--beam_width") {
       args.requested_beam_width =
           parse_size_value(require_value(i, argc, argv, name), name, 1);
       args.beam_width_requested = true;
-    } else if (name == "--enable-prefetch") {
-      args.enable_prefetch =
-          parse_bool_value(require_value(i, argc, argv, name), name);
-      args.enable_prefetch_explicit = true;
-    } else if (name == "--prefetch-depth" || name == "--prefetch_depth") {
-      args.requested_prefetch_depth =
-          parse_size_value(require_value(i, argc, argv, name), name, 0);
-      args.prefetch_depth_requested = true;
-    } else if (name == "--prefetch-width" || name == "--prefetch_width") {
-      args.prefetch_width = parse_size_value(require_value(i, argc, argv, name),
-                                             name, 1);
-    } else if (name == "--prefetch-min-candidates-per-page" ||
-               name == "--prefetch_min_candidates_per_page") {
-      args.prefetch_min_candidates_per_page =
-          parse_size_value(require_value(i, argc, argv, name), name, 1);
-    } else if (name == "--prefetch-candidate-pool-size" ||
-               name == "--prefetch_candidate_pool_size") {
-      args.prefetch_candidate_pool_size =
-          parse_size_value(require_value(i, argc, argv, name), name, 0);
-    } else if (name == "--prefetch-submit-top-k" ||
-               name == "--prefetch_submit_top_k") {
-      args.prefetch_submit_top_k =
-          parse_size_value(require_value(i, argc, argv, name), name, 0);
-    } else if (name == "--jit-window-multiplier" ||
-               name == "--jit_window_multiplier") {
-      args.jit_window_multiplier =
-          parse_size_value(require_value(i, argc, argv, name), name, 1);
-    } else if (name == "--jit-prefetch-interval-batches" ||
-               name == "--jit_prefetch_interval_batches") {
-      args.jit_prefetch_interval_batches =
-          parse_size_value(require_value(i, argc, argv, name), name, 1);
-    } else if (name == "--jit-prefetch-max-pages-per-query" ||
-               name == "--jit_prefetch_max_pages_per_query") {
-      args.jit_prefetch_max_pages_per_query =
-          parse_size_value(require_value(i, argc, argv, name), name, 0);
-    } else if (name == "--prefetch-early-trigger" ||
-               name == "--prefetch_early_trigger") {
-      args.prefetch_early_trigger = require_value(i, argc, argv, name);
-    } else if (name == "--prefetch-policy" || name == "--prefetch_policy") {
-      args.prefetch_policy = require_value(i, argc, argv, name);
-    } else if (name == "--prefetch-model" || name == "--prefetch_model") {
-      args.prefetch_model_path = require_value(i, argc, argv, name);
-    } else if (name == "--prefetch-top-k" ||
-               name == "--prefetch_top_k") {
-      args.prefetch_top_k =
-          parse_size_value(require_value(i, argc, argv, name), name, 0);
-    } else if (name == "--prefetch-score-threshold" ||
-               name == "--prefetch_score_threshold") {
-      args.prefetch_score_threshold =
-          std::stod(require_value(i, argc, argv, name));
-    } else if (name == "--prefetch-max-inflight" ||
-               name == "--prefetch_max_inflight") {
-      args.prefetch_max_inflight =
-          parse_size_value(require_value(i, argc, argv, name), name, 0);
-    } else if (name == "--prefetch-trace" ||
-               name == "--prefetch_trace") {
-      args.prefetch_trace_path = require_value(i, argc, argv, name);
     } else if (name == "--io-mode" || name == "--io_mode") {
       args.io_mode = require_value(i, argc, argv, name);
     } else if (name == "--io-batch" || name == "--io_batch") {
@@ -428,6 +350,27 @@ Args parse_args(int argc, char** argv) {
     } else if (name == "--io-depth" || name == "--io_depth") {
       args.io_depth = parse_size_value(require_value(i, argc, argv, name),
                                        name, 1);
+    } else if (name == "--enable-prefetch") {
+      args.enable_prefetch =
+          parse_bool_value(require_value(i, argc, argv, name), name);
+      args.enable_prefetch_explicit = true;
+    } else if (name == "--prefetch-policy") {
+      args.prefetch_policy = require_value(i, argc, argv, name);
+      args.prefetch_policy_explicit = true;
+    } else if (name == "--prefetch-adaptive") {
+      args.prefetch_adaptive =
+          parse_bool_value(require_value(i, argc, argv, name), name);
+    } else if (name == "--prefetch-top-k") {
+      args.prefetch_top_k =
+          parse_size_value(require_value(i, argc, argv, name), name, 1);
+    } else if (name == "--prefetch-max-inflight") {
+      args.prefetch_max_inflight =
+          parse_size_value(require_value(i, argc, argv, name), name, 1);
+    } else if (name == "--prefetch-max-pages-per-query") {
+      args.prefetch_max_pages_per_query =
+          parse_size_value(require_value(i, argc, argv, name), name, 0);
+    } else if (name == "--prefetch-trace") {
+      args.prefetch_trace_path = require_value(i, argc, argv, name);
     } else if (name == "--cache-policy" || name == "--cache_policy") {
       args.cache_policy = require_value(i, argc, argv, name);
     } else if (name == "--cache-pages" || name == "--cache_pages") {
@@ -456,7 +399,6 @@ Args parse_args(int argc, char** argv) {
 }
 
 void validate_and_finalize_args(Args& args) {
-  (void)agent_aware::parse_entry_strategy(args.entry_strategy);
   if (args.build_policy != "vamana") {
     throw std::runtime_error("Unsupported --build-policy: only vamana is supported");
   }
@@ -469,39 +411,22 @@ void validate_and_finalize_args(Args& args) {
                                 : args.effective_beam_width,
       std::size_t{1}, args.search_width);
 
-  if (args.prefetch_depth_requested) {
-    if (args.requested_prefetch_depth == 0) {
-      args.enable_prefetch = false;
-      args.enable_prefetch_explicit = true;
-      args.effective_prefetch_depth.reset();
-    } else {
-      args.enable_prefetch = true;
-      args.enable_prefetch_explicit = true;
-      args.effective_prefetch_depth = args.requested_prefetch_depth;
-    }
-  } else if (args.enable_prefetch) {
-    args.effective_prefetch_depth = 1;
-  } else {
-    args.effective_prefetch_depth.reset();
-  }
-
-  if (args.prefetch_policy != "none" && args.prefetch_policy != "xgboost") {
-    throw std::runtime_error(
-        "Invalid --prefetch-policy: expected none or xgboost");
-  }
-  if (args.prefetch_early_trigger != "off" &&
-      args.prefetch_early_trigger != "entry-warmup" &&
-      args.prefetch_early_trigger != "pre-beam" &&
-      args.prefetch_early_trigger != "rerank" &&
-      args.prefetch_early_trigger != "all") {
-    throw std::runtime_error(
-        "Invalid --prefetch-early-trigger: expected off, entry-warmup, pre-beam, rerank, or all");
-  }
-
   if (!args.enable_pq) {
     throw std::runtime_error(
         "--enable-pq=0 is no longer supported; search requires PQ+ADC candidate generation");
   }
+  if (args.prefetch_policy != "none" &&
+      args.prefetch_policy != "topology") {
+    throw std::runtime_error(
+        "Invalid --prefetch-policy: expected none or topology");
+  }
+  if (args.prefetch_policy_explicit && !args.enable_prefetch_explicit) {
+    args.enable_prefetch = args.prefetch_policy == "topology";
+  }
+  if (args.enable_prefetch && !args.prefetch_policy_explicit) {
+    args.prefetch_policy = "topology";
+  }
+  if (!args.enable_prefetch) args.prefetch_policy = "none";
 
   if (args.enable_pq) {
     if (args.pq_subspaces < 1) {
@@ -614,24 +539,109 @@ long long binary_mtime_seconds(const fs::path& path) {
   return -1;
 }
 
-agent_aware::LoadedDataset load_input_dataset(const Args& args) {
-  agent_aware::DatasetLoadConfig config;
-  config.synthetic = args.synthetic;
-  config.base_limit = args.base_limit;
+struct BuildManifest {
+  std::uint64_t format_version = 0;
+  std::uint64_t vector_count = 0;
+  std::uint64_t dim = 0;
+  std::uint64_t index_bytes = 0;
+  std::string entry_strategy;
+  std::uint64_t entry_id = 0;
+};
+
+std::string read_text_file(const fs::path& path) {
+  std::ifstream input(path);
+  if (!input) {
+    throw std::runtime_error(
+        "Build manifest does not exist; run agent-aware-build first: " +
+        path.string());
+  }
+  return std::string(std::istreambuf_iterator<char>(input),
+                     std::istreambuf_iterator<char>());
+}
+
+std::uint64_t manifest_integer(const std::string& text,
+                               const std::string& field) {
+  const std::regex key_pattern("\\\"" + field + "\\\"\\s*:");
+  if (std::distance(std::sregex_iterator(text.begin(), text.end(), key_pattern),
+                    std::sregex_iterator()) != 1) {
+    throw std::runtime_error(
+        "Build manifest must contain exactly one field: " + field);
+  }
+  const std::regex pattern("\\\"" + field +
+                           "\\\"\\s*:\\s*([0-9]+)");
+  std::smatch match;
+  if (!std::regex_search(text, match, pattern)) {
+    throw std::runtime_error("Build manifest is missing integer field: " + field);
+  }
+  std::size_t consumed = 0;
+  const auto value = std::stoull(match[1].str(), &consumed);
+  if (consumed != match[1].str().size()) {
+    throw std::runtime_error("Build manifest has invalid integer field: " + field);
+  }
+  return value;
+}
+
+std::string manifest_string(const std::string& text,
+                            const std::string& field) {
+  const std::regex key_pattern("\\\"" + field + "\\\"\\s*:");
+  if (std::distance(std::sregex_iterator(text.begin(), text.end(), key_pattern),
+                    std::sregex_iterator()) != 1) {
+    throw std::runtime_error(
+        "Build manifest must contain exactly one field: " + field);
+  }
+  const std::regex pattern("\\\"" + field +
+                           "\\\"\\s*:\\s*\\\"([^\\\"]*)\\\"");
+  std::smatch match;
+  if (!std::regex_search(text, match, pattern)) {
+    throw std::runtime_error("Build manifest is missing string field: " + field);
+  }
+  return match[1].str();
+}
+
+BuildManifest load_build_manifest(
+    const fs::path& path, const agent_aware::DiskGraphMetadata& metadata) {
+  const std::string text = read_text_file(path);
+  const std::string pair =
+      "\\\"[^\\\"]+\\\"\\s*:\\s*(?:[0-9]+|\\\"[^\\\"]*\\\")";
+  if (!std::regex_match(
+          text, std::regex("\\s*\\{\\s*(?:" + pair +
+                           "(?:\\s*,\\s*" + pair + ")*)?\\s*\\}\\s*"))) {
+    throw std::runtime_error("Build manifest is not a JSON object: " + path.string());
+  }
+  BuildManifest manifest;
+  manifest.format_version = manifest_integer(text, "format_version");
+  manifest.vector_count = manifest_integer(text, "vector_count");
+  manifest.dim = manifest_integer(text, "dim");
+  manifest.index_bytes = manifest_integer(text, "index_bytes");
+  manifest.entry_strategy = manifest_string(text, "entry_strategy");
+  manifest.entry_id = manifest_integer(text, "entry_id");
+  if (manifest.format_version != metadata.format_version ||
+      manifest.vector_count != metadata.vector_count ||
+      manifest.dim != metadata.dim || manifest.index_bytes != metadata.index_bytes) {
+    throw std::runtime_error(
+        "Build manifest does not match packed index metadata; rerun agent-aware-build");
+  }
+  if (manifest.entry_strategy != "single-medoid") {
+    throw std::runtime_error(
+        "Build manifest entry_strategy must be single-medoid");
+  }
+  if (manifest.entry_id >= metadata.vector_count) {
+    throw std::runtime_error("Build manifest entry_id exceeds packed index vector count");
+  }
+  return manifest;
+}
+
+agent_aware::LoadedQueryDataset load_input_dataset(
+    const Args& args, const agent_aware::DiskGraphMetadata& metadata) {
+  agent_aware::QueryDatasetLoadConfig config;
   config.query_offset = args.query_offset;
   config.query_limit = args.query_limit;
   config.paths.sift_dir = args.sift_dir;
-  config.paths.base = args.base_path;
   config.paths.query = args.query_path;
   config.paths.truth = args.truth_path;
-  config.synthetic_config.base_count = args.base_limit;
-  config.synthetic_config.query_count = args.query_offset + args.query_limit;
-  config.synthetic_config.dim = args.synthetic_dim;
-  config.synthetic_config.clusters =
-      std::min(args.synthetic_clusters, args.base_limit);
-  config.synthetic_config.workload = "agent";
-  config.synthetic_config.seed = args.seed;
-  return agent_aware::load_dataset(config);
+  config.expected_dim = metadata.dim;
+  config.expected_base_count = static_cast<std::size_t>(metadata.vector_count);
+  return agent_aware::load_query_dataset(config);
 }
 
 double recall_at_k(const std::vector<agent_aware::SearchResult>& result,
@@ -688,13 +698,10 @@ void add_stats(SearchAggregate& aggregate,
   aggregate.stats.page_requests += stats.page_requests;
   aggregate.stats.cache_hits += stats.cache_hits;
   aggregate.stats.pinned_hits += stats.pinned_hits;
-  aggregate.stats.pending_hits += stats.pending_hits;
   aggregate.stats.demand_reads += stats.demand_reads;
-  aggregate.stats.prefetch_reads += stats.prefetch_reads;
+  aggregate.stats.unique_nodes_accessed += stats.unique_nodes_accessed;
   aggregate.stats.unique_pages_touched += stats.unique_pages_touched;
   aggregate.stats.unique_demand_pages += stats.unique_demand_pages;
-  aggregate.stats.unique_prefetch_pages += stats.unique_prefetch_pages;
-  aggregate.stats.prefetch_only_pages += stats.prefetch_only_pages;
   aggregate.stats.duplicate_skipped += stats.duplicate_skipped;
   aggregate.stats.submitted_reads += stats.submitted_reads;
   aggregate.stats.completed_reads += stats.completed_reads;
@@ -710,46 +717,7 @@ void add_stats(SearchAggregate& aggregate,
   aggregate.stats.io_submit_syscalls += stats.io_submit_syscalls;
   aggregate.stats.uring_submit_count += stats.uring_submit_count;
   aggregate.stats.uring_cqe_count += stats.uring_cqe_count;
-  aggregate.stats.io_prefetches += stats.io_prefetches;
-  aggregate.stats.io_prefetch_hits += stats.io_prefetch_hits;
-  aggregate.stats.io_prefetch_waits += stats.io_prefetch_waits;
-  aggregate.stats.io_pending_pages_peak =
-      std::max(aggregate.stats.io_pending_pages_peak,
-               stats.io_pending_pages_peak);
-  aggregate.stats.prefetch_submitted_pages += stats.prefetch_submitted_pages;
-  aggregate.stats.prefetch_useful_pages += stats.prefetch_useful_pages;
-  aggregate.stats.prefetch_wasted_pages += stats.prefetch_wasted_pages;
-  aggregate.stats.prefetch_submitted += stats.prefetch_submitted;
-  aggregate.stats.prefetch_completed += stats.prefetch_completed;
-  aggregate.stats.prefetch_ready_hit += stats.prefetch_ready_hit;
-  aggregate.stats.prefetch_pending_hit += stats.prefetch_pending_hit;
-  aggregate.stats.prefetch_late_hit += stats.prefetch_late_hit;
-  aggregate.stats.prefetch_dropped += stats.prefetch_dropped;
-  aggregate.stats.prefetch_promoted += stats.prefetch_promoted;
-  aggregate.stats.prefetch_cache_pollution_avoided +=
-      stats.prefetch_cache_pollution_avoided;
-  aggregate.stats.demand_priority_blocks_prefetch +=
-      stats.demand_priority_blocks_prefetch;
-  aggregate.stats.prefetch_skip_seen_before +=
-      stats.prefetch_skip_seen_before;
-  aggregate.stats.prefetch_skip_cached += stats.prefetch_skip_cached;
-  aggregate.stats.prefetch_skip_pending += stats.prefetch_skip_pending;
-  aggregate.stats.prefetch_skip_materialized +=
-      stats.prefetch_skip_materialized;
-  aggregate.stats.prefetch_skip_budget_full +=
-      stats.prefetch_skip_budget_full;
-  aggregate.stats.prefetch_skip_low_page_reuse +=
-      stats.prefetch_skip_low_page_reuse;
-  aggregate.stats.prefetch_skip_score_threshold +=
-      stats.prefetch_skip_score_threshold;
-  aggregate.stats.prefetch_skip_inflight_full +=
-      stats.prefetch_skip_inflight_full;
-  aggregate.stats.prefetch_skip_too_late += stats.prefetch_skip_too_late;
-  aggregate.stats.effective_prefetch_max_inflight = std::max(
-      aggregate.stats.effective_prefetch_max_inflight,
-      stats.effective_prefetch_max_inflight);
-  aggregate.stats.prefetch_evicted_before_use +=
-      stats.prefetch_evicted_before_use;
+  aggregate.stats.demand_read_wait_us += stats.demand_read_wait_us;
   aggregate.stats.page_dedup_requests += stats.page_dedup_requests;
   aggregate.stats.page_dedup_hits += stats.page_dedup_hits;
   aggregate.stats.duplicate_pages_eliminated +=
@@ -759,15 +727,7 @@ void add_stats(SearchAggregate& aggregate,
   aggregate.stats.max_batch_size =
       std::max(aggregate.stats.max_batch_size, stats.max_batch_size);
   aggregate.stats.beam_unique_pages += stats.beam_unique_pages;
-  aggregate.stats.beam_cached_or_pending_pages +=
-      stats.beam_cached_or_pending_pages;
-  aggregate.stats.jit_prefetch_windows += stats.jit_prefetch_windows;
-  aggregate.stats.jit_prefetch_skipped_by_interval +=
-      stats.jit_prefetch_skipped_by_interval;
-  aggregate.stats.jit_prefetch_budget_exhausted +=
-      stats.jit_prefetch_budget_exhausted;
-  aggregate.stats.jit_prefetch_candidates_capped +=
-      stats.jit_prefetch_candidates_capped;
+  aggregate.stats.beam_cached_pages += stats.beam_cached_pages;
   aggregate.stats.same_page_node_reuse += stats.same_page_node_reuse;
   aggregate.stats.distance_direct_calls += stats.distance_direct_calls;
   aggregate.stats.adc_table_build_us += stats.adc_table_build_us;
@@ -775,6 +735,29 @@ void add_stats(SearchAggregate& aggregate,
   aggregate.stats.pq_filter_reject_count += stats.pq_filter_reject_count;
   aggregate.stats.pq_filter_accept_count += stats.pq_filter_accept_count;
   aggregate.stats.search_mutex_wait_us += stats.search_mutex_wait_us;
+  aggregate.stats.unique_prefetch_pages += stats.unique_prefetch_pages;
+  aggregate.stats.prefetch_candidate_nodes += stats.prefetch_candidate_nodes;
+  aggregate.stats.prefetch_candidate_pages += stats.prefetch_candidate_pages;
+  aggregate.stats.prefetch_submitted += stats.prefetch_submitted;
+  aggregate.stats.prefetch_submit_batches += stats.prefetch_submit_batches;
+  aggregate.stats.prefetch_ready_hit += stats.prefetch_ready_hit;
+  aggregate.stats.prefetch_pending_hit += stats.prefetch_pending_hit;
+  aggregate.stats.prefetch_useful_pages += stats.prefetch_useful_pages;
+  aggregate.stats.prefetch_wasted_pages += stats.prefetch_wasted_pages;
+  aggregate.stats.prefetch_skip_cached += stats.prefetch_skip_cached;
+  aggregate.stats.prefetch_skip_pending += stats.prefetch_skip_pending;
+  aggregate.stats.prefetch_skip_seen += stats.prefetch_skip_seen;
+  aggregate.stats.prefetch_skip_budget += stats.prefetch_skip_budget;
+  aggregate.stats.demand_priority_blocks_prefetch +=
+      stats.demand_priority_blocks_prefetch;
+  aggregate.stats.prefetch_adaptive_pause_count +=
+      stats.prefetch_adaptive_pause_count;
+  aggregate.stats.prefetch_adaptive_final_top_k =
+      stats.prefetch_adaptive_final_top_k;
+  aggregate.stats.prefetch_adaptive_final_lead =
+      stats.prefetch_adaptive_final_lead;
+  aggregate.stats.prefetch_saved_wait_us += stats.prefetch_saved_wait_us;
+  aggregate.stats.prefetch_planner_cpu_us += stats.prefetch_planner_cpu_us;
 }
 
 void merge_aggregate(SearchAggregate& aggregate,
@@ -797,22 +780,8 @@ void configure_index_from_args(const Args& args,
 }
 
 std::vector<std::uint32_t> select_search_entries(
-    const Args& args, const agent_aware::LoadedDataset& dataset,
-    agent_aware::PackedDiskGraphIndex& index) {
-  agent_aware::EntrySelectionConfig config;
-  config.strategy = agent_aware::parse_entry_strategy(args.entry_strategy);
-  config.entry_count = args.entry_count;
-  config.hub_count = args.entry_hub_count;
-  config.cluster_count = args.entry_cluster_count;
-  config.cluster_train_limit = args.entry_cluster_train_limit;
-  config.cluster_iterations = args.entry_cluster_iterations;
-  config.seed = args.seed;
-
-  const std::vector<std::uint32_t>* node_in_degrees = nullptr;
-  if (config.strategy == agent_aware::EntryStrategy::HybridMedoidHubsClusters) {
-    node_in_degrees = &index.node_in_degrees();
-  }
-  return agent_aware::select_entry_points(dataset.base, config, node_in_degrees);
+    const BuildManifest& manifest) {
+  return {static_cast<std::uint32_t>(manifest.entry_id)};
 }
 
 std::optional<agent_aware::PQTrainingStats> train_pq_if_enabled(
@@ -830,13 +799,21 @@ std::optional<agent_aware::PQTrainingStats> train_pq_if_enabled(
   return pq_model.train(base, config);
 }
 
+agent_aware::PQTrainingStats pq_stats_from_model(
+    const agent_aware::PqAdcModel& model, std::size_t training_vectors) {
+  return agent_aware::PQTrainingStats{
+      model.vector_count(), training_vectors, model.dim(), model.subspaces(),
+      model.centroids(), model.code_bytes(), model.codebook_bytes()};
+}
+
 MemoryBudgetReport apply_memory_budget_defaults(
-    Args& args, const agent_aware::LoadedDataset& dataset,
+    Args& args, const agent_aware::LoadedQueryDataset& dataset,
+    const agent_aware::DiskGraphMetadata& metadata,
     const std::optional<agent_aware::PQTrainingStats>& pq_stats,
     std::vector<std::string>& warnings) {
   MemoryBudgetReport report;
   report.dataset_bytes =
-      static_cast<std::uint64_t>(dataset.base.size()) * dataset.base.dim *
+      metadata.vector_count * metadata.dim *
       sizeof(float);
   report.budget_bytes = static_cast<std::uint64_t>(
       std::floor(static_cast<double>(report.dataset_bytes) *
@@ -852,7 +829,7 @@ MemoryBudgetReport apply_memory_budget_defaults(
   // 多线程搜索每个 worker 都会创建一份 index/cache 实例，因此 directory 和 cache 估算按 worker 数放大。
   const std::size_t directory_copies = workers == 1 ? 1 : workers + 1;
   const std::uint64_t node_directory_bytes =
-      static_cast<std::uint64_t>(dataset.base.size()) *
+      metadata.vector_count *
       sizeof(std::uint32_t) * directory_copies;
   report.fixed_resident_bytes = pq_bytes + node_directory_bytes;
 
@@ -886,72 +863,31 @@ MemoryBudgetReport apply_memory_budget_defaults(
   return report;
 }
 
-void build_index_if_needed(const Args& args, const agent_aware::VectorSet& base,
-                           const agent_aware::PqAdcModel* pq_model,
-                           bool& rebuilt_index) {
-  rebuilt_index = false;
-  if (!args.rebuild_index && fs::exists(args.index_path)) {
-    return;
-  }
-  // 在固定 seed、policy 和 packing strategy 下索引构建是确定性的，便于跨运行比较结果 JSON。
-  if (!args.index_path.parent_path().empty()) {
-    fs::create_directories(args.index_path.parent_path());
-  }
-  agent_aware::DiskGraphBuildConfig config;
-  config.degree = args.graph_degree;
-  config.page_size = args.page_size;
-  config.random_seed = args.seed;
-  config.pq_model = pq_model;
-  agent_aware::PackedDiskGraphBuilder::build(base, args.index_path.string(),
-                                          config);
-  rebuilt_index = true;
-}
-
 agent_aware::DiskGraphSearchConfig make_search_config(
     const Args& args, const agent_aware::PqAdcModel* pq_model,
-    const std::vector<std::uint32_t>& entry_seed_ids,
-    std::size_t prefetch_width_override) {
+    const std::vector<std::uint32_t>& entry_seed_ids) {
   agent_aware::DiskGraphSearchConfig search;
   search.top_k = args.top_k;
   search.search_width = args.search_width;
   search.beam_width = args.effective_beam_width;
-  search.entry_count = args.entry_count;
+  search.entry_count = 1;
   search.seed_ids = entry_seed_ids;
   search.adc_enable = args.enable_pq && pq_model != nullptr &&
                       pq_model->enabled();
   search.pq_model = search.adc_enable ? pq_model : nullptr;
   search.rerank_topk = search.adc_enable ? args.rerank_topk : 0;
-  if (!args.enable_prefetch) {
-    search.prefetch_policy = "none";
-  } else if (args.prefetch_policy == "xgboost") {
-    search.prefetch_policy = "xgboost";
-  } else {
-    search.prefetch_policy = "none";
-  }
-  search.prefetch_model_path = args.prefetch_model_path;
+  search.prefetch_policy = args.prefetch_policy;
+  search.prefetch_adaptive = args.prefetch_adaptive;
   search.prefetch_top_k = args.prefetch_top_k;
-  search.prefetch_candidate_pool_size = args.prefetch_candidate_pool_size;
-  search.prefetch_submit_top_k = args.prefetch_submit_top_k;
-  search.prefetch_score_threshold = args.prefetch_score_threshold;
   search.prefetch_max_inflight = args.prefetch_max_inflight;
-  search.prefetch_depth = args.effective_prefetch_depth.value_or(1);
-  search.prefetch_width = prefetch_width_override;
-  search.prefetch_min_candidates_per_page =
-      args.prefetch_min_candidates_per_page;
-  search.jit_window_multiplier = args.jit_window_multiplier;
-  search.jit_prefetch_interval_batches =
-      args.jit_prefetch_interval_batches;
-  search.jit_prefetch_max_pages_per_query =
-      args.jit_prefetch_max_pages_per_query;
-  search.prefetch_early_trigger = args.prefetch_early_trigger;
+  search.prefetch_max_pages_per_query = args.prefetch_max_pages_per_query;
+  search.prefetch_trace_path = args.prefetch_trace_path;
   search.run_id = args.run_id;
-  search.policy_version = args.policy_version;
-  search.random_seed = args.seed;
   return search;
 }
 
 SearchAggregate run_search_worker(const Args& args,
-                                  const agent_aware::LoadedDataset& dataset,
+                                  const agent_aware::LoadedQueryDataset& dataset,
                                   agent_aware::PackedDiskGraphIndex& index,
                                   const agent_aware::PqAdcModel* pq_model,
                                   const std::vector<std::uint32_t>&
@@ -963,11 +899,8 @@ SearchAggregate run_search_worker(const Args& args,
   for (std::size_t i = first_query; i < query_count;
        i += query_stride) {
     // worker 以 stride 方式遍历 query，避免共享可变 query 状态，并保持每个 worker 的延迟样本独立。
-    auto search =
-        make_search_config(args, pq_model, entry_seed_ids,
-                           args.prefetch_width);
-    search.query_id = static_cast<std::uint64_t>(i);
-    search.prefetch_trace_path = args.prefetch_trace_path.string();
+    auto search = make_search_config(args, pq_model, entry_seed_ids);
+    search.query_id = args.query_offset + i;
     const auto query_start = Clock::now();
     const auto result = index.search_one(dataset.queries.row(i), search);
     const auto query_end = Clock::now();
@@ -986,7 +919,7 @@ SearchAggregate run_search_worker(const Args& args,
 }
 
 SearchAggregate run_searches(const Args& args,
-                             const agent_aware::LoadedDataset& dataset,
+                             const agent_aware::LoadedQueryDataset& dataset,
                              agent_aware::PackedDiskGraphIndex& index,
                              const agent_aware::PqAdcModel* pq_model,
                              const std::vector<std::uint32_t>&
@@ -1049,11 +982,11 @@ SearchAggregate run_searches(const Args& args,
 }
 
 std::string json_for_run(const Args& args,
-                         const agent_aware::LoadedDataset& dataset,
+                         const agent_aware::LoadedQueryDataset& dataset,
+                         const agent_aware::DiskGraphMetadata& index_metadata,
                          const agent_aware::DiskGraphIoStatus& io_status,
                          const SearchAggregate& aggregate,
-                         const fs::path& binary_path, bool rebuilt_index,
-                         bool runtime_prefetch_enabled,
+                         const fs::path& binary_path,
                          const std::optional<agent_aware::PQTrainingStats>&
                              pq_stats,
                          const MemoryBudgetReport& memory_budget,
@@ -1085,13 +1018,6 @@ std::string json_for_run(const Args& args,
   const double demand_reads_per_query =
       static_cast<double>(aggregate.stats.demand_reads) /
       query_count_for_rates;
-  const double prefetch_reads_per_query =
-      static_cast<double>(aggregate.stats.prefetch_reads) /
-      query_count_for_rates;
-  const double ready_hit_ratio =
-      static_cast<double>(aggregate.stats.prefetch_ready_hit) /
-      static_cast<double>(
-          std::max<std::size_t>(1, aggregate.stats.prefetch_submitted));
   const double duplicate_skipped_per_query =
       static_cast<double>(aggregate.stats.duplicate_skipped) /
       query_count_for_rates;
@@ -1100,6 +1026,16 @@ std::string json_for_run(const Args& args,
           ? 0.0
           : static_cast<double>(aggregate.stats.cache_hits) /
                 static_cast<double>(aggregate.stats.page_requests);
+  const double nodes_used_per_loaded_page =
+      aggregate.stats.unique_pages_touched == 0
+          ? 0.0
+          : static_cast<double>(aggregate.stats.unique_nodes_accessed) /
+                static_cast<double>(aggregate.stats.unique_pages_touched);
+  const double page_fill_utilization =
+      index_metadata.nodes_per_page == 0
+          ? 0.0
+          : nodes_used_per_loaded_page /
+                static_cast<double>(index_metadata.nodes_per_page);
   const std::string io_mode_summary =
       !io_status.fallback_reason.empty()
           ? "fallback"
@@ -1114,10 +1050,9 @@ std::string json_for_run(const Args& args,
   json << "{\n";
   json << "  \"status\": \"completed\",\n";
   json << "  \"dataset_mode\": \"" << json_escape(dataset.mode) << "\",\n";
-  json << "  \"base_count\": " << dataset.base.size() << ",\n";
+  json << "  \"base_count\": " << index_metadata.vector_count << ",\n";
   json << "  \"query_count\": " << dataset.queries.size() << ",\n";
-  json << "  \"dim\": " << dataset.base.dim << ",\n";
-  json << "  \"base_limit\": " << args.base_limit << ",\n";
+  json << "  \"dim\": " << index_metadata.dim << ",\n";
   json << "  \"query_offset\": " << args.query_offset << ",\n";
   json << "  \"query_limit\": " << args.query_limit << ",\n";
   json << "  \"warmup_query_limit\": " << args.warmup_query_limit << ",\n";
@@ -1127,12 +1062,23 @@ std::string json_for_run(const Args& args,
   json << "  \"cache_condition\": \""
        << json_escape(args.cache_condition) << "\",\n";
   json << "  \"seed\": " << args.seed << ",\n";
-  json << "  \"graph_degree\": " << args.graph_degree << ",\n";
-  json << "  \"page_size\": " << args.page_size << ",\n";
-  json << "  \"build_policy\": \"" << json_escape(args.build_policy)
-       << "\",\n";
-  json << "  \"packing_strategy\": \""
-       << json_escape(args.packing_strategy) << "\",\n";
+  json << "  \"graph_degree\": " << index_metadata.degree << ",\n";
+  json << "  \"page_size\": " << index_metadata.page_size << ",\n";
+  json << "  \"index_format_version\": " << index_metadata.format_version
+       << ",\n";
+  json << "  \"index_bytes\": " << index_metadata.index_bytes << ",\n";
+  json << "  \"pq_bytes\": " << index_metadata.pq_bytes << ",\n";
+  json << "  \"nodes_per_page\": " << index_metadata.nodes_per_page
+       << ",\n";
+  json << "  \"page_count\": " << index_metadata.page_count << ",\n";
+  const double dataset_vector_bytes =
+      static_cast<double>(index_metadata.vector_count) * index_metadata.dim * sizeof(float);
+  json << "  \"index_size_ratio_to_dataset\": "
+       << (dataset_vector_bytes == 0.0
+               ? 0.0
+               : static_cast<double>(index_metadata.index_bytes) /
+                     dataset_vector_bytes)
+       << ",\n";
   json << "  \"truth_source\": \"" << json_escape(dataset.truth_source)
        << "\",\n";
   json << "  \"truth_from_file\": " << dataset.truth_from_file << ",\n";
@@ -1148,56 +1094,6 @@ std::string json_for_run(const Args& args,
   json << "  \"effective_beam_width\": " << args.effective_beam_width
        << ",\n";
   json << "  \"beam_width_supported\": true,\n";
-  json << "  \"requested_prefetch_depth\": ";
-  if (args.prefetch_depth_requested) {
-    json << args.requested_prefetch_depth;
-  } else {
-    json << "null";
-  }
-  json << ",\n";
-  json << "  \"effective_prefetch_depth\": ";
-  if (runtime_prefetch_enabled && args.effective_prefetch_depth.has_value()) {
-    json << args.effective_prefetch_depth.value();
-  } else {
-    json << "null";
-  }
-  json << ",\n";
-  json << "  \"effective_prefetch_max_inflight\": "
-       << aggregate.stats.effective_prefetch_max_inflight << ",\n";
-  json << "  \"prefetch_enabled\": " << runtime_prefetch_enabled << ",\n";
-  json << "  \"prefetch_policy\": \"" << json_escape(args.enable_prefetch
-                                                         ? args.prefetch_policy
-                                                         : "none")
-       << "\",\n";
-  json << "  \"prefetch_model\": \""
-       << json_escape(args.prefetch_model_path) << "\",\n";
-  json << "  \"prefetch_top_k\": " << args.prefetch_top_k << ",\n";
-  json << "  \"prefetch_candidate_pool_size\": "
-       << args.prefetch_candidate_pool_size << ",\n";
-  json << "  \"prefetch_submit_top_k\": " << args.prefetch_submit_top_k
-       << ",\n";
-  json << "  \"prefetch_score_threshold\": ";
-  if (std::isfinite(args.prefetch_score_threshold)) {
-    json << args.prefetch_score_threshold;
-  } else {
-    json << "null";
-  }
-  json << ",\n";
-  json << "  \"prefetch_max_inflight\": "
-       << args.prefetch_max_inflight << ",\n";
-  json << "  \"prefetch_trace\": \""
-       << json_escape(args.prefetch_trace_path.string()) << "\",\n";
-  json << "  \"prefetch_width\": " << args.prefetch_width << ",\n";
-  json << "  \"prefetch_min_candidates_per_page\": "
-       << args.prefetch_min_candidates_per_page << ",\n";
-  json << "  \"prefetch_early_trigger\": \""
-       << json_escape(args.prefetch_early_trigger) << "\",\n";
-  json << "  \"jit_window_multiplier\": "
-       << args.jit_window_multiplier << ",\n";
-  json << "  \"jit_prefetch_interval_batches\": "
-       << args.jit_prefetch_interval_batches << ",\n";
-  json << "  \"jit_prefetch_max_pages_per_query\": "
-       << args.jit_prefetch_max_pages_per_query << ",\n";
   json << "  \"io_mode\": \"" << io_mode_summary << "\",\n";
   json << "  \"io_requested_mode\": \"" << json_escape(io_status.requested_mode)
        << "\",\n";
@@ -1207,6 +1103,20 @@ std::string json_for_run(const Args& args,
   json << "  \"odirect_enabled\": " << io_status.direct_enabled << ",\n";
   json << "  \"io_fallback_reason\": \""
        << json_escape(io_status.fallback_reason) << "\",\n";
+  json << "  \"enable_prefetch\": " << args.enable_prefetch << ",\n";
+  json << "  \"prefetch_policy\": \""
+       << json_escape(args.prefetch_policy) << "\",\n";
+  json << "  \"prefetch_runtime_enabled\": "
+       << (args.prefetch_policy == "topology" && io_status.io_uring_enabled)
+       << ",\n";
+  json << "  \"prefetch_trigger\": \"post_expand\",\n";
+  json << "  \"prefetch_candidate_multiplier\": 2,\n";
+  json << "  \"prefetch_adaptive\": " << args.prefetch_adaptive << ",\n";
+  json << "  \"prefetch_top_k\": " << args.prefetch_top_k << ",\n";
+  json << "  \"prefetch_max_inflight\": " << args.prefetch_max_inflight
+       << ",\n";
+  json << "  \"prefetch_max_pages_per_query\": "
+       << args.prefetch_max_pages_per_query << ",\n";
   json << "  \"cache_policy\": \"" << json_escape(args.cache_policy)
        << "\",\n";
   json << "  \"cache_pages\": " << args.cache_pages << ",\n";
@@ -1223,17 +1133,9 @@ std::string json_for_run(const Args& args,
   json << "  \"estimated_resident_ratio\": "
        << memory_budget.estimated_resident_ratio << ",\n";
   json << "  \"top_k\": " << args.top_k << ",\n";
-  json << "  \"entry_count\": " << args.entry_count << ",\n";
-  json << "  \"entry_strategy\": \"" << json_escape(args.entry_strategy)
-       << "\",\n";
+  json << "  \"entry_count\": 1,\n";
+  json << "  \"entry_strategy\": \"single-medoid\",\n";
   json << "  \"entry_seed_count\": " << entry_seed_ids.size() << ",\n";
-  json << "  \"entry_hub_count\": " << args.entry_hub_count << ",\n";
-  json << "  \"entry_cluster_count\": " << args.entry_cluster_count
-       << ",\n";
-  json << "  \"entry_cluster_train_limit\": "
-       << args.entry_cluster_train_limit << ",\n";
-  json << "  \"entry_cluster_iterations\": "
-       << args.entry_cluster_iterations << ",\n";
   json << "  \"entry_seed_ids\": [";
   for (std::size_t i = 0; i < entry_seed_ids.size(); ++i) {
     if (i != 0) {
@@ -1248,7 +1150,7 @@ std::string json_for_run(const Args& args,
   json << "  \"enable_pq\": " << args.enable_pq << ",\n";
   json << "  \"pq_enabled\": " << args.enable_pq << ",\n";
   json << "  \"pq_adc_enabled\": " << pq_stats.has_value() << ",\n";
-  json << "  \"pq_subspaces\": " << args.pq_subspaces << ",\n";
+  json << "  \"pq_subspaces\": " << index_metadata.pq_subspaces << ",\n";
   json << "  \"effective_pq_subspaces\": ";
   if (pq_stats.has_value()) {
     json << pq_stats->subspaces;
@@ -1256,9 +1158,7 @@ std::string json_for_run(const Args& args,
     json << "null";
   }
   json << ",\n";
-  json << "  \"pq_centroids\": " << args.pq_centroids << ",\n";
-  json << "  \"pq_train_limit\": " << args.pq_train_limit << ",\n";
-  json << "  \"pq_iterations\": " << args.pq_iterations << ",\n";
+  json << "  \"pq_centroids\": " << index_metadata.pq_centroids << ",\n";
   json << "  \"pq_training_vectors\": ";
   if (pq_stats.has_value()) {
     json << pq_stats->training_vectors;
@@ -1286,7 +1186,9 @@ std::string json_for_run(const Args& args,
        << ",\n";
   json << "  \"index_path\": \"" << json_escape(args.index_path.string())
        << "\",\n";
-  json << "  \"rebuilt_index\": " << rebuilt_index << ",\n";
+  json << "  \"build_manifest\": \""
+       << json_escape(args.manifest_path.string())
+       << "\",\n";
   json << "  \"binary_path\": \"" << json_escape(binary_path.string())
        << "\",\n";
   json << "  \"binary_mtime\": " << binary_mtime_seconds(binary_path)
@@ -1307,9 +1209,6 @@ std::string json_for_run(const Args& args,
   json << "  \"latency_p99_ms\": " << latency_p99_ms << ",\n";
   json << "  \"reads_per_query\": " << reads_per_query << ",\n";
   json << "  \"demand_reads_per_query\": " << demand_reads_per_query << ",\n";
-  json << "  \"prefetch_reads_per_query\": " << prefetch_reads_per_query
-       << ",\n";
-  json << "  \"ready_hit_ratio\": " << ready_hit_ratio << ",\n";
   json << "  \"duplicate_skipped_per_query\": "
        << duplicate_skipped_per_query << ",\n";
   json << "  \"cache_hit_rate\": " << cache_hit_rate << ",\n";
@@ -1331,18 +1230,17 @@ std::string json_for_run(const Args& args,
   json << "    \"page_requests\": " << aggregate.stats.page_requests << ",\n";
   json << "    \"cache_hits\": " << aggregate.stats.cache_hits << ",\n";
   json << "    \"pinned_hits\": " << aggregate.stats.pinned_hits << ",\n";
-  json << "    \"pending_hits\": " << aggregate.stats.pending_hits << ",\n";
   json << "    \"demand_reads\": " << aggregate.stats.demand_reads << ",\n";
-  json << "    \"prefetch_reads\": " << aggregate.stats.prefetch_reads
-       << ",\n";
+  json << "    \"unique_nodes_accessed\": "
+       << aggregate.stats.unique_nodes_accessed << ",\n";
   json << "    \"unique_pages_touched\": "
        << aggregate.stats.unique_pages_touched << ",\n";
+  json << "    \"nodes_used_per_loaded_page\": "
+       << nodes_used_per_loaded_page << ",\n";
+  json << "    \"page_fill_utilization\": " << page_fill_utilization
+       << ",\n";
   json << "    \"unique_demand_pages\": "
        << aggregate.stats.unique_demand_pages << ",\n";
-  json << "    \"unique_prefetch_pages\": "
-       << aggregate.stats.unique_prefetch_pages << ",\n";
-  json << "    \"prefetch_only_pages\": "
-       << aggregate.stats.prefetch_only_pages << ",\n";
   json << "    \"duplicate_skipped\": "
        << aggregate.stats.duplicate_skipped << ",\n";
   json << "    \"submitted_reads\": " << aggregate.stats.submitted_reads
@@ -1360,6 +1258,8 @@ std::string json_for_run(const Args& args,
        << ",\n";
   json << "    \"search_mutex_wait_us\": "
        << aggregate.stats.search_mutex_wait_us << ",\n";
+  json << "    \"demand_read_wait_us\": "
+       << aggregate.stats.demand_read_wait_us << ",\n";
   json << "    \"io_submits\": " << aggregate.stats.io_submits << ",\n";
   json << "    \"io_completions\": " << aggregate.stats.io_completions
        << ",\n";
@@ -1369,83 +1269,22 @@ std::string json_for_run(const Args& args,
        << aggregate.stats.uring_submit_count << ",\n";
   json << "    \"uring_cqe_count\": " << aggregate.stats.uring_cqe_count
        << ",\n";
-  json << "    \"io_prefetches\": " << aggregate.stats.io_prefetches
-       << ",\n";
-  json << "    \"io_prefetch_hits\": " << aggregate.stats.io_prefetch_hits
-       << ",\n";
-  json << "    \"io_prefetch_waits\": " << aggregate.stats.io_prefetch_waits
-       << ",\n";
-  json << "    \"io_pending_pages_peak\": "
-       << aggregate.stats.io_pending_pages_peak << ",\n";
   json << "    \"batch_count\": " << aggregate.stats.batch_count << ",\n";
   json << "    \"avg_batch_size\": " << avg_batch_size << ",\n";
   json << "    \"max_batch_size\": " << aggregate.stats.max_batch_size
        << ",\n";
   json << "    \"beam_unique_pages\": "
        << aggregate.stats.beam_unique_pages << ",\n";
-  json << "    \"beam_cached_or_pending_pages\": "
-       << aggregate.stats.beam_cached_or_pending_pages << ",\n";
-  json << "    \"jit_prefetch_windows\": "
-       << aggregate.stats.jit_prefetch_windows << ",\n";
-  json << "    \"jit_prefetch_skipped_by_interval\": "
-       << aggregate.stats.jit_prefetch_skipped_by_interval << ",\n";
-  json << "    \"jit_prefetch_budget_exhausted\": "
-       << aggregate.stats.jit_prefetch_budget_exhausted << ",\n";
-  json << "    \"jit_prefetch_candidates_capped\": "
-       << aggregate.stats.jit_prefetch_candidates_capped << ",\n";
+  json << "    \"beam_cached_pages\": "
+       << aggregate.stats.beam_cached_pages << ",\n";
   json << "    \"page_dedup_requests\": "
        << aggregate.stats.page_dedup_requests << ",\n";
   json << "    \"page_dedup_hits\": " << aggregate.stats.page_dedup_hits
        << ",\n";
   json << "    \"duplicate_pages_eliminated\": "
        << aggregate.stats.duplicate_pages_eliminated << ",\n";
-  json << "    \"prefetch_submitted_pages\": "
-       << aggregate.stats.prefetch_submitted_pages << ",\n";
-  json << "    \"prefetch_useful_pages\": "
-       << aggregate.stats.prefetch_useful_pages << ",\n";
-  json << "    \"prefetch_wasted_pages\": "
-       << aggregate.stats.prefetch_wasted_pages << ",\n";
-  json << "    \"prefetch_submitted\": "
-       << aggregate.stats.prefetch_submitted << ",\n";
-  json << "    \"prefetch_completed\": "
-       << aggregate.stats.prefetch_completed << ",\n";
-  json << "    \"prefetch_ready_hit\": "
-       << aggregate.stats.prefetch_ready_hit << ",\n";
-  json << "    \"prefetch_pending_hit\": "
-       << aggregate.stats.prefetch_pending_hit << ",\n";
-  json << "    \"prefetch_late_hit\": "
-       << aggregate.stats.prefetch_late_hit << ",\n";
-  json << "    \"prefetch_dropped\": "
-       << aggregate.stats.prefetch_dropped << ",\n";
-  json << "    \"prefetch_promoted\": "
-       << aggregate.stats.prefetch_promoted << ",\n";
-  json << "    \"prefetch_cache_pollution_avoided\": "
-       << aggregate.stats.prefetch_cache_pollution_avoided << ",\n";
-  json << "    \"demand_priority_blocks_prefetch\": "
-       << aggregate.stats.demand_priority_blocks_prefetch << ",\n";
-  json << "    \"ready_hit_ratio\": " << ready_hit_ratio << ",\n";
-  json << "    \"prefetch_skip_seen_before\": "
-       << aggregate.stats.prefetch_skip_seen_before << ",\n";
-  json << "    \"prefetch_skip_cached\": "
-       << aggregate.stats.prefetch_skip_cached << ",\n";
-  json << "    \"prefetch_skip_pending\": "
-       << aggregate.stats.prefetch_skip_pending << ",\n";
-  json << "    \"prefetch_skip_materialized\": "
-       << aggregate.stats.prefetch_skip_materialized << ",\n";
-  json << "    \"prefetch_skip_budget_full\": "
-       << aggregate.stats.prefetch_skip_budget_full << ",\n";
-  json << "    \"prefetch_skip_low_page_reuse\": "
-       << aggregate.stats.prefetch_skip_low_page_reuse << ",\n";
-  json << "    \"prefetch_skip_score_threshold\": "
-       << aggregate.stats.prefetch_skip_score_threshold << ",\n";
-  json << "    \"prefetch_skip_inflight_full\": "
-       << aggregate.stats.prefetch_skip_inflight_full << ",\n";
-  json << "    \"prefetch_skip_too_late\": "
-       << aggregate.stats.prefetch_skip_too_late << ",\n";
-  json << "    \"prefetch_evicted_before_use\": "
-       << aggregate.stats.prefetch_evicted_before_use << ",\n";
-  json << "    \"prefetch_unused\": "
-       << aggregate.stats.prefetch_only_pages << ",\n";
+  json << "    \"same_page_node_reuse\": "
+       << aggregate.stats.same_page_node_reuse << ",\n";
   json << "    \"adc_table_build_us\": "
        << aggregate.stats.adc_table_build_us << ",\n";
   json << "    \"rerank_reads\": " << aggregate.stats.rerank_reads << ",\n";
@@ -1454,7 +1293,50 @@ std::string json_for_run(const Args& args,
   json << "    \"pq_filter_reject_count\": "
        << aggregate.stats.pq_filter_reject_count << ",\n";
   json << "    \"distance_direct_calls\": "
-       << aggregate.stats.distance_direct_calls << "\n";
+       << aggregate.stats.distance_direct_calls << ",\n";
+  json << "    \"unique_prefetch_pages\": "
+       << aggregate.stats.unique_prefetch_pages << ",\n";
+  json << "    \"prefetch_candidate_nodes\": "
+       << aggregate.stats.prefetch_candidate_nodes << ",\n";
+  json << "    \"prefetch_candidate_pages\": "
+       << aggregate.stats.prefetch_candidate_pages << ",\n";
+  json << "    \"prefetch_submitted\": "
+       << aggregate.stats.prefetch_submitted << ",\n";
+  json << "    \"prefetch_submit_batches\": "
+       << aggregate.stats.prefetch_submit_batches << ",\n";
+  json << "    \"prefetch_ready_hit\": "
+       << aggregate.stats.prefetch_ready_hit << ",\n";
+  json << "    \"prefetch_pending_hit\": "
+       << aggregate.stats.prefetch_pending_hit << ",\n";
+  json << "    \"prefetch_useful_pages\": "
+       << aggregate.stats.prefetch_useful_pages << ",\n";
+  json << "    \"prefetch_wasted_pages\": "
+       << aggregate.stats.prefetch_wasted_pages << ",\n";
+  json << "    \"prefetch_skip_cached\": "
+       << aggregate.stats.prefetch_skip_cached << ",\n";
+  json << "    \"prefetch_skip_pending\": "
+       << aggregate.stats.prefetch_skip_pending << ",\n";
+  json << "    \"prefetch_skip_seen\": "
+       << aggregate.stats.prefetch_skip_seen << ",\n";
+  json << "    \"prefetch_skip_budget\": "
+       << aggregate.stats.prefetch_skip_budget << ",\n";
+  json << "    \"demand_priority_blocks_prefetch\": "
+       << aggregate.stats.demand_priority_blocks_prefetch << ",\n";
+  json << "    \"prefetch_adaptive_pause_count\": "
+       << aggregate.stats.prefetch_adaptive_pause_count << ",\n";
+  json << "    \"prefetch_adaptive_final_top_k\": "
+       << aggregate.stats.prefetch_adaptive_final_top_k << ",\n";
+  json << "    \"prefetch_adaptive_final_lead\": "
+       << aggregate.stats.prefetch_adaptive_final_lead << ",\n";
+  json << "    \"prefetch_saved_wait_us\": "
+       << aggregate.stats.prefetch_saved_wait_us << ",\n";
+  json << "    \"prefetch_planner_cpu_us\": "
+       << aggregate.stats.prefetch_planner_cpu_us << ",\n";
+  json << "    \"prefetch_planner_cpu_ratio\": "
+       << (aggregate.elapsed_ms == 0.0 ? 0.0
+                                      : aggregate.stats.prefetch_planner_cpu_us /
+                                            (aggregate.elapsed_ms * 1000.0))
+       << "\n";
   json << "  },\n";
   json << "  \"warning\": ";
   if (warnings.empty()) {
@@ -1490,20 +1372,6 @@ void write_json_output(const fs::path& output_path, const std::string& json) {
   output << json;
 }
 
-void prepare_prefetch_trace(const fs::path& trace_path) {
-  if (trace_path.empty()) {
-    return;
-  }
-  if (!trace_path.parent_path().empty()) {
-    fs::create_directories(trace_path.parent_path());
-  }
-  std::ofstream output(trace_path, std::ios::trunc);
-  if (!output) {
-    throw std::runtime_error("Cannot create prefetch trace: " +
-                             trace_path.string());
-  }
-}
-
 }  // namespace
 
 int main(int argc, char** argv) {
@@ -1526,54 +1394,44 @@ int main(int argc, char** argv) {
           "rerank_topk=0 with PQ enabled; exact rerank is disabled");
     }
     const fs::path binary_path = fs::absolute(argv[0]);
-    const auto dataset = load_input_dataset(args);
-    if (args.enable_pq && args.pq_subspaces > dataset.base.dim) {
-      warnings.push_back(
-          "effective_pq_subspaces=clamp(requested_pq_subspaces, 1, dim)");
+    if (!fs::exists(args.index_path)) {
+      throw std::runtime_error("Packed graph index does not exist; run agent-aware-build first: " +
+                               args.index_path.string());
     }
-
-    agent_aware::PqAdcModel pq_model;
-    const auto pq_stats =
-        train_pq_if_enabled(args, dataset.base, pq_model);
-    const agent_aware::PqAdcModel* pq_model_ptr =
-        pq_stats.has_value() ? &pq_model : nullptr;
-    const auto memory_budget =
-        apply_memory_budget_defaults(args, dataset, pq_stats, warnings);
+    agent_aware::PackedDiskGraphIndex index(args.index_path.string());
+    if (args.manifest_path.empty()) {
+      args.manifest_path = fs::path(args.index_path.string() + ".manifest.json");
+    }
+    const auto build_manifest =
+        load_build_manifest(args.manifest_path, index.metadata());
+    const auto dataset = load_input_dataset(args, index.metadata());
     if (args.num_search_threads > 1 && args.cache_pages > 0) {
       warnings.push_back(
           "num_search_threads uses one page cache per worker");
     }
 
-    bool rebuilt_index = false;
-    build_index_if_needed(args, dataset.base, pq_model_ptr, rebuilt_index);
-
-    agent_aware::PackedDiskGraphIndex index(args.index_path.string());
+    const agent_aware::PqAdcModel* pq_model_ptr = &index.pq_model();
+    const auto pq_stats = std::optional<agent_aware::PQTrainingStats>(
+        pq_stats_from_model(index.pq_model(), 0));
+    const auto memory_budget =
+        apply_memory_budget_defaults(args, dataset, index.metadata(), pq_stats,
+                                     warnings);
     configure_index_from_args(args, index);
     const auto io_status = index.io_status();
-    const bool runtime_prefetch_enabled =
-        args.enable_prefetch && io_status.io_uring_enabled &&
-        args.prefetch_policy != "none";
-    if (args.enable_prefetch && !runtime_prefetch_enabled) {
-      warnings.push_back(
-          "prefetch was requested but not enabled by the effective I/O mode");
-    }
     if (!io_status.fallback_reason.empty()) {
       warnings.push_back("I/O mode fell back: " + io_status.fallback_reason);
     }
 
-    const auto entry_seed_ids = select_search_entries(args, dataset, index);
+    const auto entry_seed_ids = select_search_entries(build_manifest);
     if (args.warmup_query_limit > 0) {
-      Args warmup_args = args;
-      warmup_args.prefetch_trace_path.clear();
-      (void)run_searches(warmup_args, dataset, index, pq_model_ptr,
+      (void)run_searches(args, dataset, index, pq_model_ptr,
                          entry_seed_ids, args.warmup_query_limit);
     }
-    prepare_prefetch_trace(args.prefetch_trace_path);
     const auto aggregate =
         run_searches(args, dataset, index, pq_model_ptr, entry_seed_ids);
     const std::string json =
-        json_for_run(args, dataset, io_status, aggregate, binary_path,
-                     rebuilt_index, runtime_prefetch_enabled, pq_stats,
+        json_for_run(args, dataset, index.metadata(), io_status, aggregate, binary_path,
+                     pq_stats,
                      memory_budget, entry_seed_ids, warnings);
     write_json_output(args.output_json, json);
     std::cout << json;

@@ -1,4 +1,4 @@
-#include "agent_aware/core/brute_force.h"
+#include "core/brute_force.h"
 
 #include <algorithm>
 #include <queue>

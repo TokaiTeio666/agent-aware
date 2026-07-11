@@ -1,12 +1,10 @@
 # Recall 达标后转向 I/O 放大与尾延迟优化计划
 
-> 关联文档：主计划 `PROJECT_PLAN.md` §8.1 P8、预取排序 `docs/design/XGBOOST_PREFETCH_PLAN.md`、提前触发 `docs/design/07-prefetch-early-trigger-plan.md`、答辩补强 `docs/roadmap/defense-gap-closure-plan.md`
 >
 > 最后更新：2026-06-25
 
 ## 0. 背景与目标
 
-当前项目已经具备 SIFT1M SSD packed graph 查询、混合读写、动态 delta、读路径 breakdown、cache / prefetch / io_uring 等基础能力。下一阶段的目标不再是单纯继续拉高 Recall，而是在固定 Recall 下限的前提下，系统性降低：
 
 - 每次查询的 SSD 读次数；
 - 每次查询读取字节数；
@@ -81,7 +79,6 @@ SIFT1M SSD packed Vamana 主索引
 | graph stats | `expanded`、`visited` | 图搜索扩展和访问节点数 |
 | graph stats | `page_requests_before_dedup`、`page_requests_after_dedup` | page 去重效果 |
 | graph stats | `page_cache_hits/misses/evictions/promotions` | 缓存行为 |
-| graph stats | `prefetch_*` | 预取提交、命中、浪费、跳过原因 |
 | graph stats | `batch_count`、`batch_expanded`、`max_batch_size` | beam batch 生效情况 |
 | graph stats | `rerank_reads` | rerank 引入的额外读取 |
 | graph stats | `pq_filter_reject_count/accept_count` | PQ filter 裁剪效果 |
@@ -93,7 +90,6 @@ SIFT1M SSD packed Vamana 主索引
 | `include/graph/disk_graph_index.h` | `DiskGraphSearchConfig`、`DiskGraphSearchStats` |
 | `src/graph/disk_graph_index.cpp` | packed graph 搜索、batch、early stop、rerank |
 | `include/core/query_page_session.h` | query 级 page 生命周期 |
-| `src/core/query_page_session.cpp` | page dedup、cache、prefetch、batch load |
 | `include/core/io_stats.h` | `P4IoStats` |
 | `include/engine/storage_engine.h` | `EngineSearchStats`、read timing |
 | `src/engine/storage_engine.cpp` | base / latest / delta / merge 分段 |
@@ -109,10 +105,7 @@ SIFT1M SSD packed Vamana 主索引
 | --- | --- | --- |
 | `bytes_read_per_read` | benchmark | `submitted_reads * page_size / read_ops` |
 | `demand_bytes_read_per_read` | benchmark | demand read 读取字节 |
-| `prefetch_bytes_read_per_read` | benchmark | prefetch read 读取字节 |
-| `wasted_prefetch_bytes_per_read` | benchmark | `prefetch_wasted_pages * page_size / read_ops` |
 | `unique_pages_per_read` | graph | query 内实际 unique page 数 |
-| `duplicate_pages_per_read` | graph | batch / prefetch 去重前后的差值 |
 | `candidate_pushes_per_read` | graph | 邻居进入候选队列次数 |
 | `candidate_pops_per_read` | graph | 从候选队列弹出次数 |
 | `base_candidates_before_filter` | engine | base graph 返回或中间候选数 |
@@ -134,8 +127,6 @@ JSON 建议结构：
     "submitted_reads_per_read": 318.0,
     "bytes_read_per_read": 1302528.0,
     "demand_bytes_read_per_read": 1048576.0,
-    "prefetch_bytes_read_per_read": 253952.0,
-    "wasted_prefetch_bytes_per_read": 49152.0,
     "unique_pages_per_read": 280.0,
     "duplicate_pages_per_read": 38.0
   },
@@ -276,7 +267,6 @@ cmake --build build -j$(nproc)
 | --- | --- | --- |
 | P0 | 输出 bytes/read | `src/mixed_rw_benchmark.cpp` |
 | P0 | 聚合 `expanded/visited/batch/rerank` per read | `append_read_timing`、`finalize_result` |
-| P0 | 输出 demand / prefetch / wasted bytes | `DiskGraphSearchStats` + JSON |
 | P1 | 增加 candidate push/pop 统计 | `src/graph/disk_graph_index.cpp` |
 | P1 | 增加 base/delta/merge candidate count | `EngineSearchStats`、`src/engine/storage_engine.cpp` |
 | P1 | 输出 top slow query 样本 | `src/mixed_rw_benchmark.cpp` |
@@ -285,10 +275,8 @@ cmake --build build -j$(nproc)
 
 | 指标 | 判断方式 |
 | --- | --- |
-| `bytes_read_per_read` 高 | page size、search_width、cache miss 或 prefetch 过度 |
 | `unique_pages_per_read` 高 | 搜索路径分散，布局或图质量问题 |
 | `duplicate_pages_per_read` 高 | batch page 去重价值大，或候选集中同页节点多 |
-| `wasted_prefetch_bytes_per_read` 高 | prefetch 太激进，应降 `prefetch_width/depth` |
 | `candidate_pushes_per_read / expanded_per_read` 高 | 邻居扩张过宽，需要过滤或 early stop |
 | `delta_candidates_scanned` 高 | delta brute force 到达瓶颈 |
 | `rerank_reads` 高 | rerank 候选过多，或 full vector 读取后置成本高 |
@@ -318,7 +306,6 @@ recall_sample_rate = 0
 
 ### 输出表
 
-| run_id | Recall@10 | QPS | P95 | P99 | reads/q | bytes/q | unique_pages/q | cache_hit | wasted_prefetch/q |
 | --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
 | SW128-B16 | | | | | | | | | |
 | SW192-B16 | | | | | | | | | |
@@ -331,7 +318,6 @@ recall_sample_rate = 0
 
 ```text
 当前 P99 主要来自 base_search、page_read_wait、delta_search、merge、还是 search_mutex_wait。
-当前 I/O 放大主要来自 search_width、cache miss、prefetch waste、rerank，还是 delta。
 ```
 
 ---
@@ -466,7 +452,7 @@ coaccess_trace_length
 hotpath_queries
 hotpath_search_width
 hotpath_entry_count
-neighbor_pq_code_bytes
+pq_subspaces / pq_codes_bytes
 ```
 
 建议按以下顺序推进。
@@ -529,29 +515,18 @@ neighbor_pq_code_bytes
 
 | 指标 | 处理 |
 | --- | --- |
-| `prefetch_useful_pages / prefetch_submitted_pages` 低 | 降低 `prefetch_width` |
-| `prefetch_wasted_pages` 高 | 降低 `prefetch_depth` 或启用更严格 page reuse 判断 |
-| `demand_priority_blocks_prefetch` 高 | demand reserve 太紧，或 prefetch 太激进 |
-| `prefetch_skip_cached` 高 | cache 已覆盖，减少预取 |
-| `prefetch_pending_hit` 高 | 预取方向正确，但完成不够早 |
 
 预取参数：
 
 | 参数 | 取值 |
 | --- | --- |
-| `prefetch_policy` | `none / frontier-next-hop` |
-| `prefetch_width` | `0 / 4 / 8 / 16` |
-| `prefetch_depth` | `0 / 1` |
-| `prefetch_min_candidates_per_page` | `1 / 2 / 4` |
 
 ### Phase 3 验收标准
 
 | 指标 | 目标 |
 | --- | ---: |
 | cache hit rate | 比 Phase 0 上升 |
-| useful prefetch ratio | `>= 0.50`，否则默认关闭或收紧 |
 | unique pages/query | 比 Phase 2 继续下降 |
-| bytes/query | 不因 page size 或 prefetch 明显反弹 |
 | P99 | 比 Phase 2 下降 |
 
 ---
@@ -606,7 +581,6 @@ neighbor_pq_code_bytes
 | 优先级 | 问题 | 动作 |
 | --- | --- | --- |
 | P0 | 锁导致串行 | 观察 `search_mutex_wait_ms_per_read`，必要时拆分 `search_mutex_` 保护范围 |
-| P0 | prefetch 抢占 demand I/O | 保留 demand reserve，限制 prefetch budget |
 | P0 | 大 query 拖慢普通 query | 增加 per-query deadline 和 max page reads |
 | P1 | cache 全局锁竞争 | 分片 cache 锁或读写锁 |
 | P1 | 少数 query miss 爆炸 | 输出 top slow query trace，分析路径 |
@@ -663,7 +637,6 @@ neighbor_pq_code_bytes
 | D6-D7 | early stop / beam / PQ filter 对照 | candidate 裁剪结果 |
 | D8 | delta 规模压力测试 | delta 阈值结论 |
 | D9 | cache policy / cache_pages 对照 | cache 曲线 |
-| D10 | prefetch width/depth 对照 | useful/wasted prefetch 曲线 |
 
 ### Week 3：布局和尾延迟
 
@@ -727,7 +700,6 @@ benchmark_config
   先调 search_width / beam_width / early_stop / PQ filter
 
 如果 page_read_wait 占比最高：
-  先看 cache_hit_rate、bytes/q、prefetch_waste，再调 cache 和 prefetch
 
 如果 search_mutex_wait 占比高：
   优先拆锁或改每线程独立 reader/cache 共享策略
@@ -741,8 +713,6 @@ benchmark_config
 如果 Recall 低于护栏：
   回退最近一次裁剪，优先修图质量或提高 search_width，不继续压 I/O
 
-如果 prefetch_wasted_bytes 高：
-  降 prefetch_width/depth，或关闭预取作为默认配置
 ```
 
 ---
@@ -760,7 +730,6 @@ benchmark_config
 
 ### 表 2：I/O 放大
 
-| config | reads/q | bytes/q | unique pages/q | duplicate pages/q | wasted prefetch bytes/q |
 | --- | ---: | ---: | ---: | ---: | ---: |
 | baseline | | | | | |
 | Phase 2 | | | | | |
@@ -808,7 +777,6 @@ benchmark_config
 | reads/query | 相比 Phase 0 降低 `>= 30%` |
 | bytes/query | 相比 Phase 0 降低 `>= 30%` |
 | P99 | 相比 Phase 0 降低 `>= 25%` |
-| useful prefetch ratio | `>= 0.50`，否则默认收紧或关闭 |
 | cache hit rate | 不低于 Phase 0 |
 | dirty dynamic correctness | insert/update/delete 语义不回退 |
 
@@ -817,4 +785,3 @@ benchmark_config
 ```text
 Recall 护栏 > 正确性 > P99 > bytes/query > QPS > 平均延迟
 ```
-

@@ -1,4 +1,4 @@
-#include "agent_aware/dynamic/memtable.h"
+#include "dynamic/memtable.h"
 
 #include <mutex>
 

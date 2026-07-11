@@ -1,4 +1,4 @@
-#include "agent_aware/dynamic/manifest.h"
+#include "dynamic/manifest.h"
 
 #include <charconv>
 #include <cctype>

@@ -24,12 +24,12 @@
 #include <utility>
 #include <vector>
 
-#include "agent_aware/core/benchmark_support.h"
-#include "agent_aware/core/brute_force.h"
-#include "agent_aware/data/dataset.h"
-#include "agent_aware/dynamic/dynamic_write_manager.h"
-#include "agent_aware/dynamic/manifest.h"
-#include "agent_aware/engine/storage_engine.h"
+#include "core/benchmark_support.h"
+#include "core/brute_force.h"
+#include "data/dataset.h"
+#include "dynamic/dynamic_write_manager.h"
+#include "dynamic/manifest.h"
+#include "engine/storage_engine.h"
 
 namespace {
 
@@ -49,6 +49,9 @@ struct Args {
   double write_ratio = -1.0;
   std::size_t topk = 10;
   std::size_t insert_batch_size = 1;
+  double insert_ratio = 1.0;
+  double update_ratio = 0.0;
+  double delete_ratio = 0.0;
   bool enable_flush = true;
   bool enable_compaction = false;
   bool compaction_background = false;
@@ -60,6 +63,11 @@ struct Args {
   std::size_t dim = 32;
   std::size_t memtable_flush_bytes = 256 * 1024;
   std::size_t dynamic_graph_degree = 16;
+  std::size_t write_queue_capacity = 4096;
+  std::size_t wal_group_max_records = 64;
+  std::size_t wal_group_max_delay_us = 1000;
+  std::size_t version_index_shards = 64;
+  std::size_t neighbor_candidate_limit = 1024;
   std::size_t search_width = 350;
   std::size_t entry_count = 64;
   std::size_t beam_width = 16;
@@ -68,13 +76,27 @@ struct Args {
   std::size_t io_depth = 32;
   std::string cache_policy = "graph-aware-2q";
   std::size_t cache_pages = 0;
+  std::size_t pq_subspaces = 32;
+  std::size_t pq_centroids = 256;
+  std::size_t pq_train_limit = 100000;
+  std::size_t pq_iterations = 8;
+  std::size_t rerank_topk = 100;
   std::uint32_t seed = 42;
+};
+
+struct PqRuntime {
+  std::shared_ptr<const agent_aware::PqAdcModel> model;
+  agent_aware::PQTrainingStats stats;
+  double training_ms = 0.0;
 };
 
 struct Scenario {
   std::string name;
   double read_ratio = 0.0;
   double write_ratio = 0.0;
+  double insert_ratio = 1.0;
+  double update_ratio = 0.0;
+  double delete_ratio = 0.0;
 };
 
 struct Percentiles {
@@ -119,6 +141,9 @@ struct ScenarioResult {
   std::string scenario;
   double read_ratio = 0.0;
   double write_ratio = 0.0;
+  double insert_ratio = 1.0;
+  double update_ratio = 0.0;
+  double delete_ratio = 0.0;
   std::size_t read_threads = 0;
   std::size_t write_threads = 0;
   double duration_sec = 0.0;
@@ -126,6 +151,16 @@ struct ScenarioResult {
   std::size_t search_width = 0;
   std::size_t beam_width = 0;
   std::size_t entry_count = 0;
+  bool pq_adc_enabled = false;
+  std::size_t pq_subspaces = 0;
+  std::size_t effective_pq_subspaces = 0;
+  std::size_t pq_centroids = 0;
+  std::size_t pq_train_limit = 0;
+  std::size_t pq_iterations = 0;
+  std::size_t rerank_topk = 0;
+  std::size_t pq_code_bytes = 0;
+  std::size_t pq_codebook_bytes = 0;
+  double pq_training_ms = 0.0;
   bool enable_compaction = false;
   bool compaction_background = false;
   double recall_max_samples_per_sec = 0.0;
@@ -136,6 +171,9 @@ struct ScenarioResult {
   std::string dynamic_dir;
   std::size_t read_ops = 0;
   std::size_t write_ops = 0;
+  std::size_t insert_ops = 0;
+  std::size_t update_ops = 0;
+  std::size_t delete_ops = 0;
   double read_qps = 0.0;
   double write_qps = 0.0;
   double total_qps = 0.0;
@@ -164,6 +202,7 @@ struct ScenarioResult {
   double search_mutex_wait_ms_per_read = 0.0;
   ReadBreakdownSummary read_breakdown;
   CompactionAggregate compaction;
+  agent_aware::dynamic::DynamicWriteStats write_pipeline;
 };
 
 struct ThreadMetrics {
@@ -172,6 +211,9 @@ struct ThreadMetrics {
   std::vector<double> write_latencies_ms;
   std::size_t read_ops = 0;
   std::size_t write_records = 0;
+  std::size_t insert_records = 0;
+  std::size_t update_records = 0;
+  std::size_t delete_records = 0;
   double recall_sum = 0.0;
   std::size_t recall_samples = 0;
   std::uint64_t recall_sequence_min = std::numeric_limits<std::uint64_t>::max();
@@ -180,6 +222,31 @@ struct ThreadMetrics {
   std::size_t exact_deleted_sum = 0;
   agent_aware::DiskGraphSearchStats graph_stats;
   ReadBreakdownSamples read_breakdown;
+};
+
+struct MutationState {
+  std::mutex mutex;
+  std::vector<agent_aware::NodeId> inserted_ids;
+
+  void remember_insert(agent_aware::NodeId node_id) {
+    std::lock_guard<std::mutex> lock(mutex);
+    inserted_ids.push_back(node_id);
+  }
+
+  agent_aware::NodeId choose_existing(std::size_t base_count,
+                                      std::mt19937& rng) {
+    std::lock_guard<std::mutex> lock(mutex);
+    const std::size_t population = base_count + inserted_ids.size();
+    if (population == 0) {
+      throw std::runtime_error("Mutation target population is empty");
+    }
+    std::uniform_int_distribution<std::size_t> choose(0, population - 1);
+    const auto offset = choose(rng);
+    if (offset < base_count) {
+      return static_cast<agent_aware::NodeId>(offset);
+    }
+    return inserted_ids[offset - base_count];
+  }
 };
 
 void print_help() {
@@ -199,13 +266,26 @@ void print_help() {
       << "  --recall_max_samples_per_sec R  Optional global recall sample rate cap\n"
       << "  --topk N                     Search top-k, default 10\n"
       << "  --insert_batch_size N        Inserts per write event\n"
+      << "  --insert_ratio R             Insert share within writes, default 1\n"
+      << "  --update_ratio R             Update share within writes, default 0\n"
+      << "  --delete_ratio R             Delete share within writes, default 0\n"
       << "  --dynamic_graph_degree N     Delta graph neighbor count\n"
+      << "  --write_queue_capacity N     Bounded mutation queue capacity\n"
+      << "  --wal_group_max_records N    Maximum records per group commit\n"
+      << "  --wal_group_max_delay_us N   Group commit collection delay\n"
+      << "  --version_index_shards N     Dynamic version index shard count\n"
+      << "  --neighbor_candidate_limit N Bounded delta neighbor candidates\n"
       << "  --search_width N             SSD graph expansion budget\n"
       << "  --entry_count N              SSD graph entry points\n"
       << "  --beam_width N               SSD graph beam batch width\n"
       << "  --io_mode NAME               pread, odirect, or io_uring\n"
       << "  --cache_policy NAME          none/lru/2q/graph-aware-2q\n"
       << "  --cache_pages N              SSD graph cache pages\n"
+      << "  --pq_subspaces N             PQ subspaces, default 32\n"
+      << "  --pq_centroids N             PQ centroids, default 256\n"
+      << "  --pq_train_limit N           PQ training vectors, default 100000\n"
+      << "  --pq_iterations N            PQ k-means iterations, default 8\n"
+      << "  --rerank_topk N              Exact rerank pool, default 100\n"
       << "  --enable_flush 0|1           Flush at end and allow auto flush\n"
       << "  --enable_compaction 0|1      Run compaction\n"
       << "  --compaction_background 0|1  Run compaction while workload runs\n"
@@ -233,6 +313,9 @@ Args parse_args(int argc, char** argv) {
   parser.take(args.recall_max_samples_per_sec, {"--recall_max_samples_per_sec"});
   parser.take(args.topk, {"--topk"});
   parser.take(args.insert_batch_size, {"--insert_batch_size"});
+  parser.take(args.insert_ratio, {"--insert_ratio"});
+  parser.take(args.update_ratio, {"--update_ratio"});
+  parser.take(args.delete_ratio, {"--delete_ratio"});
   parser.take(args.enable_flush, {"--enable_flush"});
   parser.take(args.enable_compaction, {"--enable_compaction"});
   parser.take(args.compaction_background, {"--compaction_background"});
@@ -242,6 +325,11 @@ Args parse_args(int argc, char** argv) {
   parser.take(args.dim, {"--dim"});
   parser.take(args.memtable_flush_bytes, {"--memtable_flush_bytes"});
   parser.take(args.dynamic_graph_degree, {"--dynamic_graph_degree"});
+  parser.take(args.write_queue_capacity, {"--write_queue_capacity"});
+  parser.take(args.wal_group_max_records, {"--wal_group_max_records"});
+  parser.take(args.wal_group_max_delay_us, {"--wal_group_max_delay_us"});
+  parser.take(args.version_index_shards, {"--version_index_shards"});
+  parser.take(args.neighbor_candidate_limit, {"--neighbor_candidate_limit"});
   parser.take(args.search_width, {"--search_width"});
   parser.take(args.entry_count, {"--entry_count"});
   parser.take(args.beam_width, {"--beam_width"});
@@ -250,20 +338,36 @@ Args parse_args(int argc, char** argv) {
   parser.take(args.io_depth, {"--io_depth"});
   parser.take(args.cache_policy, {"--cache_policy"});
   parser.take(args.cache_pages, {"--cache_pages"});
+  parser.take(args.pq_subspaces, {"--pq_subspaces"});
+  parser.take(args.pq_centroids, {"--pq_centroids"});
+  parser.take(args.pq_train_limit, {"--pq_train_limit"});
+  parser.take(args.pq_iterations, {"--pq_iterations"});
+  parser.take(args.rerank_topk, {"--rerank_topk"});
   parser.take(args.seed, {"--seed"});
   parser.finish();
   if (args.num_operations == 0 || args.topk == 0 ||
       args.insert_batch_size == 0 || args.search_width == 0 ||
       args.entry_count == 0 || args.beam_width == 0 || args.io_batch == 0 ||
-      args.io_depth == 0) {
+      args.io_depth == 0 || args.pq_subspaces == 0 ||
+      args.pq_train_limit == 0 || args.pq_iterations == 0 ||
+      args.write_queue_capacity == 0 || args.wal_group_max_records == 0 ||
+      args.version_index_shards == 0 || args.neighbor_candidate_limit == 0) {
     throw std::runtime_error(
-        "num_operations, topk, insert_batch_size, and SSD search parameters must be positive");
+        "num_operations, topk, insert_batch_size, PQ, and SSD search parameters must be positive");
+  }
+  if (args.pq_centroids < 2 || args.pq_centroids > 256) {
+    throw std::runtime_error("pq_centroids must be in [2,256]");
+  }
+  if (args.rerank_topk < args.topk) {
+    throw std::runtime_error("rerank_topk must be at least topk");
   }
   if (args.duration_sec < 0.0 || args.recall_sample_rate < 0.0 ||
       args.recall_sample_rate > 1.0 ||
-      args.recall_max_samples_per_sec < 0.0) {
+      args.recall_max_samples_per_sec < 0.0 || args.insert_ratio < 0.0 ||
+      args.update_ratio < 0.0 || args.delete_ratio < 0.0 ||
+      args.insert_ratio + args.update_ratio + args.delete_ratio <= 0.0) {
     throw std::runtime_error(
-        "duration_sec and recall_max_samples_per_sec must be non-negative; recall_sample_rate must be in [0,1]");
+        "duration/ratios must be non-negative, mutation ratios must sum above zero, and recall_sample_rate must be in [0,1]");
   }
   return args;
 }
@@ -537,9 +641,7 @@ void append_read_timing(ThreadMetrics& metrics,
   metrics.graph_stats.page_requests += stats.graph.page_requests;
   metrics.graph_stats.cache_hits += stats.graph.cache_hits;
   metrics.graph_stats.pinned_hits += stats.graph.pinned_hits;
-  metrics.graph_stats.pending_hits += stats.graph.pending_hits;
   metrics.graph_stats.demand_reads += stats.graph.demand_reads;
-  metrics.graph_stats.prefetch_reads += stats.graph.prefetch_reads;
   metrics.graph_stats.duplicate_skipped += stats.graph.duplicate_skipped;
   metrics.graph_stats.submitted_reads += stats.graph.submitted_reads;
   metrics.graph_stats.completed_reads += stats.graph.completed_reads;
@@ -623,11 +725,56 @@ bool allow_recall_sample(const Args& args,
   return false;
 }
 
+PqRuntime prepare_pq_runtime(const Args& args,
+                             const agent_aware::VectorSet& base) {
+  PqRuntime runtime;
+  if (args.index_path.empty()) {
+    return runtime;
+  }
+
+  agent_aware::PackedDiskGraphIndex index(args.index_path);
+  const auto& metadata = index.metadata();
+  if (metadata.vector_count != base.size()) {
+    throw std::runtime_error(
+        "Packed graph index vector count " +
+        std::to_string(metadata.vector_count) +
+        " does not match loaded base count " + std::to_string(base.size()));
+  }
+  if (metadata.dim != base.dim) {
+    throw std::runtime_error(
+        "Packed graph index dimension " + std::to_string(metadata.dim) +
+        " does not match loaded base dimension " +
+        std::to_string(base.dim));
+  }
+  if (metadata.pq_subspaces == 0) {
+    throw std::runtime_error(
+        "Packed graph V3 index does not contain a global PQ model");
+  }
+  if (metadata.pq_subspaces != args.pq_subspaces) {
+    throw std::runtime_error(
+        "Configured --pq_subspaces " + std::to_string(args.pq_subspaces) +
+        " does not match index PQ subspaces " +
+        std::to_string(metadata.pq_subspaces));
+  }
+  auto model = std::make_shared<agent_aware::PqAdcModel>(index.pq_model());
+  runtime.stats.vector_count = model->vector_count();
+  runtime.stats.dim = model->dim();
+  runtime.stats.subspaces = model->subspaces();
+  runtime.stats.centroids = model->centroids();
+  runtime.stats.code_bytes = model->code_bytes();
+  runtime.stats.codebook_bytes = model->codebook_bytes();
+  runtime.training_ms = 0.0;
+  runtime.model = std::move(model);
+  return runtime;
+}
+
 agent_aware::PackedGraphEngineConfig engine_config_for(const Args& args,
-    const std::shared_ptr<agent_aware::dynamic::DynamicWriteManager>& manager) {
+    const std::shared_ptr<agent_aware::dynamic::DynamicWriteManager>& manager,
+    const std::shared_ptr<const agent_aware::PqAdcModel>& pq_model) {
   agent_aware::PackedGraphEngineConfig engine_config;
   engine_config.index_path = args.index_path;
   engine_config.dynamic_manager = manager;
+  engine_config.pq_model = pq_model;
   engine_config.cache_policy = args.cache_policy;
   engine_config.cache_pages = args.cache_pages;
   engine_config.io_mode = args.io_mode;
@@ -636,6 +783,7 @@ agent_aware::PackedGraphEngineConfig engine_config_for(const Args& args,
   engine_config.search.search_width = args.search_width;
   engine_config.search.entry_count = args.entry_count;
   engine_config.search.beam_width = args.beam_width;
+  engine_config.search.rerank_topk = args.rerank_topk;
   return engine_config;
 }
 
@@ -645,6 +793,11 @@ std::shared_ptr<agent_aware::dynamic::DynamicWriteManager> open_manager(
   options.dynamic_dir = scenario_dir;
   options.memtable_flush_bytes = args.memtable_flush_bytes;
   options.dynamic_graph_degree = args.dynamic_graph_degree;
+  options.write_queue_capacity = args.write_queue_capacity;
+  options.wal_group_max_records = args.wal_group_max_records;
+  options.wal_group_max_delay_us = args.wal_group_max_delay_us;
+  options.version_index_shards = args.version_index_shards;
+  options.neighbor_candidate_limit = args.neighbor_candidate_limit;
   options.enable_wal = true;
   options.enable_auto_flush = args.enable_flush;
 
@@ -691,6 +844,9 @@ void merge_thread_metrics(ThreadMetrics& into, ThreadMetrics&& from) {
                                  from.write_latencies_ms.end());
   into.read_ops += from.read_ops;
   into.write_records += from.write_records;
+  into.insert_records += from.insert_records;
+  into.update_records += from.update_records;
+  into.delete_records += from.delete_records;
   into.recall_sum += from.recall_sum;
   into.recall_samples += from.recall_samples;
   into.recall_sequence_min =
@@ -703,9 +859,7 @@ void merge_thread_metrics(ThreadMetrics& into, ThreadMetrics&& from) {
   into.graph_stats.page_requests += from.graph_stats.page_requests;
   into.graph_stats.cache_hits += from.graph_stats.cache_hits;
   into.graph_stats.pinned_hits += from.graph_stats.pinned_hits;
-  into.graph_stats.pending_hits += from.graph_stats.pending_hits;
   into.graph_stats.demand_reads += from.graph_stats.demand_reads;
-  into.graph_stats.prefetch_reads += from.graph_stats.prefetch_reads;
   into.graph_stats.duplicate_skipped += from.graph_stats.duplicate_skipped;
   into.graph_stats.submitted_reads += from.graph_stats.submitted_reads;
   into.graph_stats.completed_reads += from.graph_stats.completed_reads;
@@ -743,11 +897,15 @@ ScenarioResult finalize_result(
     const std::vector<agent_aware::DynamicRecord>& delta_records,
     ThreadMetrics metrics, CompactionAggregate compaction,
     Clock::time_point start, Clock::time_point end, double flush_ms,
-    double recovery_ms) {
+    double recovery_ms, const PqRuntime& pq_runtime,
+    const agent_aware::dynamic::DynamicWriteStats& write_pipeline) {
   ScenarioResult result;
   result.scenario = scenario.name;
   result.read_ratio = scenario.read_ratio;
   result.write_ratio = scenario.write_ratio;
+  result.insert_ratio = args.insert_ratio;
+  result.update_ratio = args.update_ratio;
+  result.delete_ratio = args.delete_ratio;
   result.read_threads = args.read_threads;
   result.write_threads = args.write_threads;
   result.duration_sec = elapsed_seconds(start, end);
@@ -755,6 +913,16 @@ ScenarioResult finalize_result(
   result.search_width = args.search_width;
   result.beam_width = args.beam_width;
   result.entry_count = args.entry_count;
+  result.pq_adc_enabled = pq_runtime.model != nullptr;
+  result.pq_subspaces = args.pq_subspaces;
+  result.effective_pq_subspaces = pq_runtime.stats.subspaces;
+  result.pq_centroids = pq_runtime.stats.centroids;
+  result.pq_train_limit = args.pq_train_limit;
+  result.pq_iterations = args.pq_iterations;
+  result.rerank_topk = args.rerank_topk;
+  result.pq_code_bytes = pq_runtime.stats.code_bytes;
+  result.pq_codebook_bytes = pq_runtime.stats.codebook_bytes;
+  result.pq_training_ms = pq_runtime.training_ms;
   result.enable_compaction = args.enable_compaction;
   result.compaction_background = args.compaction_background;
   result.recall_max_samples_per_sec = args.recall_max_samples_per_sec;
@@ -765,6 +933,9 @@ ScenarioResult finalize_result(
   result.dynamic_dir = scenario_dir.string();
   result.read_ops = metrics.read_ops;
   result.write_ops = metrics.write_records;
+  result.insert_ops = metrics.insert_records;
+  result.update_ops = metrics.update_records;
+  result.delete_ops = metrics.delete_records;
   const double seconds = std::max(1e-9, result.duration_sec);
   result.read_qps = static_cast<double>(metrics.read_ops) / seconds;
   result.write_qps = static_cast<double>(metrics.write_records) / seconds;
@@ -821,6 +992,7 @@ ScenarioResult finalize_result(
           : (metrics.graph_stats.search_mutex_wait_us / 1000.0) /
                 static_cast<double>(metrics.read_ops);
   result.compaction = compaction;
+  result.write_pipeline = write_pipeline;
   return result;
 }
 
@@ -855,18 +1027,39 @@ void execute_read(
 
 template <typename NextNodeId>
 void execute_write(
-    const Args& args, std::size_t dim,
+    const Args& args, std::size_t base_count, std::size_t dim,
     const std::shared_ptr<agent_aware::dynamic::DynamicWriteManager>& manager,
-  agent_aware::PackedGraphEngine* engine, ThreadMetrics& metrics,
-  std::mt19937& rng, NextNodeId next_node_id) {
+    MutationState& mutation_state, ThreadMetrics& metrics, std::mt19937& rng,
+    NextNodeId next_node_id) {
   const auto start = Clock::now();
+  const double mutation_total =
+      args.insert_ratio + args.update_ratio + args.delete_ratio;
+  std::uniform_real_distribution<double> mutation_choice(0.0, mutation_total);
   for (std::size_t i = 0; i < args.insert_batch_size; ++i) {
-    const auto [id, write_index] = next_node_id();
-    auto vector = make_insert_vector(write_index, dim, rng);
-    if (engine != nullptr) {
-      engine->insert(id, vector.data());
-    } else if (!manager->insert(id, vector.data(), static_cast<std::uint32_t>(dim))) {
-      throw std::runtime_error("Dynamic insert failed");
+    const auto [next_id, write_index] = next_node_id();
+    const double choice = mutation_choice(rng);
+    if (choice < args.insert_ratio) {
+      auto vector = make_insert_vector(write_index, dim, rng);
+      if (!manager->insert(next_id, vector.data(),
+                           static_cast<std::uint32_t>(dim))) {
+        throw std::runtime_error("Dynamic insert failed");
+      }
+      mutation_state.remember_insert(next_id);
+      ++metrics.insert_records;
+    } else if (choice < args.insert_ratio + args.update_ratio) {
+      const auto target = mutation_state.choose_existing(base_count, rng);
+      auto vector = make_insert_vector(write_index, dim, rng);
+      if (!manager->update(target, vector.data(),
+                           static_cast<std::uint32_t>(dim))) {
+        throw std::runtime_error("Dynamic update failed");
+      }
+      ++metrics.update_records;
+    } else {
+      const auto target = mutation_state.choose_existing(base_count, rng);
+      if (!manager->erase(target)) {
+        throw std::runtime_error("Dynamic delete failed");
+      }
+      ++metrics.delete_records;
     }
     ++metrics.write_records;
   }
@@ -880,7 +1073,8 @@ ScenarioResult close_scenario(
     const std::filesystem::path& scenario_dir,
     const std::shared_ptr<agent_aware::dynamic::DynamicWriteManager>& manager,
     ThreadMetrics metrics, const CompactionAggregate& compaction,
-    Clock::time_point start, Clock::time_point end) {
+    Clock::time_point start, Clock::time_point end,
+    const PqRuntime& pq_runtime) {
   double flush_ms = 0.0;
   if (args.enable_flush) {
     const auto flush_start = Clock::now();
@@ -890,6 +1084,7 @@ ScenarioResult close_scenario(
     flush_ms = elapsed_ms(flush_start, Clock::now());
   }
   const auto records = manager->collect_all_delta_records();
+  const auto write_pipeline = manager->write_stats();
   if (!manager->close()) {
     throw std::runtime_error("Dynamic close failed");
   }
@@ -908,13 +1103,14 @@ ScenarioResult close_scenario(
   (void)recovered.close();
   return finalize_result(args, scenario, scenario_dir, records,
                          std::move(metrics), compaction, start, end, flush_ms,
-                         recovery_ms);
+                         recovery_ms, pq_runtime, write_pipeline);
 }
 
 ScenarioResult run_sequential_scenario(
     const Args& args, const Scenario& scenario,
     const agent_aware::VectorSet& base,
-    const std::vector<std::vector<float>>& queries) {
+    const std::vector<std::vector<float>>& queries,
+    const PqRuntime& pq_runtime) {
   const auto scenario_dir = args.dynamic_dir / scenario.name;
   // 每个场景使用干净的动态目录，避免 recovery、flush 和磁盘占用指标被上一场景污染。
   std::filesystem::remove_all(scenario_dir);
@@ -924,7 +1120,7 @@ ScenarioResult run_sequential_scenario(
   std::unique_ptr<agent_aware::PackedGraphEngine> engine;
   if (!args.index_path.empty()) {
     engine = std::make_unique<agent_aware::PackedGraphEngine>(
-        engine_config_for(args, manager));
+        engine_config_for(args, manager, pq_runtime.model));
   }
 
   std::mt19937 rng(args.seed ^ static_cast<std::uint32_t>(scenario.name.size()));
@@ -934,6 +1130,7 @@ ScenarioResult run_sequential_scenario(
   std::size_t next_node_id = base.size();
   std::size_t next_query = 0;
   std::atomic<std::int64_t> next_recall_ns{0};
+  MutationState mutation_state;
 
   const auto start = Clock::now();
   for (std::size_t op = 0; op < args.num_operations; ++op) {
@@ -943,7 +1140,8 @@ ScenarioResult run_sequential_scenario(
       execute_read(args, base, query.data(), manager, engine.get(), metrics,
                    rng, next_recall_ns);
     } else {
-      execute_write(args, base.dim, manager, engine.get(), metrics, rng, [&]() {
+      execute_write(args, base.size(), base.dim, manager, mutation_state,
+                    metrics, rng, [&]() {
         return std::pair{static_cast<agent_aware::NodeId>(next_node_id++),
                          metrics.write_records};
       });
@@ -958,13 +1156,15 @@ ScenarioResult run_sequential_scenario(
   }
 
   return close_scenario(args, scenario, scenario_dir, manager,
-                        std::move(metrics), compaction, start, end);
+                        std::move(metrics), compaction, start, end,
+                        pq_runtime);
 }
 
 ScenarioResult run_concurrent_scenario(
     const Args& args, const Scenario& scenario,
     const agent_aware::VectorSet& base,
-    const std::vector<std::vector<float>>& queries) {
+    const std::vector<std::vector<float>>& queries,
+    const PqRuntime& pq_runtime) {
   const auto scenario_dir = args.dynamic_dir / scenario.name;
   std::filesystem::remove_all(scenario_dir);
   std::filesystem::create_directories(scenario_dir);
@@ -986,18 +1186,33 @@ ScenarioResult run_concurrent_scenario(
   std::atomic<std::uint32_t> next_node_id{
       static_cast<std::uint32_t>(base.size())};
   std::atomic<std::size_t> write_index{0};
+  MutationState mutation_state;
 
-  auto claim_operation = [&]() {
-    // timed 模式下 worker 跑到 wall-clock stop；否则通过原子计数领取固定数量的操作槽位。
-    if (args.duration_sec > 0.0) {
-      return !stop.load(std::memory_order_relaxed);
+  auto claim_operation = [&](bool wants_read) {
+    // Reader/writer 各自只能领取匹配的确定性槽位，使 timed 模式的实际操作数
+    // 仍遵守配置比例，而不是退化为由两类 worker 的相对速度决定。
+    while (!stop.load(std::memory_order_relaxed)) {
+      auto id = claimed_ops.load(std::memory_order_relaxed);
+      if (args.duration_sec <= 0.0 && id >= args.num_operations) {
+        stop.store(true, std::memory_order_relaxed);
+        return false;
+      }
+      const auto reads_before = static_cast<std::size_t>(
+          std::floor(static_cast<double>(id) * scenario.read_ratio));
+      const auto reads_after = static_cast<std::size_t>(
+          std::floor(static_cast<double>(id + 1) * scenario.read_ratio));
+      const bool slot_is_read = reads_after > reads_before;
+      if (slot_is_read != wants_read) {
+        std::this_thread::yield();
+        continue;
+      }
+      if (claimed_ops.compare_exchange_weak(
+              id, id + 1, std::memory_order_relaxed,
+              std::memory_order_relaxed)) {
+        return true;
+      }
     }
-    const auto id = claimed_ops.fetch_add(1, std::memory_order_relaxed);
-    if (id >= args.num_operations) {
-      stop.store(true, std::memory_order_relaxed);
-      return false;
-    }
-    return true;
+    return false;
   };
 
   std::vector<ThreadMetrics> reader_metrics(read_threads);
@@ -1028,11 +1243,11 @@ ScenarioResult run_concurrent_scenario(
         std::unique_ptr<agent_aware::PackedGraphEngine> engine;
         if (!args.index_path.empty()) {
           engine = std::make_unique<agent_aware::PackedGraphEngine>(
-              engine_config_for(args, manager));
+              engine_config_for(args, manager, pq_runtime.model));
         }
         std::mt19937 rng(args.seed ^ static_cast<std::uint32_t>(thread_id + 17));
         auto& metrics = reader_metrics[thread_id];
-        while (claim_operation()) {
+        while (claim_operation(true)) {
           const auto& query =
               queries[query_cursor.fetch_add(1, std::memory_order_relaxed) %
                       queries.size()];
@@ -1051,8 +1266,9 @@ ScenarioResult run_concurrent_scenario(
       try {
         std::mt19937 rng(args.seed ^ static_cast<std::uint32_t>(thread_id + 911));
         auto& metrics = writer_metrics[thread_id];
-        while (claim_operation()) {
-          execute_write(args, base.dim, manager, nullptr, metrics, rng, [&]() {
+        while (claim_operation(false)) {
+          execute_write(args, base.size(), base.dim, manager, mutation_state,
+                        metrics, rng, [&]() {
             return std::pair{
                 static_cast<agent_aware::NodeId>(
                     next_node_id.fetch_add(1, std::memory_order_relaxed)),
@@ -1102,7 +1318,8 @@ ScenarioResult run_concurrent_scenario(
   effective_args.read_threads = read_threads;
   effective_args.write_threads = write_threads;
   return close_scenario(effective_args, scenario, scenario_dir, manager,
-                        std::move(metrics), compaction, start, end);
+                        std::move(metrics), compaction, start, end,
+                        pq_runtime);
 }
 
 std::vector<Scenario> scenarios_for(const Args& args) {
@@ -1244,10 +1461,30 @@ void write_json(const std::filesystem::path& output_path,
            << "\",\n"
            << "        \"dynamic_dir\": \"" << json_escape(result.dynamic_dir)
            << "\",\n"
+           << "        \"insert_ratio\": " << result.insert_ratio << ",\n"
+           << "        \"update_ratio\": " << result.update_ratio << ",\n"
+           << "        \"delete_ratio\": " << result.delete_ratio << ",\n"
            << "        \"topk\": " << result.topk << ",\n"
            << "        \"search_width\": " << result.search_width << ",\n"
            << "        \"beam_width\": " << result.beam_width << ",\n"
            << "        \"entry_count\": " << result.entry_count << ",\n"
+           << "        \"pq_adc_enabled\": "
+           << (result.pq_adc_enabled ? "true" : "false") << ",\n"
+           << "        \"pq_subspaces\": " << result.pq_subspaces << ",\n"
+           << "        \"effective_pq_subspaces\": "
+           << result.effective_pq_subspaces << ",\n"
+           << "        \"pq_centroids\": " << result.pq_centroids << ",\n"
+           << "        \"pq_train_limit\": " << result.pq_train_limit
+           << ",\n"
+           << "        \"pq_iterations\": " << result.pq_iterations
+           << ",\n"
+           << "        \"rerank_topk\": " << result.rerank_topk << ",\n"
+           << "        \"pq_code_bytes\": " << result.pq_code_bytes
+           << ",\n"
+           << "        \"pq_codebook_bytes\": "
+           << result.pq_codebook_bytes << ",\n"
+           << "        \"pq_training_ms\": " << result.pq_training_ms
+           << ",\n"
            << "        \"recall_sample_rate\": "
            << result.recall_sample_rate << ",\n"
            << "        \"recall_max_samples_per_sec\": "
@@ -1263,6 +1500,9 @@ void write_json(const std::filesystem::path& output_path,
            << "      },\n"
            << "      \"read_ops\": " << result.read_ops << ",\n"
            << "      \"write_ops\": " << result.write_ops << ",\n"
+           << "      \"insert_ops\": " << result.insert_ops << ",\n"
+           << "      \"update_ops\": " << result.update_ops << ",\n"
+           << "      \"delete_ops\": " << result.delete_ops << ",\n"
            << "      \"read_qps\": " << result.read_qps << ",\n"
            << "      \"write_qps\": " << result.write_qps << ",\n"
            << "      \"total_qps\": " << result.total_qps << ",\n"
@@ -1299,6 +1539,48 @@ void write_json(const std::filesystem::path& output_path,
            << result.page_read_wait_ms_per_read << ",\n"
            << "      \"search_mutex_wait_ms_per_read\": "
            << result.search_mutex_wait_ms_per_read << ",\n"
+           << "      \"write_pipeline\": {\n"
+           << "        \"submitted\": " << result.write_pipeline.submitted << ",\n"
+           << "        \"committed\": " << result.write_pipeline.committed << ",\n"
+           << "        \"failed\": " << result.write_pipeline.failed << ",\n"
+           << "        \"batches\": " << result.write_pipeline.batches << ",\n"
+           << "        \"avg_batch_size\": "
+           << (result.write_pipeline.batches == 0
+                   ? 0.0
+                   : static_cast<double>(result.write_pipeline.batch_records) /
+                         static_cast<double>(result.write_pipeline.batches))
+           << ",\n"
+           << "        \"queue_wait_ms\": "
+           << result.write_pipeline.queue_wait_ns / 1000000.0 << ",\n"
+           << "        \"neighbor_prepare_ms\": "
+           << result.write_pipeline.neighbor_prepare_ns / 1000000.0 << ",\n"
+           << "        \"wal_append_ms\": "
+           << result.write_pipeline.wal_append_ns / 1000000.0 << ",\n"
+           << "        \"wal_sync_ms\": "
+           << result.write_pipeline.wal_sync_ns / 1000000.0 << ",\n"
+           << "        \"memtable_apply_ms\": "
+           << result.write_pipeline.memtable_apply_ns / 1000000.0 << ",\n"
+           << "        \"queue_high_watermark\": "
+           << result.write_pipeline.queue_high_watermark << ",\n"
+           << "        \"backpressure_events\": "
+           << result.write_pipeline.backpressure_events << ",\n"
+           << "        \"flush_tasks\": "
+           << result.write_pipeline.flush_tasks << ",\n"
+           << "        \"flush_failures\": "
+           << result.write_pipeline.flush_failures << ",\n"
+           << "        \"flush_queue_high_watermark\": "
+           << result.write_pipeline.flush_queue_high_watermark << ",\n"
+           << "        \"coordinator_utilization\": "
+           << (result.duration_sec <= 0.0
+                   ? 0.0
+                   : std::min(
+                         1.0,
+                         (result.write_pipeline.wal_append_ns +
+                          result.write_pipeline.wal_sync_ns +
+                          result.write_pipeline.memtable_apply_ns) /
+                             (result.duration_sec * 1000000000.0)))
+           << "\n"
+           << "      },\n"
            << "      \"read_breakdown\": {\n";
     write_breakdown_percentiles(output, "dynamic_snapshot",
                                 result.read_breakdown.dynamic_snapshot, true);
@@ -1352,15 +1634,18 @@ int main(int argc, char** argv) {
     if (base.empty()) {
       throw std::runtime_error("Base dataset is empty");
     }
+    const auto pq_runtime = prepare_pq_runtime(args, base);
     const auto queries =
         make_queries(base, std::max<std::size_t>(1, args.query_count), args.seed);
 
     std::vector<ScenarioResult> results;
     for (const auto& scenario : scenarios_for(args)) {
       if (concurrent_mode(args)) {
-        results.push_back(run_concurrent_scenario(args, scenario, base, queries));
+        results.push_back(run_concurrent_scenario(
+            args, scenario, base, queries, pq_runtime));
       } else {
-        results.push_back(run_sequential_scenario(args, scenario, base, queries));
+        results.push_back(run_sequential_scenario(
+            args, scenario, base, queries, pq_runtime));
       }
     }
     write_output(args.output, results);

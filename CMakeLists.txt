@@ -35,7 +35,7 @@ set(AGENT_AWARE_LIBRARY_SOURCES
   src/core/async_page_reader.cpp
   src/core/brute_force.cpp
   src/core/pq_encoder.cpp
-  src/core/prefetch_planner.cpp
+  src/core/prefetch_adaptive_controller.cpp
   src/core/query_page_session.cpp
   src/data/dataset.cpp
   src/dynamic/compaction.cpp
@@ -48,7 +48,6 @@ set(AGENT_AWARE_LIBRARY_SOURCES
   src/graph/disk_graph_builder.cpp
   src/graph/disk_graph_index.cpp
   src/graph/disk_page_codec.cpp
-  src/graph/entry_selector.cpp
   src/graph/vamana_builder.cpp
 )
 
@@ -76,8 +75,11 @@ else()
   target_compile_definitions(agent_aware PRIVATE AGENT_AWARE_HAS_LIBURING=0)
 endif()
 
-add_executable(agent-aware src/sift_search_benchmark.cpp)
-target_link_libraries(agent-aware PRIVATE agent_aware::agent_aware)
+add_executable(agent-aware-search src/sift_search_benchmark.cpp)
+target_link_libraries(agent-aware-search PRIVATE agent_aware::agent_aware)
+
+add_executable(agent-aware-build src/index_builder.cpp)
+target_link_libraries(agent-aware-build PRIVATE agent_aware::agent_aware)
 
 add_executable(bench_mixed_rw src/mixed_rw_benchmark.cpp)
 target_link_libraries(bench_mixed_rw PRIVATE agent_aware::agent_aware)
@@ -85,11 +87,32 @@ target_link_libraries(bench_mixed_rw PRIVATE agent_aware::agent_aware)
 include(CTest)
 if(BUILD_TESTING)
   find_package(Python3 REQUIRED COMPONENTS Interpreter)
+  add_executable(dynamic_write_concurrency_test
+                 tests/dynamic_write_concurrency.cpp)
+  target_link_libraries(dynamic_write_concurrency_test
+                        PRIVATE agent_aware::agent_aware)
+  add_test(NAME dynamic_write_concurrency
+           COMMAND dynamic_write_concurrency_test)
+  add_executable(packed_layout_v3_test tests/packed_layout_v3.cpp)
+  target_link_libraries(packed_layout_v3_test PRIVATE agent_aware::agent_aware)
+  add_test(NAME packed_layout_v3 COMMAND packed_layout_v3_test)
+  add_executable(async_page_reader_test
+                 tests/async_page_reader.cpp)
+  target_link_libraries(async_page_reader_test
+                        PRIVATE agent_aware::agent_aware)
+  add_test(NAME async_page_reader COMMAND async_page_reader_test)
+  add_executable(prefetch_adaptive_controller_test
+                 tests/prefetch_adaptive_controller.cpp)
+  target_link_libraries(prefetch_adaptive_controller_test
+                        PRIVATE agent_aware::agent_aware)
+  add_test(NAME prefetch_adaptive_controller
+           COMMAND prefetch_adaptive_controller_test)
   add_test(
     NAME contract_smoke
     COMMAND "${Python3_EXECUTABLE}"
             "${CMAKE_CURRENT_SOURCE_DIR}/tests/contract_smoke.py"
-            "$<TARGET_FILE:agent-aware>"
+            "$<TARGET_FILE:agent-aware-build>"
+            "$<TARGET_FILE:agent-aware-search>"
             "$<TARGET_FILE:bench_mixed_rw>"
             "${CMAKE_CURRENT_SOURCE_DIR}/scripts/agent_aware.py"
   )

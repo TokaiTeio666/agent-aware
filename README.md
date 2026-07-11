@@ -6,7 +6,7 @@
 
 Agent-aware 是一个面向大模型 Agent 长期记忆场景的向量检索 I/O 优化原型。项目目标是在全精度向量常驻 SSD、内存预算约束为数据集大小 10%-20% 的条件下，提供可复现的 Top-K 近似最近邻检索、缓存/预取/I/O 统计，以及动态写入路径验证。
 
-当前主线实现围绕 `agent-aware` benchmark 展开：SIFT 或合成数据加载后，系统训练 PQ ADC 模型、构建或复用 Vamana packed graph index，再通过 Graph-Aware 2Q BufferPool（参考 Agent-Mem-IO 架构）、io_uring 异步 I/O 和图邻居 + 滚动流水线预取完成查询，并输出 JSON 结果。当前先以 `search_width=156`、关闭预取作为 Recall/延迟基线；纯 PQ 直接提交和可选 XGBoost 二次精排均需相对该口径做配对 A/B 后再报告收益。动态写入由 `bench_mixed_rw` 和 `StorageEngine`/`DynamicWriteManager` 验证，覆盖 WAL、MemTable、SSTable、flush、compaction 和 base/delta Top-K merge。
+静态链路由两个独立程序组成：`agent-aware-build` 加载 base、训练 PQ 并生成 V3 packed Vamana 索引，同时把 Vamana global medoid 写入配套 manifest；`agent-aware-search` 只加载 query/truth、已有索引和 manifest，使用该 single-medoid 执行在线 benchmark。搜索进程不会加载 base，也不会在索引或 manifest 缺失时隐式构建。
 
 当前推荐口径（来源 `build/search_width_156_baseline.json`；SIFT1M、query 5000-5999、`search_width=156`、`beam_width=16`、io_uring、cache=15000 pages、关闭预取）：
 
@@ -20,7 +20,6 @@ Agent-aware 是一个面向大模型 Agent 长期记忆场景的向量检索 I/O
 | QPS | `20.79` |
 | search width / beam width | `156` / `16` |
 | I/O effective mode | `io_uring` |
-| prefetch | `off`，作为后续预取 A/B 的稳定 baseline |
 | cache policy / pages | `graph-aware-2q` / `15000` |
 | cache hit rate | `18.16%` |
 | page reads / query | `109.82` |
@@ -82,7 +81,6 @@ Agent-aware 是一个面向大模型 Agent 长期记忆场景的向量检索 I/O
 │  │ Query Runtime                                                          │  │
 │  │ EntrySelector -> beam search -> QueryPageSession                       │  │
 │  │ expand: 邻居 PQ ADC 粗排 -> top beam*2 页面 -> io_uring 异步预取          │  │
-│  │ (可选) XGBoost 二次精排: 页面聚合 + 特征打分 + 限流提交                      │  │
 │  └────────────────────────────────────────────────────────────────────────┘  │
 │                                                                              │
 └──────────────────────────────────────────────────────────────────────────────┘
@@ -95,7 +93,7 @@ agent-aware/
 ├── CMakeLists.txt                         # 顶层构建入口，生成库和 benchmark 可执行文件
 ├── README.md                              # 项目入口、构建运行、实验结果和参数说明
 ├── PROJECT_PLAN.md                        # 总体计划、技术路线和验收标准
-├── include/agent_aware/                   # 对外头文件
+├── include/                               # 对外头文件根目录
 │   ├── agent_aware.h                      # 聚合入口头
 │   ├── core/                              # 基础类型、距离计算、PQ、预取和异步 page reader
 │   │   ├── types.h
@@ -103,7 +101,6 @@ agent-aware/
 │   │   ├── pq_encoder.h
 │   │   ├── async_page_reader.h
 │   │   ├── query_page_session.h
-│   │   └── prefetch_planner.h
 │   ├── data/                              # SIFT/fvecs/ivecs 读取与 synthetic 数据生成
 │   ├── graph/                             # Vamana 构图、packed page 编码、SSD graph index
 │   ├── dynamic/                           # WAL、MemTable、SSTable、Manifest、Compaction
@@ -118,17 +115,11 @@ agent-aware/
 │   └── mixed_rw_benchmark.cpp             # 构建为 bench_mixed_rw，输出混合读写 CSV/JSON
 ├── scripts/
 │   ├── agent_aware.py                      # once/ab/tune 与工具统一入口
-│   ├── prefetch_trace.py                   # trace 分析与校验
-│   ├── summarize_prefetch_ab.py            # 三臂双基线验收汇总
-│   ├── train_prefetch_ranker.py            # XGBoost 预取排序模型训练
-│   └── replay_prefetch_policy.py           # 离线策略回放
 └── docs/
-    ├── INDEX.md                           # 文档中心索引
-    ├── changelog.md                       # 当前版本能力边界、验证命令、已知限制
-    ├── competition/                       # 赛题要求、评分映射、答辩清单
     ├── design/                            # SSD 存储、缓存、异步预取、动态写入设计
     ├── experiments/                       # SIFT1M、混合读写、参数调优实验报告
-    └── roadmap/                           # 后续优化计划、任务拆分和冲刺路线
+    ├── problem/                           # 赛题背景与问题定义
+    └── roadmap in future/                 # 后续优化计划与答辩补强路线
 ```
 
 ## 核心特性
@@ -141,7 +132,6 @@ agent-aware/
 | PQ ADC 编码器 | 已实现 | 支持 PQ codes、codebooks、ADC 候选评分和 exact rerank |
 | SIMD/L2 距离计算 | 已实现 | core 路径提供 L2 距离计算，查询中支持 direct distance/rerank |
 | O_DIRECT / pread 读路径 | 已实现 | Linux 下支持 O_DIRECT；不满足条件时保持 `pread` fallback |
-| io_uring 异步预取 | 已实现 | expand 时图邻居 PQ 粗排 → top beam*2 页面 → io_uring 滚动流水线；可选 XGBoost 精排 |
 | Graph-Aware 2Q 缓存 | 已实现 | 支持 graph-aware-2q、hot page protection、缓存命中统计 |
 | 动态写入路径 | 已实现 | WAL + MemTable + SSTable + Manifest + Compaction + recovery |
 | immutable read view | 已实现 | reader 通过 atomic read view 读取动态层快照，降低读写锁竞争 |
@@ -177,7 +167,8 @@ cmake --build build -j"$(nproc)"
 构建验证：
 
 ```bash
-./build/agent-aware --help
+./build/agent-aware-build --help
+./build/agent-aware-search --help
 ./build/bench_mixed_rw --help
 ```
 
@@ -196,15 +187,12 @@ cmake --build build -j"$(nproc)"
 开发和 CI 可使用 synthetic 数据：
 
 ```bash
-./build/agent-aware \
+./build/agent-aware-build \
   --synthetic 1 \
   --base-limit 10000 \
-  --query-limit 20 \
   --synthetic-dim 32 \
   --synthetic-clusters 16 \
-  --rebuild-index 1 \
-  --index-path indexes/synthetic_demo.idx \
-  --output-json logs/sift_bench/synthetic_demo/result.json
+  --index-path indexes/synthetic_demo.idx
 ```
 
 注意：如果使用 SIFT ground truth，又把 `--base-limit` 截断到小于完整 base 集合，truth 中可能出现超出当前 base 范围的 id。此时需要使用匹配该截断数据集的 truth，或加载完整 base。
@@ -213,12 +201,12 @@ cmake --build build -j"$(nproc)"
 
 ###  SIFT 运行
 
-统一 Python 入口负责构建、执行 benchmark 和保存结果 JSON。
+构建和 benchmark 是显式的两个阶段。Python 入口的 `once`、`ab` 和 `tune` 只运行 `agent-aware-search`，要求索引已经存在。
 
-第一次建图：
+构建索引：
 
 ```bash
-python3 scripts/agent_aware.py once --extra-arg=--rebuild-index --extra-arg=1
+./build/agent-aware-build --sift-dir data/sift --index-path indexes/sift.idx
 ```
 
 后续复用索引：
@@ -247,39 +235,27 @@ python3 scripts/agent_aware.py once \
 SIFT1M 推荐 baseline 入口（复用已有索引，先关闭预取以固定 Recall/延迟口径）：
 
 ```bash
-./build/agent-aware \
+./build/agent-aware-search \
   --sift-dir data/sift \
-  --base-limit 1000000 \
   --query-offset 5000 \
   --query-limit 1000 \
-  --graph-degree 32 \
-  --build-policy vamana \
-  --packing-strategy bfs \
   --enable-pq 1 \
-  --pq-subspaces 32 \
-  --pq-centroids 256 \
-  --pq-train-limit 100000 \
-  --pq-iterations 8 \
   --rerank-topk 100 \
   --top-k 10 \
   --search-width 156 \
   --beam-width 16 \
-  --entry-strategy single-medoid \
-  --entry-count 64 \
   --io-mode io_uring \
   --io-batch 16 \
   --io-depth 32 \
   --cache-policy graph-aware-2q \
   --memory-budget-ratio 0.20 \
-  --enable-prefetch 0 \
   --cache-pages 15000 \
-  --rebuild-index 0 \
   --index-path indexes/sift.idx \
   --run-id search-width-156-baseline \
   --output-json build/search_width_156_baseline.json
 ```
 
-需要重新构建索引时再使用 `--rebuild-index 1`。预取实验必须在上述参数不变的前提下开启，并与这条 baseline 做配对 A/B。
+V3 索引保存完整向量页和 PQ 模型，header 保持不变。构建阶段将 global medoid ID 写入默认的 `<index>.manifest.json`；在线搜索严格校验 manifest 与索引的 version、vector count、dimension 和文件字节数后，从该 single-medoid 启动。可用 `--manifest PATH` 覆盖默认侧车路径。
 
 ### 混合读写 benchmark
 
@@ -299,7 +275,7 @@ SIFT1M 推荐 baseline 入口（复用已有索引，先关闭预取以固定 Re
   --data_path data/sift/sift_base.fvecs \
   --base_count 1000000 \
   --query_count 256 \
-  --index_path indexes/sift1m_vamana_pq100_p4096_sm.idx \
+  --index_path indexes/sift.idx \
   --num_operations 10000 \
   --read_ratio 0.95 \
   --write_ratio 0.05 \
@@ -312,49 +288,38 @@ SIFT1M 推荐 baseline 入口（复用已有索引，先关闭预取以固定 Re
   --output build/p5_mixed_rw_ssd.csv
 ```
 
-当前版本推荐用三组实验分开展示性能与正确性：
+SSD mixed-RW 会在场景计时前使用 `--data_path` 加载的 base 和 PQ 参数训练一次共享 `PqAdcModel`。所有 reader 复用该只读模型，训练耗时记录为 `benchmark_config.pq_training_ms`，不计入 read/write QPS。模型的向量数、维度和 subspaces 必须与 packed index metadata 一致；当前 `indexes/sift.idx` 使用默认 PQ 参数即可复现。
 
-1. 纯读 baseline：关闭 writer、Recall exact、compaction，只测 SSD 主图并发读扩展性。
+#### SIFT1M 动态混合读写结果
 
-```bash
-for t in 1 2 4 8; do
-  ./build/bench_mixed_rw \
-    --data_path data/sift/sift_base.fvecs \
-    --base_count 1000000 \
-    --query_count 1000 \
-    --index_path indexes/sift1m_vamana_pq100_p4096_sm.idx \
-    --dynamic_dir build/sift1m_readonly_t${t}_dynamic \
-    --duration_sec 30 \
-    --read_threads "$t" \
-    --write_threads 0 \
-    --read_ratio 1 \
-    --write_ratio 0 \
-    --recall_sample_rate 0 \
-    --enable_compaction 0 \
-    --topk 10 \
-    --search_width 156 \
-    --entry_count 64 \
-    --beam_width 16 \
-    --io_mode io_uring \
-    --cache_policy graph-aware-2q \
-    --output build/sift1m_readonly_t${t}.json
-done
-```
+2026-07-11 在同一台 WSL2 主机上使用 4 reader、1 writer、30 秒 workload 完成配对实验。每个配置先预热一次，再正式运行三次；表中为中位数，括号内为最小值到最大值。写事件统一为 insert/update/delete = 70%/25%/5%，吞吐轮次关闭 exact Recall。
 
-2. 混合读写主路径：关闭 Recall exact，避免把 O(N) exact 回算计入吞吐；可分别对比 compaction 开/关。
+| 配置 | Read QPS | Write QPS | Read P95 (ms) | Read P99 (ms) | Delta search (ms/read) | Compaction 次数 |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: |
+| 纯读，compaction 关 | 703.18 (695.36-703.68) | 0 | 6.70 (6.67-6.71) | 8.36 (8.23-8.84) | 0.002 | 0 |
+| 95/5，compaction 关 | 647.05 (645.43-649.09) | 34.06 (34.00-34.19) | 7.23 (7.12-7.37) | 8.76 (8.63-8.95) | 0.205 | 0 |
+| 95/5，compaction 开 | 653.09 (621.66-686.04) | 34.39 (32.75-36.12) | 7.16 (6.77-8.14) | 8.68 (8.21-9.57) | 0.206 | 1 |
+| 80/20，compaction 开 | 578.23 (566.33-580.71) | 144.58 (141.62-145.19) | 8.31 (8.22-8.65) | 9.84 (9.66-10.27) | 0.912 | 9 (8-9) |
+
+95/5、关闭 compaction 相对纯读的 read QPS 下降 8.0%，P95 增加 7.9%。95/5 下开启后台 compaction 的中位数没有退化，但三轮波动更大；80/20 相对 95/5 + compaction 的 read QPS 下降 11.5%，P95 增加 16.0%。独立正确性场景取得 29 个 exact 样本，Recall@10 为 0.9966，并覆盖 insert/update/delete 可见性。完整环境、三轮原始数据、复现方式和结论边界见 [SIFT1M 动态混合读写对照实验](docs/experiments/mixed-read-write.md)。
+
+下面是 95/5 + 后台 compaction 的快速复现命令；纯读、compaction 开关和 80/20 的完整对照方法见专项报告。
 
 ```bash
 ./build/bench_mixed_rw \
   --data_path data/sift/sift_base.fvecs \
   --base_count 1000000 \
   --query_count 1000 \
-  --index_path indexes/sift1m_vamana_pq100_p4096_sm.idx \
+  --index_path indexes/sift.idx \
   --dynamic_dir build/sift1m_mixed_immutable_compaction_dynamic \
   --duration_sec 30 \
   --read_threads 4 \
   --write_threads 1 \
   --read_ratio 0.95 \
   --write_ratio 0.05 \
+  --insert_ratio 0.70 \
+  --update_ratio 0.25 \
+  --delete_ratio 0.05 \
   --recall_sample_rate 0 \
   --enable_compaction 1 \
   --compaction_background 1 \
@@ -368,33 +333,7 @@ done
   --output build/sift1m_mixed_rw_no_recall_compaction_immutable_view.json
 ```
 
-3. 动态 Recall evidence：单独开启 Recall 抽样和限速，用于验证 read_sequence + visible set + base/delta merge 正确性，不用于主路径吞吐解释。
-
-```bash
-./build/bench_mixed_rw \
-  --data_path data/sift/sift_base.fvecs \
-  --base_count 1000000 \
-  --query_count 1000 \
-  --index_path indexes/sift1m_vamana_pq100_p4096_sm.idx \
-  --dynamic_dir build/sift1m_dynamic_recall_immutable_view_dynamic \
-  --duration_sec 30 \
-  --read_threads 1 \
-  --write_threads 1 \
-  --read_ratio 0.95 \
-  --write_ratio 0.05 \
-  --recall_sample_rate 1 \
-  --recall_max_samples_per_sec 1 \
-  --enable_compaction 1 \
-  --compaction_background 1 \
-  --compaction_interval_ms 1000 \
-  --topk 10 \
-  --search_width 156 \
-  --entry_count 64 \
-  --beam_width 16 \
-  --io_mode io_uring \
-  --cache_policy graph-aware-2q \
-  --output build/sift1m_dynamic_recall_immutable_view.json
-```
+不要在吞吐轮次开启 O(N) exact Recall 回算；正确性证据应使用单独的抽样限速场景。
 
 ## `agent-aware` 参数说明
 
@@ -432,15 +371,11 @@ done
 | 参数 | 默认值 | 可选范围 | 说明 |
 | --- | --- | --- | --- |
 | `--top-k`, `--k` | `10` | `>=1`，计划推荐 `1-100` | 返回结果数量 |
-| `--search-width` | `350` | `>=1`；SIFT1M 当前推荐 `156`，已测 `128/156/192` | 图搜索扩展预算；越大 Recall 通常越高，但需同时观察 rerank reads 与 I/O batching |
+| `--search-width` | `156` | `>=1`；SIFT1M 当前推荐 `156`，已测 `128/156/192` | 图搜索扩展预算；越大 Recall 通常越高，但需同时观察 rerank reads 与 I/O batching |
 | `--beam-width` | `16` | `>=1`，有效值会 clamp 到 `1..search-width`；推荐 `8-32` | 每轮批量扩展候选数，影响 I/O 批处理 |
-| `--entry-count` | `64` | `>=1` | entry point 数量上限；`single-medoid` 实际只返回 1 个全局 medoid |
-| `--entry-strategy` | `single-medoid` | `single-medoid`、`evenly-spaced`、`hybrid` | entry point 选择策略 |
-| `--entry-hub-count` | `15` | `>=0` | `hybrid` 策略下按入度选取的 hub entry 数 |
-| `--entry-cluster-count` | `0` | `>=0` | `hybrid` 策略下 cluster medoid 数；`0` 表示填满剩余 entry |
-| `--entry-cluster-train-limit` | `100000` | `>=1` | cluster medoid 训练采样上限 |
-| `--entry-cluster-iterations` | `4` | `>=1` | cluster k-means 迭代轮数 |
 | `--num-search-threads` | `1` | `>=1` | 查询 worker 数；多线程会为每个 worker 打开独立 index/cache |
+
+搜索入口固定为构建 manifest 中的 single-medoid，不提供 entry strategy/count 选择参数。
 
 ### PQ/ADC 参数
 
@@ -457,22 +392,16 @@ done
 
 | 参数 | 默认值 | 可选范围 | 说明 |
 | --- | --- | --- | --- |
-| `--enable-prefetch` | `1` | `0/1` | 是否启用异步预取；`0` = baseline（零预取） |
-| `--prefetch-depth` | `1` | `>=0` | `0` 等价关闭预取 |
-| `--prefetch-width` | `2` | `>=1` | entry/pre-beam/rerank 补漏触发的 top-K fallback |
-| `--prefetch-min-candidates-per-page` | `2` | `>=1` | XGBoost 路径的页复用门槛 |
-| `--prefetch-policy` | `xgboost` | `none`、`xgboost` | 预取策略；`none` = baseline，`xgboost` = 图邻居 + io_uring 滚动流水线 |
-| `--prefetch-model` | 空 | path | XGBoost 二次精排模型路径（可选）；为空时走纯 PQ 直接提交 |
-| `--prefetch-candidate-pool-size` | `0` | `>=0` | Post-Expand 唯一候选页上限；`0` 使用 `beam*4` |
-| `--prefetch-submit-top-k` | `4` | `>=0` | Post-Expand 每轮最多提交页数 |
-| `--prefetch-early-trigger` | `all` | `off`、`entry-warmup`、`pre-beam`、`rerank`、`all` | 阶段 2 默认组合；Post-Expand 为主，其他 trigger 补漏 |
-| `--prefetch-top-k` | `2` | `>=0` | entry/pre-beam/rerank 的 XGBoost top-K |
-| `--prefetch-score-threshold` | `-inf` | float | XGBoost 分数阈值 |
-| `--prefetch-max-inflight` | `8` | `>=0` | 请求的 inflight 上限；实际硬限制为 `min(requested, 8, io_depth/4)` |
-| `--prefetch-trace` | 空 | path | 输出 page ranking CSV 用于离线分析 |
 | `--io-mode` | `io_uring` | `pread`、`odirect`、`io_uring` | 磁盘读模式；不满足条件时会 fallback 到 `pread` |
 | `--io-batch` | `16` | `>=1` | 每次 batch submit 的请求上限 |
 | `--io-depth` | `32` | `>=1`，计划推荐 `32-512` | io_uring queue depth |
+| `--enable-prefetch` | `0` | `0/1` | 是否启用 topology 异步预取；正式 A/B 通过前默认关闭 |
+| `--prefetch-policy` | `none` | `none`、`topology` | 确定性的 PQ/topology post-expand 策略 |
+| `--prefetch-adaptive` | `1` | `0/1` | 根据 ready/pending/waste 反馈调节提交量 |
+| `--prefetch-top-k` | `2` | `>=1` | 每个窗口最多提交页数；候选窗口仍为 `2*beam_width` |
+| `--prefetch-max-inflight` | `2` | `>=1` | 单 query 最大未完成预取数 |
+| `--prefetch-max-pages-per-query` | `0` | `>=0` | query 预取预算，`0` 表示不额外限制 |
+| `--prefetch-trace` | 空 | CSV 路径 | 输出 post-expand 页排序、提交和 useful/wasted 标签 |
 | `--cache-policy` | `graph-aware-2q` | `none`、`lru`、`2q`、`graph-aware-2q`、`agent` | page cache 淘汰策略 |
 | `--cache-pages` | `0` | `>=0` | `0` 且 cache policy 非 `none` 时按内存预算自动计算 |
 | `--memory-budget-ratio` | `0.20` | `(0,1]`，验收推荐 `0.10-0.20` | resident memory 预算占原始向量字节比例 |
@@ -481,52 +410,20 @@ done
 
 ### 预取 A/B 对比实验
 
-正式实验采用三臂配对：零预取、阶段 1 pre-beam、阶段 2 composite。默认执行 5 个 seed，并同时覆盖 cold/hot cache：
 
 ```bash
 python3 scripts/agent_aware.py ab --index indexes/sift.idx \
-  --model build/xgboost_model.txt --query-offset 5000 --query-limit 1000
 ```
 
-冷缓存运行必须提供每个 arm 前执行的重置命令：
+脚本运行 `no_prefetch`、`topology_fixed`、`topology_adaptive` 三臂，默认在 cold/hot cache 下各执行 5 个 seed。`report.json` 只有在 P95/P99、Recall、demand wait、waste、读放大和 planner CPU 门槛全部满足时才输出 `acceptance_ok=true`。
+
+### 预取 trace / 回放（可选）
+
 
 ```bash
-python3 scripts/agent_aware.py ab --index indexes/sift.idx \
-  --model build/xgboost_model.txt --cold-reset 'sudo sysctl vm.drop_caches=3'
-```
-
-正式实验前可用 200-query 调优脚本按 waste-rate 依次评估 Post-Expand top-K 4、3、2：
-
-```bash
-python3 scripts/agent_aware.py tune --index indexes/sift.idx \
-  --model build/prefetch_closed_loop_xgboost.txt --query-offset 5000 --query-limit 200
-```
-
-`report.json` 只有在两种 cache 条件均具备至少 5 个配对轮次、trace 全部通过、相对两个基线同时满足 P95/P99、Recall、waste-rate 和读放大门槛时才会输出 `acceptance_ok=true`。
-
-### 预取 trace / 训练 / 回放（可选）
-
-用于训练 XGBoost 二次精排模型：
-
-```bash
-# 分析 trace
-python3 scripts/agent_aware.py analyze \
-  --trace build/prefetch_ab_trace.csv \
-  --json-out build/trace_summary.json
-
-# 训练模型（3000 train / 1000 valid / 1000 test）
-python3 scripts/agent_aware.py train \
-  --trace build/prefetch_ab_trace.csv \
-  --model-out build/xgboost_model.txt \
-  --metrics-out build/train_metrics.json \
-  --train-queries 3000 --valid-queries 1000 --test-queries 1000
-
-# 离线回放
-python3 scripts/agent_aware.py replay \
-  --trace build/prefetch_ab_trace.csv \
-  --model build/xgboost_model.txt \
-  --top-k 4 8 \
-  --out-json build/replay.json
+# topology 与 oracle 离线对比
+python3 scripts/replay_prefetch_policy.py \
+  --trace logs/topology.csv --top-k 2 --output build/replay.json
 
 # 自动 smoke
 ctest --test-dir build --output-on-failure
@@ -550,6 +447,9 @@ ctest --test-dir build --output-on-failure
 | `--recall_max_samples_per_sec` | `0` | `>=0` | Recall exact 回算全局限速；`0` 表示不限速 |
 | `--topk` | `10` | `>0` | 查询 Top-K |
 | `--insert_batch_size` | `1` | `>0` | 每个写事件插入向量数 |
+| `--insert_ratio` | `1.0` | `>=0` | 写事件内 insert 比例，与 update/delete 比例归一化 |
+| `--update_ratio` | `0.0` | `>=0` | 写事件内 update 比例 |
+| `--delete_ratio` | `0.0` | `>=0` | 写事件内 delete 比例 |
 | `--enable_flush` | `1` | `0/1` | 是否允许自动 flush 并在结尾 flush |
 | `--enable_compaction` | `0` | `0/1` | 是否执行一次测量型 compaction |
 | `--compaction_background` | `0` | `0/1` | 是否在 workload 运行期间周期性后台 compaction |
@@ -559,6 +459,11 @@ ctest --test-dir build --output-on-failure
 | `--dim` | `32` | `>0` | synthetic 维度 |
 | `--memtable_flush_bytes` | `262144` | `>0` | MemTable flush 阈值 |
 | `--dynamic_graph_degree` | `16` | `>0` | delta graph 邻居数 |
+| `--write_queue_capacity` | `4096` | `>0` | 有界 mutation 队列容量；满时 writer 阻塞并统计 backpressure |
+| `--wal_group_max_records` | `64` | `>0` | 单次 group commit 最大记录数 |
+| `--wal_group_max_delay_us` | `1000` | `>=0` | coordinator 收集批次的最大等待时间 |
+| `--version_index_shards` | `64` | `>0` | 动态版本索引 shard 数 |
+| `--neighbor_candidate_limit` | `1024` | `>0` | 写入准备阶段的 Delta 邻居候选上限 |
 | `--search_width` | `350` | `>0` | SSD graph 搜索扩展预算 |
 | `--entry_count` | `64` | `>0` | SSD graph entry 数 |
 | `--beam_width` | `16` | `>0` | SSD graph beam batch width |
@@ -567,6 +472,11 @@ ctest --test-dir build --output-on-failure
 | `--io_depth` | `32` | `>0` | I/O depth |
 | `--cache_policy` | `graph-aware-2q` | `none`、`lru`、`2q`、`graph-aware-2q` | SSD graph cache policy |
 | `--cache_pages` | `0` | `>=0` | cache page 数 |
+| `--pq_subspaces` | `32` | `>0`，必须匹配 index 的 neighbor PQ code bytes | SSD graph ADC 使用的 PQ 子空间数 |
+| `--pq_centroids` | `256` | `2-256` | PQ codebook 每个子空间的中心数 |
+| `--pq_train_limit` | `100000` | `>0` | 场景启动前训练 PQ 的 base 采样上限 |
+| `--pq_iterations` | `8` | `>0` | PQ k-means 迭代轮数 |
+| `--rerank_topk` | `100` | `>=topk` | PQ 候选的全精度 rerank 池大小 |
 | `--seed` | `42` | `>=0` | 随机种子 |
 
 ## 结果展示
@@ -586,7 +496,6 @@ ctest --test-dir build --output-on-failure
 | `recall_at_k`, `recall_queries` | 召回率指标 |
 | `stats.page_cache_hits`, `stats.cache_hit_rate` | 缓存命中统计 |
 | `stats.io_submits`, `stats.uring_submit_count`, `stats.uring_cqe_count` | I/O 提交和完成统计 |
-| `stats.prefetch_submitted_pages`, `stats.prefetch_useful_pages`, `stats.prefetch_wasted_pages` | 预取有效性统计 |
 | `stats.distance_direct_calls`, `stats.rerank_reads` | 零拷贝距离计算和 rerank 统计 |
 
 ### 混合读写 CSV 示例
@@ -598,7 +507,7 @@ ctest --test-dir build --output-on-failure
   --data_path data/sift/sift_base.fvecs \
   --base_count 1000000 \
   --query_count 256 \
-  --index_path indexes/sift1m_vamana_pq100_p4096_sm.idx \
+  --index_path indexes/sift.idx \
   --num_operations 1000 \
   --topk 10 \
   --search_width 156 \
@@ -628,7 +537,9 @@ CSV 字段含义：
 
 | 字段 | 说明 |
 | --- | --- |
-| `benchmark_config` | 本次实验的数据、索引、线程数、search width、beam width、Recall 抽样、compaction 和 git 状态 |
+| `benchmark_config` | 本次实验的数据、索引、线程数、search/beam width、PQ 参数与训练耗时、Recall 抽样、compaction 和 git 状态 |
+| `benchmark_config.pq_adc_enabled`, `effective_pq_subspaces` | SSD mixed-RW 是否成功注入 PQ/ADC，以及模型实际 subspaces |
+| `benchmark_config.pq_code_bytes`, `pq_codebook_bytes`, `pq_training_ms` | 共享 PQ 模型的内存字节数和场景外训练耗时 |
 | `read_breakdown.dynamic_snapshot_*_ms` | 读取动态层 read sequence / read view 的耗时 |
 | `read_breakdown.base_search_*_ms` | SSD packed graph 主图查询耗时 |
 | `read_breakdown.latest_record_lookup_*_ms` | 检查 base topK 是否被动态 update/delete 覆盖的耗时 |
@@ -642,35 +553,34 @@ CSV 字段含义：
 
 ### SSD 检索流程
 
-1. 解析 CLI 参数，校验 `prefetch_depth`、PQ、内存预算等约束。
-2. 通过 `load_dataset` 加载 SIFT/fvecs，或生成 synthetic 数据。
-3. 如果 `--enable-pq=1`，用 base 训练 `PqAdcModel`，常驻 PQ codes 和 codebooks。
+2. 只加载 query 和可选 truth；base 不进入在线 benchmark 进程。
+3. 从 V3 索引恢复 PQ offsets、codebooks 和全量 codes。
 4. 根据 `--memory-budget-ratio` 估算 resident memory，并在未手动设置 `--cache-pages` 时自动计算 cache 容量。
-5. 如果 `--rebuild-index=1` 或 index 不存在，调用 `PackedDiskGraphBuilder::build` 构建 packed graph index。
+5. 索引不存在或格式不匹配时直接失败，提示先运行 `agent-aware-build`。
 6. 打开 `PackedDiskGraphIndex`，配置 cache policy 和 I/O mode。
-7. 根据 `--entry-strategy` 选择 entry point；`hybrid` 会结合 medoid、hub 和 cluster medoid。
+7. 从经过索引一致性校验的 manifest 读取 single-medoid 入口节点。
 8. 每个 query 构造 `DiskGraphSearchConfig`，执行 graph beam search。
 9. 搜索时优先命中 BufferPool；miss 时通过 `pread`、`odirect` 或 `io_uring` 读取 4KB page。
 10. 命中 page 后直接从 page buffer 计算 L2 距离，并用 PQ/rerank 更新候选队列。
-11. 如果有效 I/O mode 为 `io_uring` 且预取策略为 `xgboost`，expand 时按图邻居 PQ 排名取 top beam*2 页面，通过 io_uring 滚动流水线异步预取；若有训练好的 XGBoost 模型，可开启二次精排。
 12. 聚合所有 query 的 Recall、QPS、延迟、缓存、I/O、预取、内存预算统计，写入 JSON。
 
 ### 动态写入流程
 
 1. `DynamicWriteManager::open` 创建或恢复 manifest、WAL、MemTable 和 SSTable reader。
-2. `insert/update/erase` 先追加 WAL，再写入 active MemTable。
-3. 写入成功后发布 immutable `DynamicReadView`，reader 通过 atomic `shared_ptr` 获得动态层快照，避免和 writer/flush/compaction 抢全局 mutex。
-4. MemTable 超过 `memtable_flush_bytes` 时 flush 为 SSTable，并轮转 WAL；后台 compaction 通过 manifest 发布新 SSTable 视图。
-5. 查询时，`PackedGraphEngine` 先查 SSD base graph，再按 `read_sequence` 查 base id 的 update/delete 覆盖记录和 delta records，最后调用 `merge_base_and_delta_l2` 合并 Top-K。
-6. `bench_mixed_rw` 以 read-heavy、balanced、write-heavy 或自定义比例生成读写事件，记录吞吐、延迟、Recall、flush、恢复、compaction 和读路径分段耗时。
+2. `insert/update/erase` 在调用线程准备记录并进入有界 MPSC 队列，commit coordinator 按最多 64 条或 1000us 组成批次。
+3. coordinator 按出队顺序分配 sequence，批量追加 WAL 并执行一次 `fdatasync`，然后更新 MemTable 和 64-shard 版本索引，最后发布批次 `latest_sequence`。
+4. MemTable 达阈值后原子切换并轮转编号 WAL segment，后台 flush worker 写 SSTable；manifest 只在提交点短暂加锁更新。
+5. Compaction 锁内捕获输入 generation、锁外生成 SSTable、锁内校验并原子提交，避免持锁执行全量文件合并。
+6. 查询时，`PackedGraphEngine` 先固定 `read_sequence`，再查 SSD base graph 和该 sequence 下的 update/delete/Delta，最后合并 Top-K，不会看到半个 group commit。
+7. `bench_mixed_rw` 支持 insert/update/delete 比例并输出 queue、batch、WAL、MemTable、flush 和 coordinator 指标。
 
 ## 重要接口
 
 ### 数据与基础类型
 
 ```cpp
-#include "agent_aware/data/dataset.h"
-#include "agent_aware/core/types.h"
+#include "data/dataset.h"
+#include "core/types.h"
 
 agent_aware::LoadedDataset load_dataset(const agent_aware::DatasetLoadConfig& config);
 agent_aware::VectorSet load_fvecs(const std::string& path, std::size_t limit = 0);
@@ -685,7 +595,7 @@ agent_aware::SyntheticData generate_synthetic(
 ### PQ ADC
 
 ```cpp
-#include "agent_aware/core/pq_encoder.h"
+#include "core/pq_encoder.h"
 
 agent_aware::PQEncoder pq;
 agent_aware::PQTrainingConfig config;
@@ -702,13 +612,12 @@ float approx_distance = pq.adc_distance(id, adc_table);
 ### Packed graph index
 
 ```cpp
-#include "agent_aware/graph/disk_graph_index.h"
+#include "graph/disk_graph_index.h"
 
 agent_aware::DiskGraphBuildConfig build;
 build.degree = 32;
 build.page_size = 4096;
-build.build_policy = "vamana";
-build.packing_strategy = "bfs";
+build.pq_model = &pq;
 agent_aware::PackedDiskGraphBuilder::build(base, "indexes/demo.idx", build);
 
 agent_aware::PackedDiskGraphIndex index("indexes/demo.idx");
@@ -726,7 +635,7 @@ auto result = index.search_one(query, search);
 ### StorageEngine 集成接口
 
 ```cpp
-#include "agent_aware/engine/storage_engine.h"
+#include "engine/storage_engine.h"
 
 agent_aware::PackedGraphEngineConfig config;
 config.index_path = "indexes/demo.idx";
@@ -753,7 +662,7 @@ virtual void erase(std::uint32_t id);
 ### 动态写入接口
 
 ```cpp
-#include "agent_aware/dynamic/dynamic_write_manager.h"
+#include "dynamic/dynamic_write_manager.h"
 
 agent_aware::dynamic::DynamicWriteOptions options;
 options.dynamic_dir = "build/dynamic";
@@ -774,12 +683,10 @@ manager.close();
 
 | 目标 | 优先调整参数 | 观察指标 |
 | --- | --- | --- |
-| 复现当前平衡点 | 固定 `--search-width 156 --beam-width 16 --enable-prefetch 0` | Recall@10 `0.9748`、P99 `66.29 ms`、reads/query `109.82` |
 | 提高 Recall | 增大 `--search-width`、`--beam-width`、`--graph-degree`，或提高 `--rerank-topk` | `recall_at_k`、`visited`、`page_reads` |
 | 降低 I/O | 启用 PQ、提高缓存页、使用 `graph-aware-2q`、调整 packing | `node_reads/query`、`cache_hit_rate`、`distance_direct_calls` |
 | 控制内存 | 降低 `--cache-pages` 或 `--memory-budget-ratio`，降低 `pq_subspaces`/`graph_degree` | `estimated_resident_ratio`、`warnings` |
 | 观察 io_uring 收益 | 对比 `--io-mode pread` 与 `--io-mode io_uring` | `qps`、`latency_p95_ms`、`io_submit_syscalls` |
-| 评估预取 | `python3 scripts/agent_aware.py ab ...` | `prefetch_ready_hit`、`prefetch_pending_hit`、`prefetch_wasted`、latency Δ |
 | 验证动态写入 | 调整 `--read_ratio`、`--write_ratio`、`--memtable_flush_bytes` | `write_qps`、`flush_duration_ms`、`recovery_time_ms` |
 
 ## 开源参考与合规说明

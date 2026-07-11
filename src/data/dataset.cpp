@@ -1,4 +1,4 @@
-#include "agent_aware/data/dataset.h"
+#include "data/dataset.h"
 
 #include <algorithm>
 #include <fstream>
@@ -297,6 +297,46 @@ LoadedDataset load_dataset(const DatasetLoadConfig& config) {
     loaded.truth_source = paths.truth;
   }
 
+  return loaded;
+}
+
+LoadedQueryDataset load_query_dataset(const QueryDatasetLoadConfig& config) {
+  DatasetPaths paths = config.paths;
+  if (!paths.sift_dir.empty()) {
+    const DatasetPaths sift_paths = resolve_sift_paths(paths.sift_dir);
+    if (paths.query.empty()) paths.query = sift_paths.query;
+    if (paths.truth.empty()) paths.truth = sift_paths.truth;
+  }
+  if (paths.query.empty()) {
+    throw std::runtime_error("Query loading requires a query fvecs path");
+  }
+  LoadedQueryDataset loaded;
+  loaded.queries = load_fvecs(paths.query, config.query_limit,
+                              config.query_offset);
+  if (loaded.queries.empty()) {
+    throw std::runtime_error("Loaded query dataset is empty: " + paths.query);
+  }
+  if (config.expected_dim != 0 && loaded.queries.dim != config.expected_dim) {
+    throw std::runtime_error("Query dimension does not match packed index");
+  }
+  loaded.mode = paths.sift_dir.empty() ? "fvecs" : "sift";
+  loaded.truth_source = "none";
+  if (!paths.truth.empty()) {
+    loaded.truth = load_ivecs(paths.truth, loaded.queries.size(),
+                              config.query_offset);
+    if (loaded.truth.size() != loaded.queries.size()) {
+      throw std::runtime_error("Ground-truth query count does not match loaded queries");
+    }
+    for (const auto& row : loaded.truth) {
+      for (const auto id : row) {
+        if (id >= config.expected_base_count) {
+          throw std::runtime_error("Ground-truth id exceeds packed index vector count");
+        }
+      }
+    }
+    loaded.truth_from_file = true;
+    loaded.truth_source = paths.truth;
+  }
   return loaded;
 }
 

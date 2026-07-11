@@ -1,4 +1,4 @@
-#include "agent_aware/dynamic/compaction.h"
+#include "dynamic/compaction.h"
 
 #include <algorithm>
 #include <iomanip>

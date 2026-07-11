@@ -1,11 +1,30 @@
-#include "agent_aware/core/pq_encoder.h"
+#include "core/pq_encoder.h"
 
 #include <algorithm>
+#include <cstring>
 #include <limits>
 #include <random>
 #include <stdexcept>
 
 namespace agent_aware {
+namespace {
+constexpr std::uint32_t kPqFormatVersion = 1;
+constexpr char kPqMagic[8] = {'A', 'M', 'P', 'Q', 'V', '1', '\0', '\0'};
+
+template <typename T>
+void write_pq_value(std::ostream& output, const T& value) {
+  output.write(reinterpret_cast<const char*>(&value), sizeof(value));
+  if (!output) throw std::runtime_error("Failed to write PQ section");
+}
+
+template <typename T>
+T read_pq_value(std::istream& input) {
+  T value{};
+  input.read(reinterpret_cast<char*>(&value), sizeof(value));
+  if (!input) throw std::runtime_error("Truncated PQ section");
+  return value;
+}
+}  // namespace
 
 // Product Quantization 只用于快速候选排序；最终对距离敏感的结果仍可用原始向量 rerank。
 PQTrainingStats PQEncoder::train(const VectorSet& base,
@@ -174,6 +193,75 @@ float PQEncoder::adc_distance(std::uint32_t id,
     distance += table[m * centroids_ + codes_[offset + m]];
   }
   return distance;
+}
+
+void PQEncoder::write(std::ostream& output) const {
+  validate_trained();
+  output.write(kPqMagic, sizeof(kPqMagic));
+  write_pq_value(output, kPqFormatVersion);
+  write_pq_value(output, static_cast<std::uint32_t>(dim_));
+  write_pq_value(output, static_cast<std::uint32_t>(subspaces_));
+  write_pq_value(output, static_cast<std::uint32_t>(centroids_));
+  write_pq_value(output, static_cast<std::uint64_t>(offsets_.size()));
+  write_pq_value(output, static_cast<std::uint64_t>(codebooks_.size()));
+  write_pq_value(output, static_cast<std::uint64_t>(codes_.size()));
+  for (const auto value : offsets_) {
+    write_pq_value(output, static_cast<std::uint64_t>(value));
+  }
+  output.write(reinterpret_cast<const char*>(codebooks_.data()),
+               static_cast<std::streamsize>(codebooks_.size() * sizeof(float)));
+  output.write(reinterpret_cast<const char*>(codes_.data()),
+               static_cast<std::streamsize>(codes_.size()));
+  if (!output) throw std::runtime_error("Failed to write PQ section payload");
+}
+
+PQEncoder PQEncoder::read(std::istream& input) {
+  char magic[sizeof(kPqMagic)]{};
+  input.read(magic, sizeof(magic));
+  if (!input || std::memcmp(magic, kPqMagic, sizeof(magic)) != 0) {
+    throw std::runtime_error("Invalid PQ section magic");
+  }
+  if (read_pq_value<std::uint32_t>(input) != kPqFormatVersion) {
+    throw std::runtime_error("Unsupported PQ section version");
+  }
+  PQEncoder model;
+  model.dim_ = read_pq_value<std::uint32_t>(input);
+  model.subspaces_ = read_pq_value<std::uint32_t>(input);
+  model.centroids_ = read_pq_value<std::uint32_t>(input);
+  const auto offset_count = read_pq_value<std::uint64_t>(input);
+  const auto codebook_count = read_pq_value<std::uint64_t>(input);
+  const auto code_count = read_pq_value<std::uint64_t>(input);
+  if (model.dim_ == 0 || model.subspaces_ == 0 || model.centroids_ < 2 ||
+      model.centroids_ > 256 || offset_count != model.subspaces_ + 1 ||
+      offset_count > 1'000'000 || codebook_count > 10'000'000'000ULL ||
+      code_count > 10'000'000'000ULL) {
+    throw std::runtime_error("Invalid PQ section metadata");
+  }
+  model.offsets_.resize(static_cast<std::size_t>(offset_count));
+  for (auto& value : model.offsets_) {
+    value = static_cast<std::size_t>(read_pq_value<std::uint64_t>(input));
+  }
+  if (model.offsets_.front() != 0 || model.offsets_.back() != model.dim_) {
+    throw std::runtime_error("PQ offsets do not cover the model dimension");
+  }
+  for (std::size_t i = 1; i < model.offsets_.size(); ++i) {
+    if (model.offsets_[i] < model.offsets_[i - 1]) {
+      throw std::runtime_error("PQ offsets are not monotonic");
+    }
+  }
+  model.codebooks_.resize(static_cast<std::size_t>(codebook_count));
+  input.read(reinterpret_cast<char*>(model.codebooks_.data()),
+             static_cast<std::streamsize>(model.codebooks_.size() * sizeof(float)));
+  model.codes_.resize(static_cast<std::size_t>(code_count));
+  input.read(reinterpret_cast<char*>(model.codes_.data()),
+             static_cast<std::streamsize>(model.codes_.size()));
+  if (!input || model.codebooks_.size() !=
+                    model.subspaces_ * model.centroids_ * model.dim_ ||
+      model.codes_.size() % model.subspaces_ != 0) {
+    throw std::runtime_error("Invalid PQ section payload sizes");
+  }
+  model.validate_trained();
+  return model;
 }
 
 std::size_t PQEncoder::nearest_centroid(const float* vector,
