@@ -128,7 +128,7 @@ PackedGraphGeneration::open_or_create(
 std::shared_ptr<const PackedGraphGeneration> PackedGraphGeneration::publish(
     const std::filesystem::path& base_index_path,
     const PackedGraphGeneration& previous,
-    const std::vector<DynamicRecord>& delta, std::uint64_t cutoff_sequence,
+    const std::vector<MaterializedRecord>& delta, std::uint64_t cutoff_sequence,
     std::shared_ptr<const PQEncoder> pq_model,
     const std::atomic<bool>* cancelled) {
   const auto check_cancelled = [&] {
@@ -137,7 +137,7 @@ std::shared_ptr<const PackedGraphGeneration> PackedGraphGeneration::publish(
     }
   };
   check_cancelled();
-  std::unordered_map<NodeId, DynamicRecord> latest;
+  std::unordered_map<NodeId, MaterializedRecord> latest;
   for (auto& record : previous.materialize_all()) {
     latest[record.node_id] = std::move(record);
   }
@@ -314,8 +314,8 @@ std::vector<NodeId> PackedGraphGeneration::read_neighbors(
 }
 
 bool PackedGraphGeneration::read_entry(const PackedGenerationEntry& entry,
-                                       DynamicRecord& out) const {
-  DynamicRecord record;
+                                       MaterializedRecord& out) const {
+  MaterializedRecord record;
   record.node_id = entry.node_id;
   record.sequence_id = entry.sequence_id;
   record.dim = entry.dim;
@@ -332,7 +332,7 @@ bool PackedGraphGeneration::read_entry(const PackedGenerationEntry& entry,
   return true;
 }
 
-bool PackedGraphGeneration::resolve(NodeId node_id, DynamicRecord& out) const {
+bool PackedGraphGeneration::resolve(NodeId node_id, MaterializedRecord& out) const {
   const auto found = entries_.find(node_id);
   return found != entries_.end() && read_entry(found->second, out);
 }
@@ -347,7 +347,7 @@ void PackedGraphGeneration::cleanup_obsolete_segments() const {
   cleanup_unreferenced(live_dir_, segment_path_);
 }
 
-std::vector<DynamicRecord> PackedGraphGeneration::search(
+std::vector<MaterializedRecord> PackedGraphGeneration::search(
     const float* query, std::uint32_t dim, std::size_t topk,
     std::size_t candidate_top_l) const {
   struct Candidate { const PackedGenerationEntry* entry; float distance; };
@@ -404,9 +404,9 @@ std::vector<DynamicRecord> PackedGraphGeneration::search(
                      candidates.end(), less);
     candidates.resize(limit);
   }
-  std::vector<std::pair<float, DynamicRecord>> exact;
+  std::vector<std::pair<float, MaterializedRecord>> exact;
   for (const auto& candidate : candidates) {
-    DynamicRecord record;
+    MaterializedRecord record;
     if (read_entry(*candidate.entry, record)) {
       exact.emplace_back(squared_l2(query, record.vector.data(), dim),
                          std::move(record));
@@ -417,16 +417,16 @@ std::vector<DynamicRecord> PackedGraphGeneration::search(
                               : a.first < b.first;
   });
   if (exact.size() > topk) exact.resize(topk);
-  std::vector<DynamicRecord> output;
+  std::vector<MaterializedRecord> output;
   for (auto& item : exact) output.push_back(std::move(item.second));
   return output;
 }
 
-std::vector<DynamicRecord> PackedGraphGeneration::materialize_all() const {
-  std::vector<DynamicRecord> output;
+std::vector<MaterializedRecord> PackedGraphGeneration::materialize_all() const {
+  std::vector<MaterializedRecord> output;
   output.reserve(entries_.size());
   for (const auto& item : entries_) {
-    DynamicRecord record;
+    MaterializedRecord record;
     if (read_entry(item.second, record)) output.push_back(std::move(record));
   }
   return output;

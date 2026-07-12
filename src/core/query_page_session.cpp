@@ -1,6 +1,7 @@
 #include "core/query_page_session.h"
 
 #include <algorithm>
+#include <atomic>
 #include <chrono>
 #include <filesystem>
 #include <fstream>
@@ -13,6 +14,8 @@
 
 namespace agent_aware {
 namespace {
+std::atomic<std::uint64_t> next_query_id{1};
+
 std::mutex& prefetch_trace_mutex() {
   static std::mutex mutex;
   return mutex;
@@ -32,7 +35,13 @@ QueryPageSession::QueryPageSession(PackedDiskGraphIndex& index,
   prefetch_query_limit_ = config.prefetch_max_pages_per_query;
   prefetch_trace_path_ = config.prefetch_trace_path;
   run_id_ = config.run_id;
-  query_id_ = config.query_id;
+  query_id_ = config.query_id == 0
+                  ? next_query_id.fetch_add(1, std::memory_order_relaxed)
+                  : config.query_id;
+  const std::size_t page_words =
+      (static_cast<std::size_t>(index_.metadata_.page_count) + 63) / 64;
+  touched_page_bits_.assign(page_words, 0);
+  demand_page_bits_.assign(page_words, 0);
 }
 
 QueryPageSession::~QueryPageSession() {
@@ -42,78 +51,96 @@ QueryPageSession::~QueryPageSession() {
   }
 }
 
-const QueryPageSession::Page& QueryPageSession::get_or_load_page(
+void QueryPageSession::apply_workspace_limits(
+    std::size_t prefetch_top_k, std::size_t prefetch_max_inflight) {
+  prefetch_top_k_ = std::min(prefetch_top_k_, prefetch_top_k);
+  prefetch_max_inflight_ =
+      std::min(prefetch_max_inflight_, prefetch_max_inflight);
+  if (prefetch_top_k_ == 0 || prefetch_max_inflight_ == 0) {
+    async_prefetch_ = false;
+  }
+  constexpr std::size_t kMaxPrefetchPagesPerQuery = 64;
+  const std::size_t limit = std::max<std::size_t>(
+      prefetch_max_inflight_ * 4, prefetch_top_k_);
+  prefetch_query_limit_ = prefetch_query_limit_ == 0
+                              ? std::min(limit, kMaxPrefetchPagesPerQuery)
+                              : std::min(prefetch_query_limit_,
+                                         kMaxPrefetchPagesPerQuery);
+}
+
+QueryPageSession::PageHandle QueryPageSession::get_or_load_page(
     std::uint32_t page_id) {
   if (page_id >= index_.metadata_.page_count) {
     throw std::runtime_error("Packed page id out of range");
   }
 
   if (finished_) {
-    const Page& page = index_.load_page(page_id, stats_);
-    materialize_page(page);
+    auto page = index_.load_page(page_id, stats_);
+    remember_page(page);
     return page;
   }
 
-  visited_pages_.insert(page_id);
+  mark_unique_page(touched_page_bits_, page_id, pages_touched_);
   ++stats_.page_requests;
   ++stats_.page_requests_before_dedup;
 
-  const auto owned = owned_pages_.find(page_id);
-  if (owned != owned_pages_.end()) {
+  const auto resident = resident_pages_.find(page_id);
+  if (resident != resident_pages_.end()) {
     ++stats_.pinned_hits;
-    return owned->second;
+    return resident->second;
   }
 
-  if (const Page* cached = try_get_cached_page(page_id)) {
-    materialize_page(*cached);
-    return *cached;
+  if (auto cached = try_get_cached_page(page_id)) {
+    remember_page(cached);
+    return cached;
   }
 
   ++stats_.page_cache_misses;
   ++stats_.demand_reads;
   ++stats_.node_reads;
   ++stats_.page_requests_after_dedup;
-  demand_pages_.insert(page_id);
+  mark_unique_page(demand_page_bits_, page_id, demand_pages_count_);
   Page page = read_demand_page(page_id);
 
   if (index_.cache_enabled()) {
-    const Page& cached_page = index_.store_cached_page(std::move(page), stats_);
-    materialize_page(cached_page);
+    auto cached_page = index_.store_cached_page(std::move(page), stats_);
+    remember_page(cached_page);
     return cached_page;
   }
 
-  auto inserted = owned_pages_.insert_or_assign(page_id, std::move(page));
-  materialize_page(inserted.first->second);
-  return inserted.first->second;
+  auto handle = std::make_shared<Page>(std::move(page));
+  remember_page(handle);
+  return handle;
 }
 
-const QueryPageSession::Page* QueryPageSession::try_get_cached_page(
+QueryPageSession::PageHandle QueryPageSession::try_get_cached_page(
     std::uint32_t page_id) {
   return index_.lookup_cached_page(page_id, stats_);
 }
 
 const QueryPageSession::Node& QueryPageSession::get_node(
     std::uint32_t node_id, bool count_same_page_reuse, bool require_vector) {
-  accessed_nodes_.insert(node_id);
-  auto found = local_nodes_.find(node_id);
-  if (found != local_nodes_.end()) {
-    if (count_same_page_reuse) {
-      ++stats_.same_page_node_reuse;
-    }
-    if (!require_vector || !found->second.vector.empty()) return found->second;
+  ++nodes_accessed_;
+  const std::uint32_t page_id = page_for_node(node_id);
+  if (count_same_page_reuse && resident_pages_.find(page_id) !=
+                                  resident_pages_.end()) {
+    ++stats_.same_page_node_reuse;
   }
-
-  const Page& page = get_or_load_page(page_for_node(node_id));
-  found = local_nodes_.find(node_id);
-  if (found == local_nodes_.end()) {
-    throw std::runtime_error("Node is missing from packed page");
+  auto page = get_or_load_page(page_id);
+  const auto disk_node = index_.find_node_in_page(*page, node_id);
+  current_node_ = Node{};
+  current_node_.id = node_id;
+  current_node_.page = page;
+  const std::uint32_t* neighbors = index_.neighbor_data(*page, disk_node);
+  current_node_.neighbors.assign(neighbors,
+                                 neighbors + disk_node.neighbor_count);
+  if (require_vector) {
+    const float* values = index_.vector_data(*page, disk_node);
+    current_node_.vector.assign(values, values + index_.metadata_.dim);
   }
-  if (require_vector && found->second.vector.empty()) {
-    const auto disk_node = index_.find_node_in_page(page, node_id);
-    const float* values = index_.vector_data(page, disk_node);
-    found->second.vector.assign(values, values + index_.metadata_.dim);
-  }
-  return found->second;
+  resident_pages_.erase(page_id);
+  materialized_pages_.erase(page_id);
+  return current_node_;
 }
 
 std::vector<std::uint32_t> QueryPageSession::collect_missing_pages(
@@ -160,7 +187,7 @@ void QueryPageSession::ensure_pages_loaded_batch(
     if (page_id >= index_.metadata_.page_count) {
       throw std::runtime_error("Packed page id out of range");
     }
-    visited_pages_.insert(page_id);
+    mark_unique_page(touched_page_bits_, page_id, pages_touched_);
     if (seen.insert(page_id).second) {
       unique_pages.push_back(page_id);
     }
@@ -182,15 +209,10 @@ void QueryPageSession::ensure_pages_loaded_batch(
       ++stats_.prefetch_pending_hit;
       useful_prefetch_pages_.insert(page_id);
       const auto wait_start = std::chrono::steady_clock::now();
-      if (!wait_for_prefetch_page(page_id) ||
-          ready_prefetch_pages_.find(page_id) == ready_prefetch_pages_.end()) {
+      if (!wait_for_prefetch_page(page_id)) {
         throw std::runtime_error(
             "Pending topology prefetch did not materialize its page");
       }
-      auto ready = ready_prefetch_pages_.find(page_id);
-      Page page = std::move(ready->second);
-      ready_prefetch_pages_.erase(ready);
-      store_prefetched_page(page_id, std::move(page));
       if (!materialize_available_page(page_id)) {
         throw std::runtime_error(
             "Pending topology prefetch page could not be materialized");
@@ -227,9 +249,10 @@ void QueryPageSession::ensure_pages_loaded_batch(
       ++stats_.demand_reads;
       ++stats_.node_reads;
       ++stats_.page_requests_after_dedup;
-      demand_pages_.insert(page_id);
+      mark_unique_page(demand_page_bits_, page_id, demand_pages_count_);
       requests.push_back(AsyncPageReader::ReadRequest{
-          page_id, page_offset(page_id), index_.metadata_.page_size});
+          page_id, page_offset(page_id), index_.metadata_.page_size, false,
+          query_id_});
     }
     if (requests.empty()) {
       continue;
@@ -245,7 +268,8 @@ void QueryPageSession::ensure_pages_loaded_batch(
 
     while (!submitted_pages.empty()) {
       AsyncPageReader::CompletedRead completed;
-      if (!index_.page_reader_->reap_async_read(true, completed, stats_)) {
+      if (!index_.page_reader_->reap_async_read(query_id_, true, completed,
+                                                stats_)) {
         throw std::runtime_error("Failed to wait for packed graph page batch");
       }
       const auto token = submitted_pages.find(completed.token);
@@ -257,7 +281,7 @@ void QueryPageSession::ensure_pages_loaded_batch(
         const std::uint32_t prefetch_page = prefetch->second;
         prefetch_tokens_.erase(prefetch);
         pending_prefetch_pages_.erase(prefetch_page);
-        ready_prefetch_pages_.insert_or_assign(
+        store_prefetched_page(
             prefetch_page,
             index_.decode_page(prefetch_page, std::move(completed.data)));
         continue;
@@ -266,13 +290,11 @@ void QueryPageSession::ensure_pages_loaded_batch(
       submitted_pages.erase(token);
       Page decoded = index_.decode_page(page_id, std::move(completed.data));
       if (index_.cache_enabled()) {
-        const Page& cached_page =
+        auto cached_page =
             index_.store_cached_page(std::move(decoded), stats_);
-        materialize_page(cached_page);
+        remember_page(cached_page);
       } else {
-        auto inserted =
-            owned_pages_.insert_or_assign(page_id, std::move(decoded));
-        materialize_page(inserted.first->second);
+        remember_page(std::make_shared<Page>(std::move(decoded)));
       }
     }
     stats_.demand_read_wait_us +=
@@ -326,7 +348,8 @@ std::size_t QueryPageSession::submit_topology_prefetch(
       continue;
     }
     requests.push_back(AsyncPageReader::ReadRequest{
-        page_id, page_offset(page_id), index_.metadata_.page_size, true});
+        page_id, page_offset(page_id), index_.metadata_.page_size, true,
+        query_id_});
   }
   if (requests.empty()) return 0;
 
@@ -354,7 +377,7 @@ void QueryPageSession::record_topology_candidates(
 }
 
 bool QueryPageSession::is_node_materialized(std::uint32_t node_id) const {
-  return local_nodes_.find(node_id) != local_nodes_.end();
+  return resident_pages_.find(page_for_node(node_id)) != resident_pages_.end();
 }
 
 std::uint32_t QueryPageSession::page_for_node(std::uint32_t node_id) const {
@@ -409,9 +432,9 @@ void QueryPageSession::finish_query() {
   }
   stats_.prefetch_useful_pages = useful_prefetch_pages_.size();
   stats_.unique_prefetch_pages = submitted_prefetch_pages_.size();
-  stats_.unique_pages_touched = visited_pages_.size();
-  stats_.unique_nodes_accessed = accessed_nodes_.size();
-  stats_.unique_demand_pages = demand_pages_.size();
+  stats_.unique_pages_touched = pages_touched_;
+  stats_.unique_nodes_accessed = nodes_accessed_;
+  stats_.unique_demand_pages = demand_pages_count_;
   if (!prefetch_trace_path_.empty()) {
     std::lock_guard<std::mutex> lock(prefetch_trace_mutex());
     const std::filesystem::path path(prefetch_trace_path_);
@@ -474,7 +497,18 @@ void QueryPageSession::record_duplicate_skipped(std::size_t count) {
 
 bool QueryPageSession::page_ready_in_session(std::uint32_t page_id) const {
   return materialized_pages_.find(page_id) != materialized_pages_.end() ||
-         owned_pages_.find(page_id) != owned_pages_.end();
+         resident_pages_.find(page_id) != resident_pages_.end();
+}
+
+bool QueryPageSession::mark_unique_page(std::vector<std::uint64_t>& bits,
+                                         std::uint32_t page_id,
+                                         std::size_t& count) {
+  const std::size_t word = page_id >> 6;
+  const std::uint64_t mask = std::uint64_t{1} << (page_id & 63);
+  if ((bits[word] & mask) != 0) return false;
+  bits[word] |= mask;
+  ++count;
+  return true;
 }
 
 bool QueryPageSession::materialize_available_page(std::uint32_t page_id) {
@@ -488,38 +522,25 @@ bool QueryPageSession::materialize_available_page(std::uint32_t page_id) {
     index_.prefetch_controller_.record_feedback(
         "post_expand", prefetch_adaptive_, "ready_hit", 0.0, stats_);
   }
-  const auto owned = owned_pages_.find(page_id);
-  if (owned != owned_pages_.end()) {
+  const auto resident = resident_pages_.find(page_id);
+  if (resident != resident_pages_.end()) {
     ++stats_.pinned_hits;
-    materialize_page(owned->second);
     return true;
   }
   if (materialized_pages_.find(page_id) != materialized_pages_.end()) {
     ++stats_.pinned_hits;
     return true;
   }
-  if (const Page* cached = try_get_cached_page(page_id)) {
-    materialize_page(*cached);
+  if (auto cached = try_get_cached_page(page_id)) {
+    remember_page(cached);
     return true;
   }
   return false;
 }
 
-void QueryPageSession::materialize_page(const Page& page) {
-  if (!materialized_pages_.insert(page.page_id).second) {
-    return;
-  }
-  for (std::uint32_t slot = 0; slot < page.node_count; ++slot) {
-    const auto node = DiskPageCodec::node_at(index_.metadata_, page, slot);
-    auto inserted = local_nodes_.try_emplace(node.id);
-    Node& local_node = inserted.first->second;
-    if (inserted.second) {
-      local_node.id = node.id;
-      const std::uint32_t* neighbors = index_.neighbor_data(page, node);
-      local_node.neighbors.assign(neighbors,
-                                  neighbors + node.neighbor_count);
-    }
-  }
+void QueryPageSession::remember_page(PageHandle page) {
+  materialized_pages_.insert(page->page_id);
+  resident_pages_.insert_or_assign(page->page_id, std::move(page));
 }
 
 QueryPageSession::Page QueryPageSession::read_demand_page(
@@ -535,14 +556,16 @@ QueryPageSession::Page QueryPageSession::read_demand_page(
   }
   const auto submitted = index_.page_reader_->batch_submit(
       {AsyncPageReader::ReadRequest{page_id, page_offset(page_id),
-                                    index_.metadata_.page_size}},
+                                    index_.metadata_.page_size, false,
+                                    query_id_}},
       stats_);
   if (submitted.size() != 1) {
     throw std::runtime_error("Failed to submit packed graph demand page");
   }
   AsyncPageReader::CompletedRead completed;
   while (true) {
-    if (!index_.page_reader_->reap_async_read(true, completed, stats_)) {
+    if (!index_.page_reader_->reap_async_read(query_id_, true, completed,
+                                              stats_)) {
       throw std::runtime_error("Failed to complete packed graph demand page");
     }
     if (completed.token == submitted.front().token) break;
@@ -553,7 +576,7 @@ QueryPageSession::Page QueryPageSession::read_demand_page(
     const std::uint32_t prefetch_page = prefetch->second;
     prefetch_tokens_.erase(prefetch);
     pending_prefetch_pages_.erase(prefetch_page);
-    ready_prefetch_pages_.insert_or_assign(
+    store_prefetched_page(
         prefetch_page,
         index_.decode_page(prefetch_page, std::move(completed.data)));
   }
@@ -567,7 +590,10 @@ QueryPageSession::Page QueryPageSession::read_demand_page(
 bool QueryPageSession::consume_prefetch_completion(bool wait) {
   if (prefetch_tokens_.empty()) return false;
   AsyncPageReader::CompletedRead completed;
-  if (!index_.page_reader_->reap_async_read(wait, completed, stats_)) return false;
+  if (!index_.page_reader_->reap_async_read(query_id_, wait, completed,
+                                            stats_)) {
+    return false;
+  }
   const auto found = prefetch_tokens_.find(completed.token);
   if (found == prefetch_tokens_.end()) {
     throw std::runtime_error("Unexpected demand completion while harvesting prefetch");
@@ -575,7 +601,7 @@ bool QueryPageSession::consume_prefetch_completion(bool wait) {
   const std::uint32_t page_id = found->second;
   prefetch_tokens_.erase(found);
   pending_prefetch_pages_.erase(page_id);
-  ready_prefetch_pages_.insert_or_assign(
+  store_prefetched_page(
       page_id, index_.decode_page(page_id, std::move(completed.data)));
   return true;
 }
@@ -590,14 +616,13 @@ bool QueryPageSession::wait_for_prefetch_page(std::uint32_t page_id) {
 
 void QueryPageSession::store_prefetched_page(std::uint32_t page_id, Page page) {
   if (index_.cache_enabled()) {
-    const Page& cached = index_.store_cached_page(std::move(page), stats_);
+    auto cached = index_.store_cached_page(std::move(page), stats_);
     if (useful_prefetch_pages_.find(page_id) != useful_prefetch_pages_.end()) {
-      materialize_page(cached);
+      remember_page(cached);
     }
   } else {
-    auto inserted = owned_pages_.insert_or_assign(page_id, std::move(page));
     if (useful_prefetch_pages_.find(page_id) != useful_prefetch_pages_.end()) {
-      materialize_page(inserted.first->second);
+      remember_page(std::make_shared<Page>(std::move(page)));
     }
   }
 }

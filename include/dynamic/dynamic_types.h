@@ -19,12 +19,27 @@ struct DynamicLocator {
   bool valid() const { return kind != DynamicStorageKind::kNone; }
 };
 
-struct DynamicRecord {
+struct WritePayload {
+  NodeId node_id = 0;
+  std::uint32_t dim = 0;
+  std::vector<float> vector;
+  bool deleted = false;
+};
+
+struct CompactDeltaVersion {
+  std::uint64_t sequence_id = 0;
+  NodeId node_id = 0;
+  std::uint32_t dim = 0;
+  DynamicLocator locator;
+  std::vector<std::uint8_t> pq_code;
+  bool deleted = false;
+};
+
+struct MaterializedRecord {
   std::uint64_t sequence_id = 0;
   NodeId node_id = 0;
   std::uint32_t dim = 0;
   std::vector<float> vector;
-  std::vector<NodeId> neighbors;
   DynamicLocator locator;
   bool deleted = false;
 };

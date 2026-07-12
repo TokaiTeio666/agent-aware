@@ -1,6 +1,7 @@
 #include "core/async_page_reader.h"
 
 #include <algorithm>
+#include <chrono>
 #include <cerrno>
 #include <cstdlib>
 #include <cstring>
@@ -275,6 +276,7 @@ struct AsyncPageReader::Impl {
     void* aligned = nullptr;
     std::size_t bytes = 0;
     std::size_t index = 0;
+    std::uint64_t query_id = 0;
   };
 
   Impl(std::string reader_path, std::size_t reader_page_size)
@@ -392,7 +394,8 @@ struct AsyncPageReader::Impl {
   }
 
   std::uint64_t start_async_read(std::uint64_t offset, std::size_t bytes,
-                                 DiskGraphSearchStats& stats) {
+                                 DiskGraphSearchStats& stats,
+                                 std::uint64_t query_id = 0) {
     if (!async_enabled()) {
       throw std::runtime_error("Async graph reads require io_uring mode");
     }
@@ -434,7 +437,8 @@ struct AsyncPageReader::Impl {
       throw std::runtime_error("Graph page async read failed: " + reason);
     }
 
-    async_buffers.emplace(token, AsyncBuffer{aligned, bytes, buffer_index});
+    async_buffers.emplace(
+        token, AsyncBuffer{aligned, bytes, buffer_index, query_id});
     ++stats.io_submits;
     ++stats.submitted_reads;
     return token;
@@ -475,8 +479,10 @@ struct AsyncPageReader::Impl {
         throw std::runtime_error("Graph thread-pool batch failed: " + error);
       }
       for (std::size_t i = 0; i < tokens.size(); ++i) {
-        queued.push_back({read_requests[i].page_id, tokens[i]});
+        queued.push_back(
+            {read_requests[i].page_id, tokens[i], read_requests[i].query_id});
         platform_tokens.push_back(tokens[i]);
+        platform_query_ids.emplace(tokens[i], read_requests[i].query_id);
         ++stats.io_submits;
         ++stats.submitted_reads;
         ++stats.io_submit_syscalls;
@@ -489,20 +495,22 @@ struct AsyncPageReader::Impl {
       for (const auto& request : read_requests) {
         const std::uint64_t token = next_async_token++;
         inline_completions.push_back(
-            AsyncPageReader::CompletedRead{token,
-                                           read(request.offset, request.bytes,
-                                                stats)});
-        queued.push_back(
-            AsyncPageReader::SubmittedRead{request.page_id, token});
+            AsyncPageReader::CompletedRead{
+                token, read(request.offset, request.bytes, stats),
+                request.query_id});
+        queued.push_back(AsyncPageReader::SubmittedRead{
+            request.page_id, token, request.query_id});
       }
       return queued;
     }
 
     for (const auto& request : read_requests) {
       const std::uint64_t token =
-          start_async_read(request.offset, request.bytes, stats);
+          start_async_read(request.offset, request.bytes, stats,
+                           request.query_id);
       queued.push_back(
-          AsyncPageReader::SubmittedRead{request.page_id, token});
+          AsyncPageReader::SubmittedRead{request.page_id, token,
+                                         request.query_id});
     }
 
     return queued;
@@ -563,6 +571,10 @@ struct AsyncPageReader::Impl {
         throw std::runtime_error("Graph thread-pool read failed: " + result.error);
       }
       completed.token = result.token;
+      const auto query = platform_query_ids.find(result.token);
+      completed.query_id =
+          query == platform_query_ids.end() ? 0 : query->second;
+      if (query != platform_query_ids.end()) platform_query_ids.erase(query);
       completed.data = std::move(result.data);
       ++stats.io_completions;
       ++stats.completed_reads;
@@ -602,6 +614,7 @@ struct AsyncPageReader::Impl {
     }
 
     completed.token = completion.user_data;
+    completed.query_id = buffer.query_id;
     completed.data.assign(static_cast<const char*>(buffer.aligned),
                           static_cast<const char*>(buffer.aligned) +
                               buffer.bytes);
@@ -814,6 +827,7 @@ struct AsyncPageReader::Impl {
   std::unordered_map<std::uint64_t, AsyncBuffer> async_buffers;
   std::unique_ptr<platform::PageIoBackend> thread_pool_backend;
   std::deque<std::uint64_t> platform_tokens;
+  std::unordered_map<std::uint64_t, std::uint64_t> platform_query_ids;
   std::deque<AsyncPageReader::CompletedRead> inline_completions;
   std::unique_ptr<AlignedBufferPool> async_buffer_pool;
   std::uint64_t next_async_token = 1;
@@ -835,6 +849,7 @@ AsyncPageReader::~AsyncPageReader() = default;
 void AsyncPageReader::configure(const std::string& mode,
                                 std::size_t batch_size,
                                 std::size_t io_depth) {
+  std::lock_guard<std::mutex> lock(mutex_);
   impl_->configure(mode, batch_size, io_depth);
 }
 
@@ -857,33 +872,68 @@ std::size_t AsyncPageReader::pending_async_reads() const {
 std::vector<char> AsyncPageReader::read(std::uint64_t offset,
                                         std::size_t bytes,
                                         DiskGraphSearchStats& stats) {
+  std::lock_guard<std::mutex> lock(mutex_);
   return impl_->read(offset, bytes, stats);
 }
 
 std::uint64_t AsyncPageReader::start_async_read(
     std::uint64_t offset, std::size_t bytes, DiskGraphSearchStats& stats) {
+  std::lock_guard<std::mutex> lock(mutex_);
   return impl_->start_async_read(offset, bytes, stats);
 }
 
 std::vector<AsyncPageReader::SubmittedRead> AsyncPageReader::queue_reads(
     const std::vector<ReadRequest>& read_requests,
     DiskGraphSearchStats& stats) {
+  std::lock_guard<std::mutex> lock(mutex_);
   return impl_->queue_reads(read_requests, stats);
 }
 
 std::vector<AsyncPageReader::SubmittedRead> AsyncPageReader::batch_submit(
     const std::vector<ReadRequest>& read_requests,
     DiskGraphSearchStats& stats) {
+  std::lock_guard<std::mutex> lock(mutex_);
   return impl_->batch_submit(read_requests, stats);
 }
 
 void AsyncPageReader::submit_async_reads(DiskGraphSearchStats& stats) {
+  std::lock_guard<std::mutex> lock(mutex_);
   impl_->submit_async_reads(stats);
 }
 
 bool AsyncPageReader::reap_async_read(bool wait, CompletedRead& completed,
                                       DiskGraphSearchStats& stats) {
+  std::lock_guard<std::mutex> lock(mutex_);
   return impl_->reap_async_read(wait, completed, stats);
+}
+
+bool AsyncPageReader::reap_async_read(std::uint64_t query_id, bool wait,
+                                      CompletedRead& completed,
+                                      DiskGraphSearchStats& stats) {
+  for (;;) {
+    {
+      std::lock_guard<std::mutex> lock(mutex_);
+      auto& ready = deferred_[query_id];
+      if (!ready.empty()) {
+        completed = std::move(ready.front());
+        ready.pop_front();
+        return true;
+      }
+      CompletedRead candidate;
+      if (impl_->reap_async_read(false, candidate, stats)) {
+        if (candidate.query_id == query_id) {
+          completed = std::move(candidate);
+          return true;
+        }
+        deferred_[candidate.query_id].push_back(std::move(candidate));
+        completion_condition_.notify_all();
+        continue;
+      }
+    }
+    if (!wait) return false;
+    std::unique_lock<std::mutex> lock(mutex_);
+    completion_condition_.wait_for(lock, std::chrono::milliseconds(1));
+  }
 }
 
 }  // namespace agent_aware

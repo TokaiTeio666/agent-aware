@@ -2,9 +2,13 @@
 
 #include <cstddef>
 #include <cstdint>
+#include <deque>
 #include <memory>
 #include <string>
+#include <unordered_map>
 #include <vector>
+#include <mutex>
+#include <condition_variable>
 
 #include "core/io_stats.h"
 
@@ -19,16 +23,19 @@ class AsyncPageReader {
     std::uint64_t offset = 0;
     std::size_t bytes = 0;
     bool prefetch = false;
+    std::uint64_t query_id = 0;
   };
 
   struct SubmittedRead {
     std::uint32_t page_id = 0;
     std::uint64_t token = 0;
+    std::uint64_t query_id = 0;
   };
 
   struct CompletedRead {
     std::uint64_t token = 0;
     std::vector<char> data;
+    std::uint64_t query_id = 0;
   };
 
   AsyncPageReader(std::string path, std::size_t page_size);
@@ -60,10 +67,16 @@ class AsyncPageReader {
   void submit_async_reads(DiskGraphSearchStats& stats);
   bool reap_async_read(bool wait, CompletedRead& completed,
                        DiskGraphSearchStats& stats);
+  bool reap_async_read(std::uint64_t query_id, bool wait,
+                       CompletedRead& completed,
+                       DiskGraphSearchStats& stats);
 
  private:
   struct Impl;
   std::unique_ptr<Impl> impl_;
+  mutable std::mutex mutex_;
+  std::condition_variable completion_condition_;
+  std::unordered_map<std::uint64_t, std::deque<CompletedRead>> deferred_;
 };
 
 }  // namespace agent_aware

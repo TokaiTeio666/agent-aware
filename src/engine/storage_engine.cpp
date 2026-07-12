@@ -7,19 +7,26 @@
 
 namespace agent_aware {
 
+SharedPackedGraphRuntime::SharedPackedGraphRuntime(
+    const PackedGraphEngineConfig& config)
+    : index_(std::make_shared<PackedDiskGraphIndex>(config.index_path,
+                                                    config.pq_model)) {
+  index_->configure_cache(config.cache_policy, config.cache_pages,
+                          config.protect_hot_pages,
+                          config.hot_degree_threshold);
+  index_->configure_io(config.io_mode, config.io_batch_size, config.io_depth);
+}
+
 PackedGraphEngine::PackedGraphEngine(PackedGraphEngineConfig config)
     : config_(std::move(config)),
-      index_(config_.index_path, config_.pq_model) {
+      runtime_(config_.shared_runtime
+                   ? config_.shared_runtime
+                   : std::make_shared<SharedPackedGraphRuntime>(config_)) {
   config_.search.pq_model =
-      config_.pq_model ? config_.pq_model.get() : &index_.pq_model();
+      config_.pq_model ? config_.pq_model.get() : &index().pq_model();
   config_.search.adc_enable = true;
-  index_.configure_cache(config_.cache_policy, config_.cache_pages,
-                         config_.protect_hot_pages,
-                         config_.hot_degree_threshold);
-  index_.configure_io(config_.io_mode, config_.io_batch_size,
-                      config_.io_depth);
   generation_ = PackedGraphGeneration::open_or_create(
-      config_.index_path, index_.shared_pq_model());
+      config_.index_path, index().shared_pq_model());
   const std::uint32_t base_max = metadata().vector_count == 0
                                      ? 0
                                      : static_cast<std::uint32_t>(metadata().vector_count - 1);
@@ -65,7 +72,7 @@ EngineSearchResult PackedGraphEngine::search_one(const float* query,
           .count();
 
   const auto base_start = std::chrono::steady_clock::now();
-  const auto graph_result = index_.search_one(query, search);
+  const auto graph_result = index().search_one(query, search);
   output.stats.timing.base_search_ms =
       std::chrono::duration<double, std::milli>(
           std::chrono::steady_clock::now() - base_start)
@@ -78,10 +85,10 @@ EngineSearchResult PackedGraphEngine::search_one(const float* query,
     }
     // base id 可能已有更新版本或 tombstone，合并新增 id 前需要显式查一次动态层。
     const auto latest_start = std::chrono::steady_clock::now();
-    std::unordered_map<NodeId, DynamicRecord> latest_base_records;
+    std::unordered_map<NodeId, MaterializedRecord> latest_base_records;
     if (generation) {
       for (const auto id : base_ids) {
-        DynamicRecord record;
+        MaterializedRecord record;
         if (generation->resolve(id, record)) {
           latest_base_records[id] = std::move(record);
         }
@@ -100,13 +107,13 @@ EngineSearchResult PackedGraphEngine::search_one(const float* query,
             .count();
 
     const auto delta_start = std::chrono::steady_clock::now();
-    std::vector<DynamicRecord> delta_records;
+    std::vector<MaterializedRecord> delta_records;
     if (generation) {
       delta_records = generation->search(
           query, metadata().dim, top_k,
           std::min<std::size_t>(256, std::max<std::size_t>(64, top_k * 8)));
     }
-    auto active_delta = config_.dynamic_manager->search_delta_l2_at(
+    auto active_delta = config_.dynamic_manager->search_delta_pq_at(
         query, metadata().dim, top_k, read_sequence,
         output.stats.base_sequence, &output.stats.delta);
     delta_records.insert(delta_records.end(),
@@ -122,7 +129,7 @@ EngineSearchResult PackedGraphEngine::search_one(const float* query,
     }
     // 最终 top-k 会用所有可见 delta 记录的精确向量计算，保证删除和更新覆盖近似 base 结果。
     const auto merge_start = std::chrono::steady_clock::now();
-    output.topk = dynamic::merge_base_and_delta_l2(
+    output.topk = dynamic::merge_base_and_delta_candidates(
         graph_result.topk, delta_records, query, metadata().dim, top_k);
     output.stats.timing.merge_ms =
         std::chrono::duration<double, std::milli>(
@@ -242,9 +249,8 @@ void PackedGraphEngine::merge_loop() {
         merge_status_.to_sequence = cutoff;
         merge_status_.processed_records = snapshot.records.size();
         for (const auto& record : snapshot.records) {
-          merge_status_.workspace_bytes += sizeof(DynamicRecord) +
-              record.vector.capacity() * sizeof(float) +
-              record.neighbors.capacity() * sizeof(NodeId);
+          merge_status_.workspace_bytes += sizeof(MaterializedRecord) +
+              record.vector.capacity() * sizeof(float);
         }
         if (merge_cancel_.load(std::memory_order_acquire)) {
           merge_status_.phase = MergeStatus::Phase::kCancelled;
@@ -255,7 +261,7 @@ void PackedGraphEngine::merge_loop() {
       }
       auto next = PackedGraphGeneration::publish(
           config_.index_path, *previous, snapshot.records, cutoff,
-          index_.shared_pq_model(), &merge_cancel_);
+          index().shared_pq_model(), &merge_cancel_);
       {
         std::lock_guard<std::mutex> lock(merge_mutex_);
         merge_status_.phase = MergeStatus::Phase::kPublishing;
@@ -334,10 +340,10 @@ void PackedGraphEngine::configure_runtime(std::size_t cache_pages,
   config_.search.prefetch_policy = prefetch_enabled ? "topology" : "none";
   config_.search.prefetch_top_k = prefetch_enabled ? prefetch_top_k : 0;
   config_.search.prefetch_max_inflight = prefetch_enabled ? io_depth : 0;
-  index_.configure_cache(config_.cache_policy, cache_pages,
+  index().configure_cache(config_.cache_policy, cache_pages,
                          config_.protect_hot_pages,
                          config_.hot_degree_threshold);
-  index_.configure_io(config_.io_mode, config_.io_batch_size, io_depth);
+  index().configure_io(config_.io_mode, config_.io_batch_size, io_depth);
 }
 
 }  // namespace agent_aware

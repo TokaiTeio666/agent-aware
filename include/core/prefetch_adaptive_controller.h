@@ -1,6 +1,7 @@
 #pragma once
 
 #include <cstddef>
+#include <mutex>
 #include <string>
 #include <unordered_map>
 
@@ -35,6 +36,7 @@ class PrefetchAdaptiveController {
     std::size_t pause_remaining = 0;
   };
   std::unordered_map<std::string, Bucket> buckets_;
+  std::mutex mutex_;
 };
 
 }  // namespace agent_aware

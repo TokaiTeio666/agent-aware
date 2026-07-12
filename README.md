@@ -495,6 +495,7 @@ ctest --test-dir build --output-on-failure
 | `requested_*`, `effective_*` | 请求参数与最终生效参数 |
 | `io_requested_mode`, `io_effective_mode`, `io_fallback_reason` | I/O 模式与 fallback 原因 |
 | `memory_budget_ratio`, `estimated_resident_ratio`, `cache_pages_auto` | 内存预算报告 |
+| `whole_process_peak_pss_bytes`, `whole_process_peak_pss_ratio`, `whole_process_peak_pss_budget_pass` | Linux 下从索引打开到检索结束每 50ms 采样的真实进程 Peak PSS 及 20% 预算判定 |
 | `qps`, `avg_query_latency_ms`, `latency_p95_ms`, `latency_p99_ms` | 性能指标 |
 | `recall_at_k`, `recall_queries` | 召回率指标 |
 | `stats.page_cache_hits`, `stats.cache_hit_rate` | 缓存命中统计 |
@@ -549,7 +550,6 @@ CSV 字段含义：
 | `read_breakdown.delta_search_*_ms` | 动态 delta 层向量搜索耗时 |
 | `read_breakdown.merge_*_ms` | base + delta Top-K merge 耗时 |
 | `read_breakdown.exact_recall_*_ms` | 动态 Recall exact truth 回算耗时；只用于正确性实验 |
-| `read_breakdown.search_mutex_wait_*_ms` | packed graph 内部 search mutex 等待时间 |
 | `read_breakdown.page_read_wait_*_ms` | demand page read 等待时间 |
 
 ## 具体工作流程

@@ -64,6 +64,15 @@ def main():
         assert payload["entry_strategy"] == "single-medoid"
         assert payload["entry_seed_ids"] == [manifest["entry_id"]]
         assert Path(payload["build_manifest"]) == manifest_path
+        assert "whole_process_peak_pss_bytes" in payload
+        assert "whole_process_peak_pss_budget_pass" in payload
+        assert "query_latency_ms" not in payload
+        assert "dirty_untracked_files" not in payload
+        assert "io_mode" not in payload
+        assert "pq_enabled" not in payload
+        assert "cache_hit_rate" not in payload
+        assert "demand_reads_per_query" not in payload
+        assert isinstance(payload["git_dirty"], bool)
         expected_stats = {
             "expanded", "submitted_reads", "completed_reads", "demand_reads",
             "cache_hits", "io_submit_syscalls", "beam_cached_pages",

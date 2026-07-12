@@ -132,11 +132,10 @@ bool data_header_is_valid(const DataRecordHeader& header) {
   return header.node_id <= std::numeric_limits<NodeId>::max();
 }
 
-bool write_record(std::ofstream& output, const DynamicRecord& record) {
+bool write_record(std::ofstream& output, const MaterializedRecord& record) {
   if (record.dim != record.vector.size() ||
       record.vector.size() > std::numeric_limits<std::uint32_t>::max() /
-                                 sizeof(float) ||
-      record.neighbors.size() > std::numeric_limits<std::uint32_t>::max()) {
+                                 sizeof(float)) {
     return false;
   }
 
@@ -147,8 +146,8 @@ bool write_record(std::ofstream& output, const DynamicRecord& record) {
   header.dim = record.dim;
   header.vector_bytes =
       static_cast<std::uint32_t>(record.vector.size() * sizeof(float));
-  header.neighbor_count = static_cast<std::uint32_t>(record.neighbors.size());
-  header.payload_checksum = checksum_payload(record.vector, record.neighbors);
+  header.neighbor_count = 0;
+  header.payload_checksum = checksum_payload(record.vector, {});
 
   // 删除记录保持相同结构；空向量 payload 加 deleted 位即可在后续 merge 中压制旧 base/delta 值。
   if (!write_data_header(output, header)) {
@@ -161,18 +160,11 @@ bool write_record(std::ofstream& output, const DynamicRecord& record) {
       return false;
     }
   }
-  if (!record.neighbors.empty()) {
-    output.write(reinterpret_cast<const char*>(record.neighbors.data()),
-                 record.neighbors.size() * sizeof(NodeId));
-    if (!output) {
-      return false;
-    }
-  }
   return true;
 }
 
 bool read_record_at(const std::filesystem::path& data_path,
-                    std::uint64_t offset, DynamicRecord& out) {
+                    std::uint64_t offset, MaterializedRecord& out) {
   std::ifstream input(data_path, std::ios::binary);
   if (!input) {
     return false;
@@ -187,13 +179,13 @@ bool read_record_at(const std::filesystem::path& data_path,
     return false;
   }
 
-  DynamicRecord record;
+  MaterializedRecord record;
   record.sequence_id = header.sequence_id;
   record.node_id = static_cast<NodeId>(header.node_id);
   record.dim = header.dim;
   record.deleted = header.deleted != 0;
   record.vector.resize(header.dim);
-  record.neighbors.resize(header.neighbor_count);
+  std::vector<NodeId> legacy_neighbors(header.neighbor_count);
 
   if (header.vector_bytes > 0) {
     input.read(reinterpret_cast<char*>(record.vector.data()),
@@ -203,13 +195,13 @@ bool read_record_at(const std::filesystem::path& data_path,
     }
   }
   if (header.neighbor_count > 0) {
-    input.read(reinterpret_cast<char*>(record.neighbors.data()),
-               record.neighbors.size() * sizeof(NodeId));
+    input.read(reinterpret_cast<char*>(legacy_neighbors.data()),
+               legacy_neighbors.size() * sizeof(NodeId));
     if (!input) {
       return false;
     }
   }
-  if (checksum_payload(record.vector, record.neighbors) !=
+  if (checksum_payload(record.vector, legacy_neighbors) !=
       header.payload_checksum) {
     return false;
   }
@@ -218,9 +210,9 @@ bool read_record_at(const std::filesystem::path& data_path,
   return true;
 }
 
-std::vector<DynamicRecord> deduplicate_records(
-    const std::vector<DynamicRecord>& records) {
-  std::unordered_map<NodeId, DynamicRecord> latest;
+std::vector<MaterializedRecord> deduplicate_records(
+    const std::vector<MaterializedRecord>& records) {
+  std::unordered_map<NodeId, MaterializedRecord> latest;
   latest.reserve(records.size());
   for (const auto& record : records) {
     const auto found = latest.find(record.node_id);
@@ -230,13 +222,13 @@ std::vector<DynamicRecord> deduplicate_records(
     }
   }
 
-  std::vector<DynamicRecord> result;
+  std::vector<MaterializedRecord> result;
   result.reserve(latest.size());
   for (const auto& item : latest) {
     result.push_back(item.second);
   }
   std::sort(result.begin(), result.end(),
-            [](const DynamicRecord& lhs, const DynamicRecord& rhs) {
+            [](const MaterializedRecord& lhs, const MaterializedRecord& rhs) {
               return lhs.node_id < rhs.node_id;
             });
   return result;
@@ -367,7 +359,7 @@ SSTableWriter::SSTableWriter(const std::filesystem::path& dir,
                              std::uint64_t sstable_id, int level)
     : dir_(dir), sstable_id_(sstable_id), level_(level) {}
 
-bool SSTableWriter::write(const std::vector<DynamicRecord>& records) {
+bool SSTableWriter::write(const std::vector<MaterializedRecord>& records) {
   std::error_code error;
   std::filesystem::create_directories(dir_, error);
   if (error) {
@@ -472,7 +464,7 @@ bool SSTableReader::open() {
   return true;
 }
 
-bool SSTableReader::get(NodeId node_id, DynamicRecord& out) const {
+bool SSTableReader::get(NodeId node_id, MaterializedRecord& out) const {
   if (!opened_) {
     return false;
   }
@@ -482,7 +474,7 @@ bool SSTableReader::get(NodeId node_id, DynamicRecord& out) const {
   if (found == index_.end() || found->node_id != node_id) {
     return false;
   }
-  DynamicRecord record;
+  MaterializedRecord record;
   if (!read_record_at(data_path_, found->offset, record) ||
       record.node_id != node_id ||
       record.sequence_id != found->sequence_id) {
@@ -492,27 +484,27 @@ bool SSTableReader::get(NodeId node_id, DynamicRecord& out) const {
   return true;
 }
 
-std::vector<DynamicRecord> SSTableReader::scan_all() const {
-  std::vector<DynamicRecord> records;
+std::vector<MaterializedRecord> SSTableReader::scan_all() const {
+  std::vector<MaterializedRecord> records;
   if (!opened_) {
     return records;
   }
   records.reserve(index_.size());
   for (const auto& item : index_) {
-    DynamicRecord record;
+    MaterializedRecord record;
     if (get(item.node_id, record)) {
       records.push_back(std::move(record));
     }
   }
   std::sort(records.begin(), records.end(),
-            [](const DynamicRecord& lhs, const DynamicRecord& rhs) {
+            [](const MaterializedRecord& lhs, const MaterializedRecord& rhs) {
               return lhs.node_id < rhs.node_id;
             });
   return records;
 }
 
 bool SSTableReader::read_at(const DynamicLocator& locator,
-                            DynamicRecord& out) const {
+                            MaterializedRecord& out) const {
   if (!opened_ || locator.kind != DynamicStorageKind::kSSTable ||
       locator.file_id != id_) {
     return false;
@@ -522,13 +514,13 @@ bool SSTableReader::read_at(const DynamicLocator& locator,
   return true;
 }
 
-std::vector<std::pair<DynamicRecord, DynamicLocator>>
+std::vector<std::pair<MaterializedRecord, DynamicLocator>>
 SSTableReader::scan_all_located() const {
-  std::vector<std::pair<DynamicRecord, DynamicLocator>> output;
+  std::vector<std::pair<MaterializedRecord, DynamicLocator>> output;
   if (!opened_) return output;
   output.reserve(index_.size());
   for (const auto& item : index_) {
-    DynamicRecord record;
+    MaterializedRecord record;
     DynamicLocator locator{DynamicStorageKind::kSSTable, id_,
                            item.offset, 0, 0};
     if (read_at(locator, record)) {

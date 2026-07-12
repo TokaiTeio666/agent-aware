@@ -5,7 +5,7 @@
 #include <filesystem>
 #include <vector>
 
-#include "dynamic/dynamic_record.h"
+#include "dynamic/dynamic_types.h"
 
 namespace agent_aware::dynamic {
 
@@ -14,7 +14,7 @@ class SSTableWriter {
   SSTableWriter(const std::filesystem::path& dir, std::uint64_t sstable_id,
                 int level);
 
-  bool write(const std::vector<DynamicRecord>& records);
+  bool write(const std::vector<MaterializedRecord>& records);
 
  private:
   std::filesystem::path dir_;
@@ -28,15 +28,15 @@ class SSTableReader {
 
   bool open();
 
-  std::vector<DynamicRecord> scan_all() const;
-  bool read_at(const DynamicLocator& locator, DynamicRecord& out) const;
-  std::vector<std::pair<DynamicRecord, DynamicLocator>> scan_all_located() const;
+  std::vector<MaterializedRecord> scan_all() const;
+  bool read_at(const DynamicLocator& locator, MaterializedRecord& out) const;
+  std::vector<std::pair<MaterializedRecord, DynamicLocator>> scan_all_located() const;
 
   std::uint64_t id() const;
   std::uint64_t max_sequence_id() const;
 
  private:
-  bool get(NodeId node_id, DynamicRecord& out) const;
+  bool get(NodeId node_id, MaterializedRecord& out) const;
   struct IndexEntry {
     NodeId node_id = 0;
     std::uint64_t sequence_id = 0;

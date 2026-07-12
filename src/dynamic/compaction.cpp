@@ -17,9 +17,9 @@ std::string sstable_name(std::uint64_t sstable_id) {
   return name.str();
 }
 
-std::vector<DynamicRecord> deduplicate_newest(
-    const std::vector<DynamicRecord>& records) {
-  std::unordered_map<NodeId, DynamicRecord> latest;
+std::vector<MaterializedRecord> deduplicate_newest(
+    const std::vector<MaterializedRecord>& records) {
+  std::unordered_map<NodeId, MaterializedRecord> latest;
   latest.reserve(records.size());
   for (const auto& record : records) {
     const auto found = latest.find(record.node_id);
@@ -29,13 +29,13 @@ std::vector<DynamicRecord> deduplicate_newest(
     }
   }
 
-  std::vector<DynamicRecord> output;
+  std::vector<MaterializedRecord> output;
   output.reserve(latest.size());
   for (const auto& item : latest) {
     output.push_back(item.second);
   }
   std::sort(output.begin(), output.end(),
-            [](const DynamicRecord& lhs, const DynamicRecord& rhs) {
+            [](const MaterializedRecord& lhs, const MaterializedRecord& rhs) {
               return lhs.node_id < rhs.node_id;
             });
   return output;
@@ -55,7 +55,7 @@ CompactionResult CompactionJob::run() {
     return result;
   }
 
-  std::vector<DynamicRecord> records;
+  std::vector<MaterializedRecord> records;
   for (const auto& table : input_.input_tables) {
     if (!table) {
       return result;

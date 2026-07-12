@@ -23,12 +23,10 @@ agent_aware::dynamic::DynamicWriteOptions options_for(
   agent_aware::dynamic::DynamicWriteOptions options;
   options.dynamic_dir = path;
   options.memtable_flush_bytes = 4096;
-  options.dynamic_graph_degree = 0;
   options.write_queue_capacity = 128;
   options.wal_group_max_records = 16;
   options.wal_group_max_delay_us = 2000;
   options.version_index_shards = 8;
-  options.enable_wal = true;
   options.enable_auto_flush = true;
   options.enable_background_flush = true;
   return options;
@@ -98,9 +96,9 @@ void test_wal_torn_tail(const std::filesystem::path& root) {
   std::filesystem::remove(path);
   agent_aware::dynamic::WalWriter writer(path);
   assert(writer.valid());
-  std::vector<agent_aware::DynamicRecord> records;
+  std::vector<agent_aware::MaterializedRecord> records;
   for (std::uint32_t i = 1; i <= 3; ++i) {
-    agent_aware::DynamicRecord record;
+    agent_aware::MaterializedRecord record;
     record.sequence_id = i;
     record.node_id = i;
     record.dim = 4;
@@ -126,7 +124,7 @@ void test_legacy_wal_recovery(const std::filesystem::path& root) {
   const auto path = root / "legacy";
   std::filesystem::remove_all(path);
   std::filesystem::create_directories(path / "wal");
-  agent_aware::DynamicRecord record;
+  agent_aware::MaterializedRecord record;
   record.sequence_id = 17;
   record.node_id = 42;
   record.dim = 4;

@@ -1,4 +1,5 @@
 #include <algorithm>
+#include <atomic>
 #include <chrono>
 #include <cstddef>
 #include <cstdint>
@@ -69,6 +70,9 @@ struct Args {
 
   std::size_t top_k = 10;
   std::size_t search_width = 156;
+  std::size_t search_list_size = 0;
+  std::size_t max_search_list_size = 0;
+  std::size_t candidate_hot_size = 0;
   bool beam_width_requested = false;
   std::size_t requested_beam_width = 0;
   std::size_t effective_beam_width = 16;
@@ -102,6 +106,100 @@ struct MemoryBudgetReport {
   std::uint64_t estimated_resident_bytes = 0;
   double estimated_resident_ratio = 0.0;
   bool cache_pages_auto = false;
+};
+
+struct ProcessMemoryReport {
+  bool pss_available = false;
+  std::uint64_t peak_pss_bytes = 0;
+  double peak_pss_ratio = 0.0;
+  bool budget_pass = false;
+  std::uint64_t sample_count = 0;
+  std::uint64_t sample_interval_ms = 50;
+};
+
+std::optional<std::uint64_t> read_self_pss_bytes() {
+#ifdef __linux__
+  std::ifstream input("/proc/self/smaps_rollup");
+  std::string line;
+  while (std::getline(input, line)) {
+    std::istringstream fields(line);
+    std::string key;
+    std::uint64_t value_kib = 0;
+    std::string unit;
+    if (fields >> key >> value_kib >> unit && key == "Pss:") {
+      return value_kib * 1024;
+    }
+  }
+#endif
+  return std::nullopt;
+}
+
+class ProcessPssSampler {
+ public:
+  ProcessPssSampler() {
+    sample();
+    worker_ = std::thread([this]() {
+      while (!stop_.load(std::memory_order_relaxed)) {
+        std::this_thread::sleep_for(sample_interval_);
+        sample();
+      }
+    });
+  }
+
+  ~ProcessPssSampler() { stop(); }
+
+  ProcessMemoryReport stop_and_report(std::uint64_t dataset_bytes,
+                                      std::uint64_t budget_bytes) {
+    stop();
+    ProcessMemoryReport report;
+    report.pss_available = available_.load(std::memory_order_relaxed);
+    report.peak_pss_bytes = peak_pss_bytes_.load(std::memory_order_relaxed);
+    report.sample_count = sample_count_.load(std::memory_order_relaxed);
+    report.sample_interval_ms = static_cast<std::uint64_t>(
+        std::chrono::duration_cast<std::chrono::milliseconds>(sample_interval_)
+            .count());
+    report.peak_pss_ratio = dataset_bytes == 0
+                                ? 0.0
+                                : static_cast<double>(report.peak_pss_bytes) /
+                                      static_cast<double>(dataset_bytes);
+    report.budget_pass = report.pss_available &&
+                         report.peak_pss_bytes <= budget_bytes;
+    return report;
+  }
+
+ private:
+  void sample() {
+    const auto pss_bytes = read_self_pss_bytes();
+    if (!pss_bytes.has_value()) {
+      return;
+    }
+    available_.store(true, std::memory_order_relaxed);
+    sample_count_.fetch_add(1, std::memory_order_relaxed);
+    std::uint64_t peak = peak_pss_bytes_.load(std::memory_order_relaxed);
+    while (peak < *pss_bytes &&
+           !peak_pss_bytes_.compare_exchange_weak(
+               peak, *pss_bytes, std::memory_order_relaxed)) {
+    }
+  }
+
+  void stop() {
+    if (stopped_.exchange(true, std::memory_order_relaxed)) {
+      return;
+    }
+    stop_.store(true, std::memory_order_relaxed);
+    if (worker_.joinable()) {
+      worker_.join();
+    }
+    sample();
+  }
+
+  const std::chrono::milliseconds sample_interval_{50};
+  std::atomic<bool> stop_{false};
+  std::atomic<bool> stopped_{false};
+  std::atomic<bool> available_{false};
+  std::atomic<std::uint64_t> peak_pss_bytes_{0};
+  std::atomic<std::uint64_t> sample_count_{0};
+  std::thread worker_;
 };
 
 struct SearchAggregate {
@@ -192,6 +290,9 @@ void print_help() {
       << "Search:\n"
       << "  --top-k N, --k N             Result count, default 10\n"
       << "  --search-width N             Total expansion budget, default 156\n"
+      << "  --search-list-size N         Initial logical Top-L window, 0 means auto\n"
+      << "  --max-search-list-size N     Physical Top-L reservoir, 0 means 8x search width\n"
+      << "  --candidate-hot-size N       Page-aware candidate window, 0 means 4x beam\n"
       << "  (Entry point is fixed to the persisted global medoid)\n"
       << "  --beam-width N               Per-round candidate expansions, default 16\n"
       << "  --beam_width N               Compatibility alias for --beam-width\n"
@@ -338,6 +439,15 @@ Args parse_args(int argc, char** argv) {
     } else if (name == "--search-width" || name == "--search_width") {
       args.search_width = parse_size_value(require_value(i, argc, argv, name),
                                            name, 1);
+    } else if (name == "--search-list-size") {
+      args.search_list_size = parse_size_value(
+          require_value(i, argc, argv, name), name, 0);
+    } else if (name == "--max-search-list-size") {
+      args.max_search_list_size = parse_size_value(
+          require_value(i, argc, argv, name), name, 0);
+    } else if (name == "--candidate-hot-size") {
+      args.candidate_hot_size = parse_size_value(
+          require_value(i, argc, argv, name), name, 0);
     } else if (name == "--beam-width" || name == "--beam_width") {
       args.requested_beam_width =
           parse_size_value(require_value(i, argc, argv, name), name, 1);
@@ -410,6 +520,11 @@ void validate_and_finalize_args(Args& args) {
       args.beam_width_requested ? args.requested_beam_width
                                 : args.effective_beam_width,
       std::size_t{1}, args.search_width);
+  if (args.search_list_size != 0 && args.max_search_list_size != 0 &&
+      args.max_search_list_size < args.search_list_size) {
+    throw std::runtime_error(
+        "Invalid --max-search-list-size: must be 0 or >= --search-list-size");
+  }
 
   if (!args.enable_pq) {
     throw std::runtime_error(
@@ -734,7 +849,6 @@ void add_stats(SearchAggregate& aggregate,
   aggregate.stats.rerank_reads += stats.rerank_reads;
   aggregate.stats.pq_filter_reject_count += stats.pq_filter_reject_count;
   aggregate.stats.pq_filter_accept_count += stats.pq_filter_accept_count;
-  aggregate.stats.search_mutex_wait_us += stats.search_mutex_wait_us;
   aggregate.stats.unique_prefetch_pages += stats.unique_prefetch_pages;
   aggregate.stats.prefetch_candidate_nodes += stats.prefetch_candidate_nodes;
   aggregate.stats.prefetch_candidate_pages += stats.prefetch_candidate_pages;
@@ -758,6 +872,72 @@ void add_stats(SearchAggregate& aggregate,
       stats.prefetch_adaptive_final_lead;
   aggregate.stats.prefetch_saved_wait_us += stats.prefetch_saved_wait_us;
   aggregate.stats.prefetch_planner_cpu_us += stats.prefetch_planner_cpu_us;
+  aggregate.stats.query_workspace_budget_bytes = std::max(
+      aggregate.stats.query_workspace_budget_bytes,
+      stats.query_workspace_budget_bytes);
+  aggregate.stats.query_workspace_peak_bytes = std::max(
+      aggregate.stats.query_workspace_peak_bytes,
+      stats.query_workspace_peak_bytes);
+  aggregate.stats.workspace_budget_exceeded =
+      aggregate.stats.workspace_budget_exceeded ||
+      stats.workspace_budget_exceeded;
+  aggregate.stats.workspace_degraded =
+      aggregate.stats.workspace_degraded || stats.workspace_degraded;
+  aggregate.stats.effective_search_width = std::max(
+      aggregate.stats.effective_search_width, stats.effective_search_width);
+  aggregate.stats.effective_beam_width = std::max(
+      aggregate.stats.effective_beam_width, stats.effective_beam_width);
+  aggregate.stats.effective_rerank_topk = std::max(
+      aggregate.stats.effective_rerank_topk, stats.effective_rerank_topk);
+  aggregate.stats.effective_prefetch_top_k = std::max(
+      aggregate.stats.effective_prefetch_top_k,
+      stats.effective_prefetch_top_k);
+  aggregate.stats.effective_prefetch_max_inflight = std::max(
+      aggregate.stats.effective_prefetch_max_inflight,
+      stats.effective_prefetch_max_inflight);
+  aggregate.stats.workspace_prefetch_degrade_count +=
+      stats.workspace_prefetch_degrade_count;
+  aggregate.stats.workspace_rerank_degrade_count +=
+      stats.workspace_rerank_degrade_count;
+  aggregate.stats.workspace_search_degrade_count +=
+      stats.workspace_search_degrade_count;
+  aggregate.stats.workspace_candidate_pool_degrade_count +=
+      stats.workspace_candidate_pool_degrade_count;
+  aggregate.stats.requested_search_list_size =
+      stats.requested_search_list_size;
+  aggregate.stats.requested_max_search_list_size =
+      stats.requested_max_search_list_size;
+  aggregate.stats.requested_candidate_hot_size =
+      stats.requested_candidate_hot_size;
+  aggregate.stats.effective_search_list_size =
+      std::max(aggregate.stats.effective_search_list_size,
+               stats.effective_search_list_size);
+  aggregate.stats.effective_max_search_list_size =
+      std::max(aggregate.stats.effective_max_search_list_size,
+               stats.effective_max_search_list_size);
+  aggregate.stats.effective_candidate_hot_size =
+      std::max(aggregate.stats.effective_candidate_hot_size,
+               stats.effective_candidate_hot_size);
+  aggregate.stats.candidate_pool_peak_size =
+      std::max(aggregate.stats.candidate_pool_peak_size,
+               stats.candidate_pool_peak_size);
+  aggregate.stats.candidate_staging_peak_size =
+      std::max(aggregate.stats.candidate_staging_peak_size,
+               stats.candidate_staging_peak_size);
+  aggregate.stats.candidate_admitted_count += stats.candidate_admitted_count;
+  aggregate.stats.candidate_replacement_count +=
+      stats.candidate_replacement_count;
+  aggregate.stats.candidate_rejected_count += stats.candidate_rejected_count;
+  aggregate.stats.candidate_logical_l_growth_count +=
+      stats.candidate_logical_l_growth_count;
+  aggregate.stats.candidate_final_logical_l +=
+      stats.candidate_final_logical_l;
+  aggregate.stats.candidate_terminated_by_convergence +=
+      stats.candidate_terminated_by_convergence;
+  aggregate.stats.candidate_terminated_by_exhaustion +=
+      stats.candidate_terminated_by_exhaustion;
+  aggregate.stats.candidate_terminated_by_budget +=
+      stats.candidate_terminated_by_budget;
 }
 
 void merge_aggregate(SearchAggregate& aggregate,
@@ -871,6 +1051,9 @@ agent_aware::DiskGraphSearchConfig make_search_config(
   search.top_k = args.top_k;
   search.search_width = args.search_width;
   search.beam_width = args.effective_beam_width;
+  search.search_list_size = args.search_list_size;
+  search.max_search_list_size = args.max_search_list_size;
+  search.candidate_hot_size = args.candidate_hot_size;
   search.entry_count = 1;
   search.seed_ids = entry_seed_ids;
   search.adc_enable = args.enable_pq && pq_model != nullptr &&
@@ -992,6 +1175,7 @@ std::string json_for_run(const Args& args,
                          const std::optional<agent_aware::PQTrainingStats>&
                              pq_stats,
                          const MemoryBudgetReport& memory_budget,
+                         const ProcessMemoryReport& process_memory,
                          const std::vector<std::uint32_t>& entry_seed_ids,
                          const std::vector<std::string>& warnings) {
   const double elapsed_s = std::max(1e-9, aggregate.elapsed_ms / 1000.0);
@@ -1017,9 +1201,6 @@ std::string json_for_run(const Args& args,
   const double reads_per_query =
       static_cast<double>(aggregate.stats.submitted_reads) /
       query_count_for_rates;
-  const double demand_reads_per_query =
-      static_cast<double>(aggregate.stats.demand_reads) /
-      query_count_for_rates;
   const double duplicate_skipped_per_query =
       static_cast<double>(aggregate.stats.duplicate_skipped) /
       query_count_for_rates;
@@ -1038,12 +1219,8 @@ std::string json_for_run(const Args& args,
           ? 0.0
           : nodes_used_per_loaded_page /
                 static_cast<double>(index_metadata.nodes_per_page);
-  const std::string io_mode_summary =
-      !io_status.fallback_reason.empty()
-          ? "fallback"
-          : (io_status.io_uring_enabled ? "io_uring" : "sync");
-  const auto dirty_files =
-      command_lines("git status --porcelain --untracked-files=all 2>/dev/null");
+  const bool git_dirty = !command_lines(
+      "git status --porcelain --untracked-files=all 2>/dev/null").empty();
   const std::string git_commit =
       first_command_line("git rev-parse HEAD 2>/dev/null");
 
@@ -1086,6 +1263,18 @@ std::string json_for_run(const Args& args,
   json << "  \"truth_from_file\": " << dataset.truth_from_file << ",\n";
   json << "  \"requested_search_width\": " << args.search_width << ",\n";
   json << "  \"effective_search_width\": " << args.search_width << ",\n";
+  json << "  \"requested_search_list_size\": "
+       << args.search_list_size << ",\n";
+  json << "  \"effective_search_list_size\": "
+       << aggregate.stats.effective_search_list_size << ",\n";
+  json << "  \"requested_max_search_list_size\": "
+       << args.max_search_list_size << ",\n";
+  json << "  \"effective_max_search_list_size\": "
+       << aggregate.stats.effective_max_search_list_size << ",\n";
+  json << "  \"requested_candidate_hot_size\": "
+       << args.candidate_hot_size << ",\n";
+  json << "  \"effective_candidate_hot_size\": "
+       << aggregate.stats.effective_candidate_hot_size << ",\n";
   json << "  \"requested_beam_width\": ";
   if (args.beam_width_requested) {
     json << args.requested_beam_width;
@@ -1096,7 +1285,6 @@ std::string json_for_run(const Args& args,
   json << "  \"effective_beam_width\": " << args.effective_beam_width
        << ",\n";
   json << "  \"beam_width_supported\": true,\n";
-  json << "  \"io_mode\": \"" << io_mode_summary << "\",\n";
   json << "  \"io_requested_mode\": \"" << json_escape(io_status.requested_mode)
        << "\",\n";
   json << "  \"io_effective_mode\": \"" << json_escape(io_status.effective_mode)
@@ -1134,6 +1322,35 @@ std::string json_for_run(const Args& args,
        << memory_budget.estimated_resident_bytes << ",\n";
   json << "  \"estimated_resident_ratio\": "
        << memory_budget.estimated_resident_ratio << ",\n";
+  json << "  \"whole_process_peak_pss_available\": "
+       << process_memory.pss_available << ",\n";
+  json << "  \"whole_process_peak_pss_bytes\": ";
+  if (process_memory.pss_available) {
+    json << process_memory.peak_pss_bytes;
+  } else {
+    json << "null";
+  }
+  json << ",\n";
+  json << "  \"whole_process_peak_pss_ratio\": ";
+  if (process_memory.pss_available) {
+    json << process_memory.peak_pss_ratio;
+  } else {
+    json << "null";
+  }
+  json << ",\n";
+  json << "  \"whole_process_peak_pss_budget_pass\": ";
+  if (process_memory.pss_available) {
+    json << process_memory.budget_pass;
+  } else {
+    json << "null";
+  }
+  json << ",\n";
+  json << "  \"whole_process_peak_pss_sample_count\": "
+       << process_memory.sample_count << ",\n";
+  json << "  \"whole_process_peak_pss_sample_interval_ms\": "
+       << process_memory.sample_interval_ms << ",\n";
+  json << "  \"whole_process_peak_pss_scope\": "
+          "\"index_open_through_search_completion\",\n";
   json << "  \"top_k\": " << args.top_k << ",\n";
   json << "  \"entry_count\": 1,\n";
   json << "  \"entry_strategy\": \"single-medoid\",\n";
@@ -1150,7 +1367,6 @@ std::string json_for_run(const Args& args,
   json << "  \"effective_num_search_threads\": " << aggregate.worker_count
        << ",\n";
   json << "  \"enable_pq\": " << args.enable_pq << ",\n";
-  json << "  \"pq_enabled\": " << args.enable_pq << ",\n";
   json << "  \"pq_adc_enabled\": " << pq_stats.has_value() << ",\n";
   json << "  \"pq_subspaces\": " << index_metadata.pq_subspaces << ",\n";
   json << "  \"effective_pq_subspaces\": ";
@@ -1196,32 +1412,15 @@ std::string json_for_run(const Args& args,
   json << "  \"binary_mtime\": " << binary_mtime_seconds(binary_path)
        << ",\n";
   json << "  \"git_commit\": \"" << json_escape(git_commit) << "\",\n";
-  json << "  \"dirty_untracked_files\": [";
-  for (std::size_t i = 0; i < dirty_files.size(); ++i) {
-    if (i != 0) {
-      json << ", ";
-    }
-    json << "\"" << json_escape(dirty_files[i]) << "\"";
-  }
-  json << "],\n";
+  json << "  \"git_dirty\": " << git_dirty << ",\n";
   json << "  \"elapsed_ms\": " << aggregate.elapsed_ms << ",\n";
   json << "  \"qps\": " << qps << ",\n";
   json << "  \"avg_query_latency_ms\": " << avg_query_latency_ms << ",\n";
   json << "  \"latency_p95_ms\": " << latency_p95_ms << ",\n";
   json << "  \"latency_p99_ms\": " << latency_p99_ms << ",\n";
   json << "  \"reads_per_query\": " << reads_per_query << ",\n";
-  json << "  \"demand_reads_per_query\": " << demand_reads_per_query << ",\n";
   json << "  \"duplicate_skipped_per_query\": "
        << duplicate_skipped_per_query << ",\n";
-  json << "  \"cache_hit_rate\": " << cache_hit_rate << ",\n";
-  json << "  \"query_latency_ms\": [";
-  for (std::size_t i = 0; i < aggregate.query_latency_ms.size(); ++i) {
-    if (i != 0) {
-      json << ", ";
-    }
-    json << aggregate.query_latency_ms[i];
-  }
-  json << "],\n";
   json << "  \"recall_at_k\": " << recall << ",\n";
   json << "  \"recall_queries\": " << aggregate.recall_queries << ",\n";
   json << "  \"stats\": {\n";
@@ -1258,8 +1457,6 @@ std::string json_for_run(const Args& args,
        << ",\n";
   json << "    \"page_cache_misses\": " << aggregate.stats.page_cache_misses
        << ",\n";
-  json << "    \"search_mutex_wait_us\": "
-       << aggregate.stats.search_mutex_wait_us << ",\n";
   json << "    \"demand_read_wait_us\": "
        << aggregate.stats.demand_read_wait_us << ",\n";
   json << "    \"io_submits\": " << aggregate.stats.io_submits << ",\n";
@@ -1296,6 +1493,43 @@ std::string json_for_run(const Args& args,
        << aggregate.stats.pq_filter_reject_count << ",\n";
   json << "    \"distance_direct_calls\": "
        << aggregate.stats.distance_direct_calls << ",\n";
+  json << "    \"candidate_pool_peak_size\": "
+       << aggregate.stats.candidate_pool_peak_size << ",\n";
+  json << "    \"candidate_staging_peak_size\": "
+       << aggregate.stats.candidate_staging_peak_size << ",\n";
+  json << "    \"candidate_admitted_count\": "
+       << aggregate.stats.candidate_admitted_count << ",\n";
+  json << "    \"candidate_replacement_count\": "
+       << aggregate.stats.candidate_replacement_count << ",\n";
+  json << "    \"candidate_rejected_count\": "
+       << aggregate.stats.candidate_rejected_count << ",\n";
+  json << "    \"candidate_logical_l_growth_count\": "
+       << aggregate.stats.candidate_logical_l_growth_count << ",\n";
+  json << "    \"candidate_final_logical_l_avg\": "
+       << (aggregate.queries == 0
+               ? 0.0
+               : static_cast<double>(
+                     aggregate.stats.candidate_final_logical_l) /
+                     static_cast<double>(aggregate.queries))
+       << ",\n";
+  json << "    \"candidate_terminated_by_convergence\": "
+       << aggregate.stats.candidate_terminated_by_convergence << ",\n";
+  json << "    \"candidate_terminated_by_exhaustion\": "
+       << aggregate.stats.candidate_terminated_by_exhaustion << ",\n";
+  json << "    \"candidate_terminated_by_budget\": "
+       << aggregate.stats.candidate_terminated_by_budget << ",\n";
+  json << "    \"workspace_candidate_pool_degrade_count\": "
+       << aggregate.stats.workspace_candidate_pool_degrade_count << ",\n";
+  json << "    \"query_workspace_budget_bytes\": "
+       << aggregate.stats.query_workspace_budget_bytes << ",\n";
+  json << "    \"query_workspace_peak_bytes\": "
+       << aggregate.stats.query_workspace_peak_bytes << ",\n";
+  json << "    \"workspace_budget_exceeded\": "
+       << aggregate.stats.workspace_budget_exceeded << ",\n";
+  json << "    \"workspace_degraded\": "
+       << aggregate.stats.workspace_degraded << ",\n";
+  json << "    \"effective_rerank_topk\": "
+       << aggregate.stats.effective_rerank_topk << ",\n";
   json << "    \"unique_prefetch_pages\": "
        << aggregate.stats.unique_prefetch_pages << ",\n";
   json << "    \"prefetch_candidate_nodes\": "
@@ -1385,6 +1619,8 @@ int main(int argc, char** argv) {
     }
     validate_and_finalize_args(args);
 
+    ProcessPssSampler pss_sampler;
+
     std::vector<std::string> warnings;
     if (args.beam_width_requested &&
         args.requested_beam_width > args.search_width) {
@@ -1431,10 +1667,19 @@ int main(int argc, char** argv) {
     }
     const auto aggregate =
         run_searches(args, dataset, index, pq_model_ptr, entry_seed_ids);
+    const auto process_memory = pss_sampler.stop_and_report(
+        memory_budget.dataset_bytes, memory_budget.budget_bytes);
+    if (!process_memory.pss_available) {
+      warnings.push_back(
+          "whole-process peak PSS is unavailable on this platform");
+    } else if (!process_memory.budget_pass) {
+      warnings.push_back(
+          "whole-process peak PSS exceeds configured dataset budget");
+    }
     const std::string json =
         json_for_run(args, dataset, index.metadata(), io_status, aggregate, binary_path,
                      pq_stats,
-                     memory_budget, entry_seed_ids, warnings);
+                     memory_budget, process_memory, entry_seed_ids, warnings);
     write_json_output(args.output_json, json);
     std::cout << json;
     return 0;

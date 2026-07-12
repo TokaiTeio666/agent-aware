@@ -6,6 +6,8 @@
 #include <sstream>
 #include <stdexcept>
 #include <string>
+#include <thread>
+#include <vector>
 
 #include "core/pq_encoder.h"
 #include "graph/disk_graph_builder.h"
@@ -120,6 +122,56 @@ int main() {
           "foreground cache hit maintained a strict 2Q/LRU chain");
   require(index.cache_resident_pages() <= 2,
           "graph-aware cache exceeded capacity after CLOCK reuse");
+  require(warm.stats.query_workspace_budget_bytes == 5 * 1024 * 1024,
+          "query workspace hard budget was not reported");
+  require(warm.stats.query_workspace_peak_bytes <=
+              warm.stats.query_workspace_budget_bytes,
+          "query workspace exceeded its hard budget");
+
+  DiskGraphSearchConfig oversized = search;
+  oversized.search_width = base.size() * 4096;
+  oversized.beam_width = oversized.search_width;
+  oversized.rerank_topk = oversized.search_width;
+  oversized.prefetch_policy = "topology";
+  oversized.prefetch_top_k = 1024;
+  oversized.prefetch_max_inflight = 1024;
+  const auto degraded = index.search_one(base.row(3), oversized);
+  require(degraded.stats.workspace_degraded,
+          "oversized query was not degraded to the workspace budget");
+  require(degraded.stats.query_workspace_peak_bytes <= 5 * 1024 * 1024,
+          "degraded query exceeded its workspace budget");
+  require(degraded.stats.effective_search_width < oversized.search_width,
+          "oversized search width was not reduced");
+
+  std::vector<std::thread> readers;
+  std::vector<std::vector<SearchResult>> concurrent_results(8);
+  std::vector<std::exception_ptr> reader_errors(8);
+  readers.reserve(concurrent_results.size());
+  for (std::size_t thread_id = 0; thread_id < concurrent_results.size();
+       ++thread_id) {
+    readers.emplace_back([&, thread_id] {
+      try {
+        concurrent_results[thread_id] =
+            index.search_one(base.row(3), search).topk;
+      } catch (...) {
+        reader_errors[thread_id] = std::current_exception();
+      }
+    });
+  }
+  for (auto& reader : readers) reader.join();
+  for (const auto& error : reader_errors) {
+    if (error) std::rethrow_exception(error);
+  }
+  for (const auto& results : concurrent_results) {
+    require(results.size() == warm.topk.size(),
+            "concurrent search changed Top-K size");
+    for (std::size_t i = 0; i < results.size(); ++i) {
+      require(results[i].id == warm.topk[i].id,
+              "concurrent search changed result ordering");
+    }
+  }
+  require(index.cache_resident_pages() <= 2,
+          "concurrent search exceeded shared cache capacity");
 
   const fs::path v2_path = root / "old-v2.idx";
   {

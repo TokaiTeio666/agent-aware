@@ -9,7 +9,7 @@
 #include <vector>
 
 #include "core/pq_encoder.h"
-#include "dynamic/dynamic_record.h"
+#include "dynamic/dynamic_types.h"
 
 namespace agent_aware {
 
@@ -33,7 +33,7 @@ class PackedGraphGeneration {
   static std::shared_ptr<const PackedGraphGeneration> publish(
       const std::filesystem::path& base_index_path,
       const PackedGraphGeneration& previous,
-      const std::vector<DynamicRecord>& delta, std::uint64_t cutoff_sequence,
+      const std::vector<MaterializedRecord>& delta, std::uint64_t cutoff_sequence,
       std::shared_ptr<const PQEncoder> pq_model,
       const std::atomic<bool>* cancelled = nullptr);
 
@@ -44,16 +44,16 @@ class PackedGraphGeneration {
   NodeId max_node_id() const;
   void cleanup_obsolete_segments() const;
 
-  bool resolve(NodeId node_id, DynamicRecord& out) const;
-  std::vector<DynamicRecord> search(const float* query, std::uint32_t dim,
+  bool resolve(NodeId node_id, MaterializedRecord& out) const;
+  std::vector<MaterializedRecord> search(const float* query, std::uint32_t dim,
                                     std::size_t topk,
                                     std::size_t candidate_top_l) const;
-  std::vector<DynamicRecord> materialize_all() const;
+  std::vector<MaterializedRecord> materialize_all() const;
 
  private:
   static void load_segment(PackedGraphGeneration& generation);
   bool read_entry(const PackedGenerationEntry& entry,
-                  DynamicRecord& out) const;
+                  MaterializedRecord& out) const;
   std::vector<NodeId> read_neighbors(const PackedGenerationEntry& entry) const;
 
   std::uint64_t generation_id_ = 0;

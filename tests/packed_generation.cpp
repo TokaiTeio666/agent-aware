@@ -33,19 +33,19 @@ int main() {
   assert(generation0->id() == 0);
   assert(generation0->incorporated_sequence() == 0);
 
-  DynamicRecord first;
+  MaterializedRecord first;
   first.node_id = 10;
   first.sequence_id = 1;
   first.dim = 4;
   first.vector = {0, 1, 2, 3};
-  DynamicRecord future = first;
+  MaterializedRecord future = first;
   future.sequence_id = 2;
   future.vector = {9, 9, 9, 9};
   auto generation1 = PackedGraphGeneration::publish(
       base_path, *generation0, {first, future}, 1, pq);
   assert(generation1->id() == 1);
   assert(generation1->incorporated_sequence() == 1);
-  DynamicRecord resolved;
+  MaterializedRecord resolved;
   assert(generation1->resolve(10, resolved));
   assert(resolved.sequence_id == 1);
   assert(resolved.vector == first.vector);
@@ -72,7 +72,7 @@ int main() {
   generation1 = PackedGraphGeneration::publish(
       base_path, *generation0, {first}, 1, pq);
 
-  DynamicRecord erased;
+  MaterializedRecord erased;
   erased.node_id = 10;
   erased.sequence_id = 3;
   erased.deleted = true;

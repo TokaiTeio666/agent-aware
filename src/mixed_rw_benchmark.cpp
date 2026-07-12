@@ -62,12 +62,10 @@ struct Args {
   std::size_t query_count = 256;
   std::size_t dim = 32;
   std::size_t memtable_flush_bytes = 256 * 1024;
-  std::size_t dynamic_graph_degree = 16;
   std::size_t write_queue_capacity = 4096;
   std::size_t wal_group_max_records = 64;
   std::size_t wal_group_max_delay_us = 1000;
   std::size_t version_index_shards = 64;
-  std::size_t neighbor_candidate_limit = 1024;
   std::size_t search_width = 350;
   std::size_t entry_count = 64;
   std::size_t beam_width = 16;
@@ -114,7 +112,6 @@ struct ReadBreakdownSamples {
   std::vector<double> delta_search_ms;
   std::vector<double> merge_ms;
   std::vector<double> exact_recall_ms;
-  std::vector<double> search_mutex_wait_ms;
   std::vector<double> page_read_wait_ms;
 };
 
@@ -125,7 +122,6 @@ struct ReadBreakdownSummary {
   Percentiles delta_search;
   Percentiles merge;
   Percentiles exact_recall;
-  Percentiles search_mutex_wait;
   Percentiles page_read_wait;
 };
 
@@ -199,7 +195,6 @@ struct ScenarioResult {
   double graph_reads_per_read = 0.0;
   double cache_hit_rate = 0.0;
   double page_read_wait_ms_per_read = 0.0;
-  double search_mutex_wait_ms_per_read = 0.0;
   ReadBreakdownSummary read_breakdown;
   CompactionAggregate compaction;
   agent_aware::dynamic::DynamicWriteStats write_pipeline;
@@ -269,12 +264,10 @@ void print_help() {
       << "  --insert_ratio R             Insert share within writes, default 1\n"
       << "  --update_ratio R             Update share within writes, default 0\n"
       << "  --delete_ratio R             Delete share within writes, default 0\n"
-      << "  --dynamic_graph_degree N     Delta graph neighbor count\n"
       << "  --write_queue_capacity N     Bounded mutation queue capacity\n"
       << "  --wal_group_max_records N    Maximum records per group commit\n"
       << "  --wal_group_max_delay_us N   Group commit collection delay\n"
       << "  --version_index_shards N     Dynamic version index shard count\n"
-      << "  --neighbor_candidate_limit N Bounded delta neighbor candidates\n"
       << "  --search_width N             SSD graph expansion budget\n"
       << "  --entry_count N              SSD graph entry points\n"
       << "  --beam_width N               SSD graph beam batch width\n"
@@ -324,12 +317,10 @@ Args parse_args(int argc, char** argv) {
   parser.take(args.query_count, {"--query_count"});
   parser.take(args.dim, {"--dim"});
   parser.take(args.memtable_flush_bytes, {"--memtable_flush_bytes"});
-  parser.take(args.dynamic_graph_degree, {"--dynamic_graph_degree"});
   parser.take(args.write_queue_capacity, {"--write_queue_capacity"});
   parser.take(args.wal_group_max_records, {"--wal_group_max_records"});
   parser.take(args.wal_group_max_delay_us, {"--wal_group_max_delay_us"});
   parser.take(args.version_index_shards, {"--version_index_shards"});
-  parser.take(args.neighbor_candidate_limit, {"--neighbor_candidate_limit"});
   parser.take(args.search_width, {"--search_width"});
   parser.take(args.entry_count, {"--entry_count"});
   parser.take(args.beam_width, {"--beam_width"});
@@ -351,7 +342,7 @@ Args parse_args(int argc, char** argv) {
       args.io_depth == 0 || args.pq_subspaces == 0 ||
       args.pq_train_limit == 0 || args.pq_iterations == 0 ||
       args.write_queue_capacity == 0 || args.wal_group_max_records == 0 ||
-      args.version_index_shards == 0 || args.neighbor_candidate_limit == 0) {
+      args.version_index_shards == 0) {
     throw std::runtime_error(
         "num_operations, topk, insert_batch_size, PQ, and SSD search parameters must be positive");
   }
@@ -523,12 +514,11 @@ std::uintmax_t directory_bytes(const std::filesystem::path& dir) {
 }
 
 double estimate_memory_mb(
-    const std::vector<agent_aware::DynamicRecord>& records) {
+    const std::vector<agent_aware::MaterializedRecord>& records) {
   std::uint64_t bytes = 0;
   for (const auto& record : records) {
     bytes += sizeof(record);
     bytes += record.vector.size() * sizeof(float);
-    bytes += record.neighbors.size() * sizeof(agent_aware::NodeId);
   }
   return static_cast<double>(bytes) / (1024.0 * 1024.0);
 }
@@ -566,7 +556,7 @@ std::vector<agent_aware::SearchResult> exact_dynamic_topk(
     const agent_aware::VectorSet& base, const float* query, std::size_t topk,
     const agent_aware::dynamic::DynamicSnapshot& snapshot) {
   // exact recall 使用与 engine 路径相同的快照语义：动态更新覆盖 base 向量，tombstone 删除 base id。
-  std::unordered_map<agent_aware::NodeId, agent_aware::DynamicRecord> latest;
+  std::unordered_map<agent_aware::NodeId, agent_aware::MaterializedRecord> latest;
   latest.reserve(snapshot.records.size());
   for (const auto& record : snapshot.records) {
     latest[record.node_id] = record;
@@ -624,13 +614,13 @@ std::vector<agent_aware::SearchResult> search_memory_with_delta(
   auto latest_base_records =
       manager->latest_records_for(base_ids, read_sequence, true);
   // memory 模式对齐 PackedGraphEngine::search_one，方便用同一套 delta merge 语义比较图路径和 exact-base 路径。
-  auto delta_records = manager->search_delta_l2_at(
+  auto delta_records = manager->search_delta_pq_at(
       query, static_cast<std::uint32_t>(base.dim), topk, read_sequence);
   delta_records.reserve(delta_records.size() + latest_base_records.size());
   for (auto& item : latest_base_records) {
     delta_records.push_back(std::move(item.second));
   }
-  return agent_aware::dynamic::merge_base_and_delta_l2(
+  return agent_aware::dynamic::merge_base_and_delta_candidates(
       base_results, delta_records, query, static_cast<std::uint32_t>(base.dim),
       topk);
 }
@@ -648,7 +638,6 @@ void append_read_timing(ThreadMetrics& metrics,
   metrics.graph_stats.page_cache_hits += stats.graph.page_cache_hits;
   metrics.graph_stats.page_cache_misses += stats.graph.page_cache_misses;
   metrics.graph_stats.demand_read_wait_us += stats.graph.demand_read_wait_us;
-  metrics.graph_stats.search_mutex_wait_us += stats.graph.search_mutex_wait_us;
   metrics.read_breakdown.dynamic_snapshot_ms.push_back(
       stats.timing.dynamic_snapshot_ms);
   metrics.read_breakdown.base_search_ms.push_back(stats.timing.base_search_ms);
@@ -657,8 +646,6 @@ void append_read_timing(ThreadMetrics& metrics,
   metrics.read_breakdown.delta_search_ms.push_back(
       stats.timing.delta_search_ms);
   metrics.read_breakdown.merge_ms.push_back(stats.timing.merge_ms);
-  metrics.read_breakdown.search_mutex_wait_ms.push_back(
-      stats.graph.search_mutex_wait_us / 1000.0);
   metrics.read_breakdown.page_read_wait_ms.push_back(
       stats.graph.demand_read_wait_us / 1000.0);
 }
@@ -680,8 +667,6 @@ void merge_read_breakdown(ReadBreakdownSamples& into,
   merge_samples(into.delta_search_ms, std::move(from.delta_search_ms));
   merge_samples(into.merge_ms, std::move(from.merge_ms));
   merge_samples(into.exact_recall_ms, std::move(from.exact_recall_ms));
-  merge_samples(into.search_mutex_wait_ms,
-                std::move(from.search_mutex_wait_ms));
   merge_samples(into.page_read_wait_ms, std::move(from.page_read_wait_ms));
 }
 
@@ -694,8 +679,6 @@ ReadBreakdownSummary summarize_breakdown(ReadBreakdownSamples&& samples) {
   summary.delta_search = summarize(std::move(samples.delta_search_ms));
   summary.merge = summarize(std::move(samples.merge_ms));
   summary.exact_recall = summarize(std::move(samples.exact_recall_ms));
-  summary.search_mutex_wait =
-      summarize(std::move(samples.search_mutex_wait_ms));
   summary.page_read_wait = summarize(std::move(samples.page_read_wait_ms));
   return summary;
 }
@@ -770,7 +753,8 @@ PqRuntime prepare_pq_runtime(const Args& args,
 
 agent_aware::PackedGraphEngineConfig engine_config_for(const Args& args,
     const std::shared_ptr<agent_aware::dynamic::DynamicWriteManager>& manager,
-    const std::shared_ptr<const agent_aware::PqAdcModel>& pq_model) {
+    const std::shared_ptr<const agent_aware::PqAdcModel>& pq_model,
+    const std::shared_ptr<agent_aware::SharedPackedGraphRuntime>& runtime = nullptr) {
   agent_aware::PackedGraphEngineConfig engine_config;
   engine_config.index_path = args.index_path;
   engine_config.dynamic_manager = manager;
@@ -784,21 +768,21 @@ agent_aware::PackedGraphEngineConfig engine_config_for(const Args& args,
   engine_config.search.entry_count = args.entry_count;
   engine_config.search.beam_width = args.beam_width;
   engine_config.search.rerank_topk = args.rerank_topk;
+  engine_config.shared_runtime = runtime;
   return engine_config;
 }
 
 std::shared_ptr<agent_aware::dynamic::DynamicWriteManager> open_manager(
-    const Args& args, const std::filesystem::path& scenario_dir) {
+    const Args& args, const std::filesystem::path& scenario_dir,
+    std::shared_ptr<const agent_aware::PqAdcModel> pq_model) {
   agent_aware::dynamic::DynamicWriteOptions options;
   options.dynamic_dir = scenario_dir;
   options.memtable_flush_bytes = args.memtable_flush_bytes;
-  options.dynamic_graph_degree = args.dynamic_graph_degree;
   options.write_queue_capacity = args.write_queue_capacity;
   options.wal_group_max_records = args.wal_group_max_records;
   options.wal_group_max_delay_us = args.wal_group_max_delay_us;
   options.version_index_shards = args.version_index_shards;
-  options.neighbor_candidate_limit = args.neighbor_candidate_limit;
-  options.enable_wal = true;
+  options.pq_model = std::move(pq_model);
   options.enable_auto_flush = args.enable_flush;
 
   auto manager =
@@ -866,8 +850,6 @@ void merge_thread_metrics(ThreadMetrics& into, ThreadMetrics&& from) {
   into.graph_stats.page_cache_hits += from.graph_stats.page_cache_hits;
   into.graph_stats.page_cache_misses += from.graph_stats.page_cache_misses;
   into.graph_stats.demand_read_wait_us += from.graph_stats.demand_read_wait_us;
-  into.graph_stats.search_mutex_wait_us +=
-      from.graph_stats.search_mutex_wait_us;
   merge_read_breakdown(into.read_breakdown, std::move(from.read_breakdown));
 }
 
@@ -894,7 +876,7 @@ void maybe_run_compaction(
 ScenarioResult finalize_result(
     const Args& args, const Scenario& scenario,
     const std::filesystem::path& scenario_dir,
-    const std::vector<agent_aware::DynamicRecord>& delta_records,
+    const std::vector<agent_aware::MaterializedRecord>& delta_records,
     ThreadMetrics metrics, CompactionAggregate compaction,
     Clock::time_point start, Clock::time_point end, double flush_ms,
     double recovery_ms, const PqRuntime& pq_runtime,
@@ -985,11 +967,6 @@ ScenarioResult finalize_result(
       metrics.read_ops == 0
           ? 0.0
           : (metrics.graph_stats.demand_read_wait_us / 1000.0) /
-                static_cast<double>(metrics.read_ops);
-  result.search_mutex_wait_ms_per_read =
-      metrics.read_ops == 0
-          ? 0.0
-          : (metrics.graph_stats.search_mutex_wait_us / 1000.0) /
                 static_cast<double>(metrics.read_ops);
   result.compaction = compaction;
   result.write_pipeline = write_pipeline;
@@ -1091,8 +1068,7 @@ ScenarioResult close_scenario(
   agent_aware::dynamic::DynamicWriteOptions options;
   options.dynamic_dir = scenario_dir;
   options.memtable_flush_bytes = args.memtable_flush_bytes;
-  options.dynamic_graph_degree = args.dynamic_graph_degree;
-  options.enable_wal = true;
+  options.pq_model = pq_runtime.model;
   options.enable_auto_flush = args.enable_flush;
   const auto recovery_start = Clock::now();
   agent_aware::dynamic::DynamicWriteManager recovered(options);
@@ -1115,8 +1091,7 @@ ScenarioResult run_sequential_scenario(
   // 每个场景使用干净的动态目录，避免 recovery、flush 和磁盘占用指标被上一场景污染。
   std::filesystem::remove_all(scenario_dir);
   std::filesystem::create_directories(scenario_dir);
-  auto manager = open_manager(args, scenario_dir);
-
+  auto manager = open_manager(args, scenario_dir, pq_runtime.model);
   std::unique_ptr<agent_aware::PackedGraphEngine> engine;
   if (!args.index_path.empty()) {
     engine = std::make_unique<agent_aware::PackedGraphEngine>(
@@ -1168,7 +1143,12 @@ ScenarioResult run_concurrent_scenario(
   const auto scenario_dir = args.dynamic_dir / scenario.name;
   std::filesystem::remove_all(scenario_dir);
   std::filesystem::create_directories(scenario_dir);
-  auto manager = open_manager(args, scenario_dir);
+  auto manager = open_manager(args, scenario_dir, pq_runtime.model);
+  std::shared_ptr<agent_aware::SharedPackedGraphRuntime> shared_runtime;
+  if (!args.index_path.empty()) {
+    shared_runtime = std::make_shared<agent_aware::SharedPackedGraphRuntime>(
+        engine_config_for(args, manager, pq_runtime.model));
+  }
 
   const std::size_t read_threads =
       args.read_threads == 0 ? std::size_t{1} : args.read_threads;
@@ -1243,7 +1223,8 @@ ScenarioResult run_concurrent_scenario(
         std::unique_ptr<agent_aware::PackedGraphEngine> engine;
         if (!args.index_path.empty()) {
           engine = std::make_unique<agent_aware::PackedGraphEngine>(
-              engine_config_for(args, manager, pq_runtime.model));
+              engine_config_for(args, manager, pq_runtime.model,
+                                shared_runtime));
         }
         std::mt19937 rng(args.seed ^ static_cast<std::uint32_t>(thread_id + 17));
         auto& metrics = reader_metrics[thread_id];
@@ -1537,8 +1518,6 @@ void write_json(const std::filesystem::path& output_path,
            << "      \"cache_hit_rate\": " << result.cache_hit_rate << ",\n"
            << "      \"page_read_wait_ms_per_read\": "
            << result.page_read_wait_ms_per_read << ",\n"
-           << "      \"search_mutex_wait_ms_per_read\": "
-           << result.search_mutex_wait_ms_per_read << ",\n"
            << "      \"write_pipeline\": {\n"
            << "        \"submitted\": " << result.write_pipeline.submitted << ",\n"
            << "        \"committed\": " << result.write_pipeline.committed << ",\n"
@@ -1552,8 +1531,6 @@ void write_json(const std::filesystem::path& output_path,
            << ",\n"
            << "        \"queue_wait_ms\": "
            << result.write_pipeline.queue_wait_ns / 1000000.0 << ",\n"
-           << "        \"neighbor_prepare_ms\": "
-           << result.write_pipeline.neighbor_prepare_ns / 1000000.0 << ",\n"
            << "        \"wal_append_ms\": "
            << result.write_pipeline.wal_append_ns / 1000000.0 << ",\n"
            << "        \"wal_sync_ms\": "
@@ -1595,9 +1572,6 @@ void write_json(const std::filesystem::path& output_path,
                                 true);
     write_breakdown_percentiles(output, "exact_recall",
                                 result.read_breakdown.exact_recall, true);
-    write_breakdown_percentiles(
-        output, "search_mutex_wait",
-        result.read_breakdown.search_mutex_wait, true);
     write_breakdown_percentiles(output, "page_read_wait",
                                 result.read_breakdown.page_read_wait, false);
     output << "      },\n"

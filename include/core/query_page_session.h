@@ -2,6 +2,7 @@
 
 #include <cstddef>
 #include <cstdint>
+#include <memory>
 #include <unordered_map>
 #include <unordered_set>
 #include <vector>
@@ -13,10 +14,12 @@ namespace agent_aware {
 class QueryPageSession {
  public:
   using Page = PackedDiskGraphIndex::DecodedPage;
+  using PageHandle = std::shared_ptr<const Page>;
   struct Node {
     std::uint32_t id = 0;
     std::vector<std::uint32_t> neighbors;
     std::vector<float> vector;
+    PageHandle page;
   };
 
   QueryPageSession(PackedDiskGraphIndex& index,
@@ -26,7 +29,7 @@ class QueryPageSession {
   QueryPageSession& operator=(const QueryPageSession&) = delete;
   ~QueryPageSession();
 
-  const Page& get_or_load_page(std::uint32_t page_id);
+  PageHandle get_or_load_page(std::uint32_t page_id);
   const Node& get_node(std::uint32_t node_id, bool count_same_page_reuse,
                        bool require_vector = false);
   std::vector<std::uint32_t> collect_missing_pages(
@@ -45,16 +48,20 @@ class QueryPageSession {
   void unpin_page(std::uint32_t page_id);
   void unpin_all();
   void finish_query();
+  void apply_workspace_limits(std::size_t prefetch_top_k,
+                              std::size_t prefetch_max_inflight);
 
  private:
   std::uint64_t page_offset(std::uint32_t page_id) const;
   std::size_t demand_batch_limit() const;
   bool page_in_cache(std::uint32_t page_id) const;
-  const Page* try_get_cached_page(std::uint32_t page_id);
+  PageHandle try_get_cached_page(std::uint32_t page_id);
   void record_duplicate_skipped(std::size_t count = 1);
   bool page_ready_in_session(std::uint32_t page_id) const;
+  bool mark_unique_page(std::vector<std::uint64_t>& bits,
+                        std::uint32_t page_id, std::size_t& count);
   bool materialize_available_page(std::uint32_t page_id);
-  void materialize_page(const Page& page);
+  void remember_page(PageHandle page);
   Page read_demand_page(std::uint32_t page_id);
   bool consume_prefetch_completion(bool wait);
   bool wait_for_prefetch_page(std::uint32_t page_id);
@@ -70,13 +77,9 @@ class QueryPageSession {
   std::size_t prefetch_query_limit_ = 0;
   std::size_t prefetch_query_submitted_ = 0;
 
-  std::unordered_set<std::uint32_t> visited_pages_;
-  std::unordered_set<std::uint32_t> accessed_nodes_;
-  std::unordered_set<std::uint32_t> demand_pages_;
   std::unordered_set<std::uint32_t> pinned_pages_;
-  std::unordered_map<std::uint32_t, Page> owned_pages_;
+  std::unordered_map<std::uint32_t, PageHandle> resident_pages_;
   std::unordered_set<std::uint32_t> materialized_pages_;
-  std::unordered_map<std::uint32_t, Node> local_nodes_;
   std::unordered_map<std::uint64_t, std::uint32_t> prefetch_tokens_;
   std::unordered_set<std::uint32_t> pending_prefetch_pages_;
   std::unordered_map<std::uint32_t, Page> ready_prefetch_pages_;
@@ -85,7 +88,13 @@ class QueryPageSession {
   std::string prefetch_trace_path_;
   std::string run_id_;
   std::uint64_t query_id_ = 0;
+  std::vector<std::uint64_t> touched_page_bits_;
+  std::vector<std::uint64_t> demand_page_bits_;
+  std::size_t pages_touched_ = 0;
+  std::size_t nodes_accessed_ = 0;
+  std::size_t demand_pages_count_ = 0;
   std::vector<TopologyPageCandidate> topology_trace_candidates_;
+  Node current_node_;
 };
 
 }  // namespace agent_aware

@@ -1,69 +1,86 @@
 #include "dynamic/memtable.h"
 
-#include <mutex>
+#include <limits>
 
 namespace agent_aware {
-namespace {
-
-// MemTable 每个 node 只保留最新记录；完整版本历史由 DynamicWriteManager::recent_records_ 保留给快照读。
-std::size_t estimate_record_bytes(const DynamicRecord& record) {
-  return sizeof(DynamicRecord) + record.vector.size() * sizeof(float) +
-         record.neighbors.size() * sizeof(NodeId);
-}
-
-}  // namespace
 
 MemTable::MemTable(std::size_t flush_threshold_bytes)
     : flush_threshold_bytes_(flush_threshold_bytes) {}
 
-bool MemTable::insert(const DynamicRecord& record) {
-  std::unique_lock<std::shared_mutex> lock(mutex_);
-  const auto existing = records_.find(record.node_id);
-  if (existing != records_.end()) {
-    // sequence id 单调递增，replay 出来的旧记录或重复记录不能覆盖更新的内存值。
-    if (record.sequence_id <= existing->second.sequence_id) {
-      return false;
-    }
-    current_bytes_ -= estimate_record_bytes(existing->second);
-    existing->second = record;
-    current_bytes_ += estimate_record_bytes(existing->second);
-    return true;
+bool MemTable::insert(const CompactDeltaVersion& version) {
+  if (version.pq_code.size() > std::numeric_limits<std::uint16_t>::max() ||
+      pq_arena_.size() > std::numeric_limits<std::uint32_t>::max() -
+                             version.pq_code.size()) {
+    return false;
   }
-
-  const auto inserted = records_.emplace(record.node_id, record);
-  current_bytes_ += estimate_record_bytes(inserted.first->second);
+  const auto found = latest_slots_.find(version.node_id);
+  if (found != latest_slots_.end() &&
+      version.sequence_id <= sequences_[found->second]) {
+    return false;
+  }
+  const auto slot = static_cast<std::uint32_t>(node_ids_.size());
+  latest_slots_[version.node_id] = slot;
+  node_ids_.push_back(version.node_id);
+  sequences_.push_back(version.sequence_id);
+  dims_.push_back(version.dim);
+  locators_.push_back(version.locator);
+  pq_offsets_.push_back(static_cast<std::uint32_t>(pq_arena_.size()));
+  pq_lengths_.push_back(static_cast<std::uint16_t>(version.pq_code.size()));
+  deleted_.push_back(version.deleted ? 1 : 0);
+  pq_arena_.insert(pq_arena_.end(), version.pq_code.begin(),
+                   version.pq_code.end());
   return true;
 }
 
-std::vector<DynamicRecord> MemTable::snapshot() const {
-  std::shared_lock<std::shared_mutex> lock(mutex_);
-  std::vector<DynamicRecord> records;
-  records.reserve(records_.size());
-  for (const auto& item : records_) {
-    records.push_back(item.second);
-  }
-  return records;
+CompactDeltaVersion MemTable::at(std::size_t index) const {
+  CompactDeltaVersion version;
+  version.node_id = node_ids_.at(index);
+  version.sequence_id = sequences_[index];
+  version.dim = dims_[index];
+  version.locator = locators_[index];
+  version.deleted = deleted_[index] != 0;
+  const auto offset = pq_offsets_[index];
+  const auto length = pq_lengths_[index];
+  version.pq_code.assign(pq_arena_.begin() + offset,
+                         pq_arena_.begin() + offset + length);
+  return version;
+}
+
+bool MemTable::is_latest(std::size_t index) const {
+  const auto found = latest_slots_.find(node_ids_.at(index));
+  return found != latest_slots_.end() && found->second == index;
 }
 
 void MemTable::clear() {
-  std::unique_lock<std::shared_mutex> lock(mutex_);
-  records_.clear();
-  current_bytes_ = 0;
+  latest_slots_.clear();
+  node_ids_.clear();
+  sequences_.clear();
+  dims_.clear();
+  locators_.clear();
+  pq_offsets_.clear();
+  pq_lengths_.clear();
+  deleted_.clear();
+  pq_arena_.clear();
 }
 
 bool MemTable::should_flush() const {
-  std::shared_lock<std::shared_mutex> lock(mutex_);
-  return current_bytes_ >= flush_threshold_bytes_;
+  return resident_bytes() >= flush_threshold_bytes_;
 }
 
 std::size_t MemTable::resident_bytes() const {
-  std::shared_lock<std::shared_mutex> lock(mutex_);
-  return current_bytes_;
+  const auto directory_bytes = latest_slots_.bucket_count() * sizeof(void*) +
+      latest_slots_.size() *
+          (sizeof(decltype(latest_slots_)::value_type) + 3 * sizeof(void*));
+  return directory_bytes +
+         node_ids_.capacity() * sizeof(NodeId) +
+         sequences_.capacity() * sizeof(std::uint64_t) +
+         dims_.capacity() * sizeof(std::uint32_t) +
+         locators_.capacity() * sizeof(DynamicLocator) +
+         pq_offsets_.capacity() * sizeof(std::uint32_t) +
+         pq_lengths_.capacity() * sizeof(std::uint16_t) + deleted_.capacity() +
+         pq_arena_.capacity();
 }
 
-std::size_t MemTable::size() const {
-  std::shared_lock<std::shared_mutex> lock(mutex_);
-  return records_.size();
-}
+std::size_t MemTable::size() const { return node_ids_.size(); }
 
 }  // namespace agent_aware

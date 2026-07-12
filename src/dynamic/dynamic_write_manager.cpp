@@ -47,9 +47,9 @@ std::string wal_name(std::uint64_t segment_id) {
   return name.str();
 }
 
-std::vector<DynamicRecord> deduplicate_newest(
-    const std::vector<DynamicRecord>& records) {
-  std::unordered_map<NodeId, DynamicRecord> latest;
+std::vector<MaterializedRecord> deduplicate_newest(
+    const std::vector<MaterializedRecord>& records) {
+  std::unordered_map<NodeId, MaterializedRecord> latest;
   latest.reserve(records.size());
   for (const auto& record : records) {
     const auto found = latest.find(record.node_id);
@@ -59,20 +59,20 @@ std::vector<DynamicRecord> deduplicate_newest(
     }
   }
 
-  std::vector<DynamicRecord> output;
+  std::vector<MaterializedRecord> output;
   output.reserve(latest.size());
   for (const auto& item : latest) {
     output.push_back(item.second);
   }
   std::sort(output.begin(), output.end(),
-            [](const DynamicRecord& lhs, const DynamicRecord& rhs) {
+            [](const MaterializedRecord& lhs, const MaterializedRecord& rhs) {
               return lhs.node_id < rhs.node_id;
             });
   return output;
 }
 
 struct ScoredRecord {
-  DynamicRecord record;
+  MaterializedRecord record;
   float distance = 0.0f;
 };
 
@@ -104,8 +104,6 @@ DynamicWriteManager::DynamicWriteManager(DynamicWriteOptions options)
       std::max<std::size_t>(1, options_.wal_group_max_records);
   options_.version_index_shards =
       std::max<std::size_t>(1, options_.version_index_shards);
-  options_.neighbor_candidate_limit =
-      std::max(options_.dynamic_graph_degree, options_.neighbor_candidate_limit);
   const auto shard_count = std::max<std::size_t>(1, options_.version_index_shards);
   version_shards_.reserve(shard_count);
   for (std::size_t i = 0; i < shard_count; ++i) {
@@ -126,7 +124,6 @@ bool DynamicWriteManager::open() {
   if (opened_) {
     return true;
   }
-
   std::error_code error;
   std::filesystem::create_directories(options_.dynamic_dir, error);
   if (error) {
@@ -157,7 +154,7 @@ bool DynamicWriteManager::open() {
       return false;
     }
     auto located = reader->scan_all_located();
-    std::vector<DynamicRecord> records;
+    std::vector<MaterializedRecord> records;
     records.reserve(located.size());
     for (auto& item : located) {
       item.first.locator = item.second;
@@ -200,13 +197,17 @@ bool DynamicWriteManager::open() {
         continue;
       }
       max_sequence = std::max(max_sequence, record.sequence_id);
-      DynamicRecord compact = record;
-      compact.vector.clear();
-      compact.vector.shrink_to_fit();
-      compact.neighbors.clear();
-      compact.neighbors.shrink_to_fit();
+      CompactDeltaVersion compact;
+      compact.sequence_id = record.sequence_id;
+      compact.node_id = record.node_id;
+      compact.dim = record.dim;
+      compact.locator = record.locator;
+      compact.deleted = record.deleted;
+      if (!record.deleted && options_.pq_model && options_.pq_model->enabled()) {
+        compact.pq_code = options_.pq_model->encode(record.vector.data());
+      }
       memtable_->insert(compact);
-      apply_records(std::vector<DynamicRecord>{record});
+      apply_records(std::vector<MaterializedRecord>{record});
     }
   }
 
@@ -223,13 +224,11 @@ bool DynamicWriteManager::open() {
 
   active_wal_segment_id_.store(max_segment + 1, std::memory_order_release);
   active_wal_max_sequence_ = max_sequence;
-  if (options_.enable_wal) {
-    wal_writer_ = std::make_unique<WalWriter>(
-        wal_path(active_wal_segment_id_.load(std::memory_order_acquire)),
-        active_wal_segment_id_.load(std::memory_order_acquire));
-    if (!wal_writer_->valid() || !wal_writer_->sync()) {
-      return false;
-    }
+  wal_writer_ = std::make_unique<WalWriter>(
+      wal_path(active_wal_segment_id_.load(std::memory_order_acquire)),
+      active_wal_segment_id_.load(std::memory_order_acquire));
+  if (!wal_writer_->valid() || !wal_writer_->sync()) {
+    return false;
   }
 
   failed_.store(false, std::memory_order_release);
@@ -243,14 +242,14 @@ bool DynamicWriteManager::open() {
   return true;
 }
 
-bool DynamicWriteManager::submit_record(DynamicRecord record) {
+bool DynamicWriteManager::submit_record(WritePayload payload) {
   if (!accepting_writes_.load(std::memory_order_acquire) ||
       failed_.load(std::memory_order_acquire)) {
     return false;
   }
 
   auto request = std::make_shared<WriteRequest>();
-  request->record = std::move(record);
+  request->payload = std::move(payload);
   request->submitted_at = Clock::now();
   stat_submitted_.fetch_add(1, std::memory_order_relaxed);
 
@@ -340,11 +339,15 @@ bool DynamicWriteManager::commit_batch(
   if (requests.empty()) {
     return true;
   }
-  std::vector<DynamicRecord> records;
+  std::vector<MaterializedRecord> records;
   records.reserve(requests.size());
   auto next = next_sequence_id_.load(std::memory_order_relaxed);
   for (const auto& request : requests) {
-    auto record = request->record;
+    MaterializedRecord record;
+    record.node_id = request->payload.node_id;
+    record.dim = request->payload.dim;
+    record.vector = std::move(request->payload.vector);
+    record.deleted = request->payload.deleted;
     record.sequence_id = next++;
     records.push_back(std::move(record));
   }
@@ -363,8 +366,7 @@ bool DynamicWriteManager::commit_batch(
 
   const auto wal_start = Clock::now();
   std::vector<DynamicLocator> locators;
-  if (options_.enable_wal &&
-      (!wal_writer_ || !wal_writer_->append_batch(records, locators))) {
+  if (!wal_writer_ || !wal_writer_->append_batch(records, locators)) {
     memory_budget_.release(MemoryDomain::kDeltaControlled, reserved_bytes);
     set_failed();
     for (const auto& request : requests) {
@@ -376,7 +378,7 @@ bool DynamicWriteManager::commit_batch(
   stat_wal_append_ns_.fetch_add(elapsed_ns(wal_start, Clock::now()),
                                 std::memory_order_relaxed);
   const auto sync_start = Clock::now();
-  if (options_.enable_wal && !wal_writer_->sync()) {
+  if (!wal_writer_->sync()) {
     memory_budget_.release(MemoryDomain::kDeltaControlled, reserved_bytes);
     set_failed();
     for (const auto& request : requests) {
@@ -387,20 +389,22 @@ bool DynamicWriteManager::commit_batch(
   }
   stat_wal_sync_ns_.fetch_add(elapsed_ns(sync_start, Clock::now()),
                               std::memory_order_relaxed);
-  if (options_.enable_wal) {
-    for (std::size_t i = 0; i < records.size(); ++i) {
-      records[i].locator = locators[i];
-    }
+  for (std::size_t i = 0; i < records.size(); ++i) {
+    records[i].locator = locators[i];
   }
 
   const auto apply_start = Clock::now();
   apply_records(records, true);
   for (const auto& record : records) {
-    DynamicRecord compact = record;
-    compact.vector.clear();
-    compact.vector.shrink_to_fit();
-    compact.neighbors.clear();
-    compact.neighbors.shrink_to_fit();
+    CompactDeltaVersion compact;
+    compact.sequence_id = record.sequence_id;
+    compact.node_id = record.node_id;
+    compact.dim = record.dim;
+    compact.locator = record.locator;
+    compact.deleted = record.deleted;
+    if (!record.deleted && options_.pq_model && options_.pq_model->enabled()) {
+      compact.pq_code = options_.pq_model->encode(record.vector.data());
+    }
     if (!memtable_->insert(compact)) {
       set_failed();
       break;
@@ -496,7 +500,7 @@ void DynamicWriteManager::commit_loop() {
 }
 
 void DynamicWriteManager::apply_records(
-    const std::vector<DynamicRecord>& records, bool pre_reserved) {
+    const std::vector<MaterializedRecord>& records, bool pre_reserved) {
   for (const auto& record : records) {
     if (!pre_reserved) {
       memory_budget_.account_existing(MemoryDomain::kDeltaControlled,
@@ -504,15 +508,13 @@ void DynamicWriteManager::apply_records(
     }
     VersionShard::Version version;
     version.sequence_id = record.sequence_id;
+    version.node_id = record.node_id;
     version.locator = record.locator;
     version.dim = record.dim;
     version.deleted = record.deleted;
     if (!record.deleted && options_.pq_model && options_.pq_model->enabled() &&
         record.vector.size() == options_.pq_model->dim()) {
       version.pq_code = options_.pq_model->encode(record.vector.data());
-    }
-    if (!record.locator.valid() && !record.deleted) {
-      version.volatile_vector = record.vector;
     }
     auto shard = shard_for(record.node_id);
     std::unique_lock<std::shared_mutex> lock(shard->mutex);
@@ -521,19 +523,16 @@ void DynamicWriteManager::apply_records(
 }
 
 std::uint64_t DynamicWriteManager::estimate_version_bytes(
-    const DynamicRecord& record) const {
+    const MaterializedRecord& record) const {
   std::uint64_t bytes = sizeof(VersionShard::Version);
   if (!record.deleted && options_.pq_model && options_.pq_model->enabled()) {
     bytes += options_.pq_model->subspaces();
-  }
-  if (!record.locator.valid() && !options_.enable_wal && !record.deleted) {
-    bytes += record.vector.size() * sizeof(float);
   }
   return bytes;
 }
 
 void DynamicWriteManager::redirect_records(
-    const std::vector<DynamicRecord>& records) {
+    const std::vector<MaterializedRecord>& records) {
   for (const auto& record : records) {
     auto shard = shard_for(record.node_id);
     std::unique_lock<std::shared_mutex> lock(shard->mutex);
@@ -550,16 +549,15 @@ void DynamicWriteManager::redirect_records(
 
 bool DynamicWriteManager::rotate_memtable_locked(
     std::shared_ptr<WriteRequest> waiter) {
-  auto records = memtable_->snapshot();
   FlushTask task;
-  task.records = std::move(records);
+  task.table = std::move(memtable_);
   task.max_sequence = latest_sequence_.load(std::memory_order_acquire);
   task.wal_segment_id =
       active_wal_segment_id_.load(std::memory_order_acquire);
   task.waiter = std::move(waiter);
   memtable_ = std::make_unique<MemTable>(options_.memtable_flush_bytes);
 
-  if (options_.enable_wal && wal_writer_) {
+  if (wal_writer_) {
     if (!wal_writer_->close()) {
       return false;
     }
@@ -585,11 +583,7 @@ bool DynamicWriteManager::rotate_memtable_locked(
       return flush_stop_ || flush_queue_.size() < 1;
     });
     if (flush_stop_) return false;
-    std::uint64_t bytes = 0;
-    for (const auto& record : task.records) {
-      bytes += sizeof(DynamicRecord) + record.vector.capacity() * sizeof(float) +
-               record.neighbors.capacity() * sizeof(NodeId);
-    }
+    const auto bytes = task.table ? task.table->resident_bytes() : 0;
     frozen_resident_bytes_.fetch_add(bytes, std::memory_order_relaxed);
     flush_queue_.push_back(std::move(task));
     atomic_max(stat_flush_queue_high_watermark_, flush_queue_.size());
@@ -600,21 +594,29 @@ bool DynamicWriteManager::rotate_memtable_locked(
 }
 
 bool DynamicWriteManager::flush_task(const FlushTask& task) {
-  if (task.records.empty()) {
+  if (!task.table || task.table->size() == 0) {
     if (task.waiter) {
       complete_request(task.waiter, true);
     }
     return true;
   }
 
-  std::vector<DynamicRecord> materialized;
-  materialized.reserve(task.records.size());
-  for (const auto& compact : task.records) {
+  std::vector<MaterializedRecord> materialized;
+  materialized.reserve(task.table->size());
+  for (std::size_t i = 0; i < task.table->size(); ++i) {
+    if (!task.table->is_latest(i)) continue;
+    const auto compact = task.table->at(i);
     if (compact.deleted) {
-      materialized.push_back(compact);
+      MaterializedRecord record;
+      record.sequence_id = compact.sequence_id;
+      record.node_id = compact.node_id;
+      record.dim = compact.dim;
+      record.locator = compact.locator;
+      record.deleted = true;
+      materialized.push_back(std::move(record));
       continue;
     }
-    DynamicRecord record;
+    MaterializedRecord record;
     if (compact.locator.kind != DynamicStorageKind::kWal ||
         !WalReader(wal_path(compact.locator.file_id))
              .read_at(compact.locator, record)) {
@@ -674,9 +676,9 @@ bool DynamicWriteManager::flush_task(const FlushTask& task) {
       }
     }
     auto located = published ? published->scan_all_located()
-                             : std::vector<std::pair<DynamicRecord,
+                             : std::vector<std::pair<MaterializedRecord,
                                                      DynamicLocator>>{};
-    std::vector<DynamicRecord> redirected;
+    std::vector<MaterializedRecord> redirected;
     redirected.reserve(located.size());
     for (auto& item : located) {
       item.first.locator = item.second;
@@ -711,11 +713,7 @@ void DynamicWriteManager::flush_loop() {
       flush_queue_space_condition_.notify_one();
     }
     (void)flush_task(task);
-    std::uint64_t bytes = 0;
-    for (const auto& record : task.records) {
-      bytes += sizeof(DynamicRecord) + record.vector.capacity() * sizeof(float) +
-               record.neighbors.capacity() * sizeof(NodeId);
-    }
+    const auto bytes = task.table ? task.table->resident_bytes() : 0;
     frozen_resident_bytes_.fetch_sub(bytes, std::memory_order_relaxed);
   }
 }
@@ -725,11 +723,11 @@ bool DynamicWriteManager::insert(NodeId node_id, const float* vector,
   if (vector == nullptr || dim == 0) {
     return false;
   }
-  DynamicRecord record;
-  record.node_id = node_id;
-  record.dim = dim;
-  record.vector.assign(vector, vector + dim);
-  return submit_record(std::move(record));
+  WritePayload payload;
+  payload.node_id = node_id;
+  payload.dim = dim;
+  payload.vector.assign(vector, vector + dim);
+  return submit_record(std::move(payload));
 }
 
 bool DynamicWriteManager::update(NodeId node_id, const float* vector,
@@ -738,10 +736,10 @@ bool DynamicWriteManager::update(NodeId node_id, const float* vector,
 }
 
 bool DynamicWriteManager::erase(NodeId node_id) {
-  DynamicRecord record;
-  record.node_id = node_id;
-  record.deleted = true;
-  return submit_record(std::move(record));
+  WritePayload payload;
+  payload.node_id = node_id;
+  payload.deleted = true;
+  return submit_record(std::move(payload));
 }
 
 bool DynamicWriteManager::flush() { return submit_control(RequestKind::flush); }
@@ -754,7 +752,7 @@ DynamicWriteStats DynamicWriteManager::write_stats() const {
   return DynamicWriteStats{
       stat_submitted_.load(), stat_committed_.load(), stat_failed_.load(),
       stat_batches_.load(), stat_batch_records_.load(), stat_queue_wait_ns_.load(),
-      stat_neighbor_prepare_ns_.load(), stat_wal_append_ns_.load(),
+      stat_wal_append_ns_.load(),
       stat_wal_sync_ns_.load(), stat_memtable_apply_ns_.load(),
       stat_backpressure_.load(), stat_queue_high_watermark_.load(),
       stat_flush_tasks_.load(), stat_flush_failures_.load(),
@@ -763,19 +761,14 @@ DynamicWriteStats DynamicWriteManager::write_stats() const {
 
 bool DynamicWriteManager::materialize(
     NodeId node_id, const VersionShard::Version& version,
-    DynamicRecord& out) const {
-  DynamicRecord record;
+    MaterializedRecord& out) const {
+  MaterializedRecord record;
   record.node_id = node_id;
   record.sequence_id = version.sequence_id;
   record.dim = version.dim;
   record.deleted = version.deleted;
   record.locator = version.locator;
   if (record.deleted) {
-    out = std::move(record);
-    return true;
-  }
-  if (!version.volatile_vector.empty()) {
-    record.vector = version.volatile_vector;
     out = std::move(record);
     return true;
   }
@@ -806,14 +799,14 @@ bool DynamicWriteManager::materialize(
   return false;
 }
 
-std::unordered_map<NodeId, DynamicRecord>
+std::unordered_map<NodeId, MaterializedRecord>
 DynamicWriteManager::latest_records_for(const std::vector<NodeId>& node_ids,
                                         std::uint64_t read_sequence,
                                         bool include_deleted) const {
   std::unordered_set<NodeId> wanted(node_ids.begin(), node_ids.end());
   std::vector<std::pair<NodeId, VersionShard::Version>> selected;
   selected.reserve(node_ids.size());
-  std::unordered_map<NodeId, DynamicRecord> output;
+  std::unordered_map<NodeId, MaterializedRecord> output;
   output.reserve(node_ids.size());
   for (const auto& shard : version_shards_) {
     std::shared_lock<std::shared_mutex> lock(shard->mutex);
@@ -836,7 +829,7 @@ DynamicWriteManager::latest_records_for(const std::vector<NodeId>& node_ids,
     }
   }
   for (const auto& item : selected) {
-    DynamicRecord record;
+    MaterializedRecord record;
     if (materialize(item.first, item.second, record)) {
       output[item.first] = std::move(record);
     }
@@ -844,7 +837,7 @@ DynamicWriteManager::latest_records_for(const std::vector<NodeId>& node_ids,
   return output;
 }
 
-std::vector<DynamicRecord>
+std::vector<MaterializedRecord>
 DynamicWriteManager::collect_all_delta_records_at_internal(
     std::uint64_t read_sequence) const {
   std::vector<std::pair<NodeId, VersionShard::Version>> visible;
@@ -859,28 +852,28 @@ DynamicWriteManager::collect_all_delta_records_at_internal(
       }
     }
   }
-  std::vector<DynamicRecord> output;
+  std::vector<MaterializedRecord> output;
   output.reserve(visible.size());
   for (const auto& item : visible) {
-    DynamicRecord record;
+    MaterializedRecord record;
     if (materialize(item.first, item.second, record)) {
       output.push_back(std::move(record));
     }
   }
   std::sort(output.begin(), output.end(),
-            [](const DynamicRecord& lhs, const DynamicRecord& rhs) {
+            [](const MaterializedRecord& lhs, const MaterializedRecord& rhs) {
               return lhs.node_id < rhs.node_id;
             });
   return output;
 }
 
-std::vector<DynamicRecord>
+std::vector<MaterializedRecord>
 DynamicWriteManager::collect_all_delta_records_at(
     std::uint64_t read_sequence) const {
   return collect_all_delta_records_at_internal(read_sequence);
 }
 
-std::vector<DynamicRecord>
+std::vector<MaterializedRecord>
 DynamicWriteManager::collect_all_delta_records() const {
   return collect_all_delta_records_at_internal(
       std::numeric_limits<std::uint64_t>::max());
@@ -898,56 +891,12 @@ DynamicSnapshot DynamicWriteManager::snapshot(std::uint64_t read_sequence) const
   return output;
 }
 
-std::vector<NodeId> DynamicWriteManager::select_incremental_neighbors(
-    NodeId node_id, const float* vector, std::uint32_t dim,
-    std::uint64_t read_sequence) const {
-  if (options_.dynamic_graph_degree == 0 || vector == nullptr) {
-    return {};
-  }
-  auto records = collect_all_delta_records_at_internal(read_sequence);
-  records.erase(std::remove_if(records.begin(), records.end(),
-                               [&](const DynamicRecord& record) {
-                                 return record.deleted || record.node_id == node_id ||
-                                        record.dim != dim || record.vector.size() != dim;
-                               }),
-                records.end());
-  if (records.size() > options_.neighbor_candidate_limit) {
-    const auto limit = options_.neighbor_candidate_limit;
-    std::nth_element(
-        records.begin(), records.begin() + limit, records.end(),
-        [node_id](const DynamicRecord& lhs, const DynamicRecord& rhs) {
-          const auto lh = std::hash<NodeId>{}(lhs.node_id ^ node_id);
-          const auto rh = std::hash<NodeId>{}(rhs.node_id ^ node_id);
-          return lh < rh;
-        });
-    records.resize(limit);
-  }
-  std::vector<ScoredRecord> candidates;
-  candidates.reserve(records.size());
-  for (const auto& record : records) {
-    candidates.push_back(
-        ScoredRecord{record, squared_l2(vector, record.vector.data(), dim)});
-  }
-  const auto degree = std::min(options_.dynamic_graph_degree, candidates.size());
-  if (degree < candidates.size()) {
-    std::nth_element(candidates.begin(), candidates.begin() + degree,
-                     candidates.end(), scored_less);
-    candidates.resize(degree);
-  }
-  std::sort(candidates.begin(), candidates.end(), scored_less);
-  std::vector<NodeId> neighbors;
-  neighbors.reserve(candidates.size());
-  for (const auto& candidate : candidates) {
-    neighbors.push_back(candidate.record.node_id);
-  }
-  return neighbors;
-}
-
-std::vector<DynamicRecord> DynamicWriteManager::search_delta_l2_at(
+std::vector<MaterializedRecord> DynamicWriteManager::search_delta_pq_at(
     const float* query, std::uint32_t dim, std::size_t topk,
     std::uint64_t read_sequence, std::uint64_t exclusive_lower_sequence,
     DeltaSearchStats* stats) const {
-  if (query == nullptr || dim == 0 || topk == 0) {
+  if (query == nullptr || dim == 0 || topk == 0 || !options_.pq_model ||
+      !options_.pq_model->enabled() || options_.pq_model->dim() != dim) {
     return {};
   }
   struct Candidate {
@@ -971,18 +920,12 @@ std::vector<DynamicRecord> DynamicWriteManager::search_delta_l2_at(
     }
   }
   if (stats) stats->visible_versions = visible.size();
-  const bool use_pq = options_.pq_model && options_.pq_model->enabled();
-  const auto adc_table = use_pq ? options_.pq_model->build_adc_table(query)
-                                : std::vector<float>{};
+  const auto adc_table = options_.pq_model->build_adc_table(query);
   for (auto& candidate : visible) {
-    if (use_pq && candidate.version.pq_code.size() ==
-                      options_.pq_model->subspaces()) {
+    if (candidate.version.pq_code.size() == options_.pq_model->subspaces()) {
       candidate.distance = options_.pq_model->adc_distance_code(
           candidate.version.pq_code.data(), adc_table);
       if (stats) ++stats->pq_scanned;
-    } else if (!candidate.version.volatile_vector.empty()) {
-      candidate.distance = squared_l2(
-          query, candidate.version.volatile_vector.data(), dim);
     } else {
       candidate.distance = std::numeric_limits<float>::max();
     }
@@ -1003,7 +946,7 @@ std::vector<DynamicRecord> DynamicWriteManager::search_delta_l2_at(
   std::vector<ScoredRecord> scored;
   scored.reserve(visible.size());
   for (const auto& candidate : visible) {
-    DynamicRecord record;
+    MaterializedRecord record;
     if (!materialize(candidate.node_id, candidate.version, record) ||
         record.vector.size() != dim) {
       continue;
@@ -1023,7 +966,7 @@ std::vector<DynamicRecord> DynamicWriteManager::search_delta_l2_at(
     scored.resize(count);
   }
   std::sort(scored.begin(), scored.end(), scored_less);
-  std::vector<DynamicRecord> output;
+  std::vector<MaterializedRecord> output;
   output.reserve(scored.size());
   for (auto& item : scored) {
     output.push_back(std::move(item.record));
@@ -1073,8 +1016,7 @@ std::uint64_t DynamicWriteManager::checkpoint_versions(
           versions.begin(), versions.end(), [&](const VersionShard::Version& version) {
             if (version.sequence_id > incorporated_sequence) return false;
             released += sizeof(VersionShard::Version) +
-                        version.pq_code.capacity() +
-                        version.volatile_vector.capacity() * sizeof(float);
+                        version.pq_code.capacity();
             return true;
           });
       versions.erase(keep, versions.end());
@@ -1155,7 +1097,7 @@ bool DynamicWriteManager::compact_once(DynamicCompactionStats* stats) {
   }
   if (committed) {
     auto located = sstables_.front()->scan_all_located();
-    std::vector<DynamicRecord> redirected;
+    std::vector<MaterializedRecord> redirected;
     redirected.reserve(located.size());
     for (auto& item : located) {
       item.first.locator = item.second;
@@ -1260,9 +1202,9 @@ std::filesystem::path DynamicWriteManager::sstable_dir() const {
   return options_.dynamic_dir / "sstable";
 }
 
-std::vector<SearchResult> merge_base_and_delta_l2(
+std::vector<SearchResult> merge_base_and_delta_candidates(
     const std::vector<SearchResult>& base_results,
-    const std::vector<DynamicRecord>& delta_records, const float* query,
+    const std::vector<MaterializedRecord>& delta_records, const float* query,
     std::uint32_t dim, std::size_t topk) {
   if (query == nullptr || dim == 0 || topk == 0) {
     return {};

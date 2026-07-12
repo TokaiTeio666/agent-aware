@@ -20,6 +20,8 @@
 #include "core/async_page_reader.h"
 #include "core/brute_force.h"
 #include "core/query_page_session.h"
+#include "core/reader_context.h"
+#include "core/top_l_candidate_pool.h"
 #include "graph/disk_page_codec.h"
 #include "graph/vamana_builder.h"
 
@@ -70,43 +72,6 @@ std::shared_ptr<const PqAdcModel> load_shared_pq_model(
 }
 
 // PackedDiskGraphIndex 查询 V2 页布局，组合 PQ/ADC 候选打分、页 cache 复用和单 query 异步预取会话。
-struct CloserFirst {
-  bool operator()(const SearchResult& lhs, const SearchResult& rhs) const {
-    if (lhs.distance == rhs.distance) {
-      return lhs.id > rhs.id;
-    }
-    return lhs.distance > rhs.distance;
-  }
-};
-
-struct WorseResultFirst {
-  bool operator()(const SearchResult& lhs, const SearchResult& rhs) const {
-    if (lhs.distance == rhs.distance) {
-      return lhs.id < rhs.id;
-    }
-    return lhs.distance < rhs.distance;
-  }
-};
-
-std::vector<SearchResult> sorted_results(
-    std::priority_queue<SearchResult, std::vector<SearchResult>,
-                        WorseResultFirst>& heap) {
-  std::vector<SearchResult> results;
-  results.reserve(heap.size());
-  while (!heap.empty()) {
-    results.push_back(heap.top());
-    heap.pop();
-  }
-  std::sort(results.begin(), results.end(),
-            [](const SearchResult& lhs, const SearchResult& rhs) {
-              if (lhs.distance == rhs.distance) {
-                return lhs.id < rhs.id;
-              }
-              return lhs.distance < rhs.distance;
-            });
-  return results;
-}
-
 }  // namespace
 
 std::vector<TopologyPageCandidate> rank_topology_pages(
@@ -156,7 +121,15 @@ struct PackedDiskGraphIndex::SearchState {
         query(query),
         config(config),
         output(output),
-        session(index, config, output.stats) {}
+        context(static_cast<std::size_t>(index.metadata_.vector_count), config,
+                output.stats),
+        session(index, config, output.stats),
+        pool(context.limits().max_search_list_size),
+        logical_l(context.limits().search_list_size) {
+    session.apply_workspace_limits(context.limits().prefetch_top_k,
+                                   context.limits().prefetch_max_inflight);
+    staging.reserve(context.limits().beam_width * index.metadata_.degree);
+  }
 
   // SearchState 保存单 query 可变遍历状态；共享的 index 对象只负责索引元数据和 cache。
   const QueryPageSession::Node& load_node(std::uint32_t id) {
@@ -189,30 +162,64 @@ struct PackedDiskGraphIndex::SearchState {
     return ranked;
   }
 
-  void add_best(const SearchResult& result) {
-    if (best.size() < result_capacity) {
-      best.push(result);
-    } else {
-      const auto& worst = best.top();
-      if (result.distance < worst.distance ||
-          (result.distance == worst.distance && result.id < worst.id)) {
-        best.pop();
-        best.push(result);
+  void merge_staging() {
+    output.stats.candidate_staging_peak_size = std::max(
+        output.stats.candidate_staging_peak_size, staging.size());
+    const CandidatePoolMergeStats merged = pool.merge(staging);
+    output.stats.candidate_admitted_count += merged.admitted;
+    output.stats.candidate_replacement_count += merged.replacements;
+    output.stats.candidate_rejected_count += merged.rejected;
+    output.stats.candidate_pool_peak_size =
+        std::max(output.stats.candidate_pool_peak_size, pool.size());
+  }
+
+  std::size_t logical_limit() const {
+    return std::min(logical_l, pool.size());
+  }
+
+  std::size_t unexpanded_in_logical_prefix() const {
+    std::size_t count = 0;
+    const auto& values = pool.values();
+    for (std::size_t i = 0; i < logical_limit(); ++i) {
+      if (!context.is_expanded(values[i].id)) ++count;
+    }
+    return count;
+  }
+
+  bool grow_logical_l() {
+    if (logical_l >= context.limits().max_search_list_size) return false;
+    const std::size_t doubled =
+        logical_l > context.limits().max_search_list_size / 2
+            ? context.limits().max_search_list_size
+            : logical_l * 2;
+    logical_l = std::min(context.limits().max_search_list_size,
+                         std::max(logical_l + 1, doubled));
+    ++output.stats.candidate_logical_l_growth_count;
+    return true;
+  }
+
+  bool converged() const {
+    if (pool.size() < result_capacity) return false;
+    if (output.stats.expanded < logical_limit()) return false;
+    const auto& values = pool.values();
+    for (std::size_t i = 0; i < logical_limit(); ++i) {
+      if (!context.is_expanded(values[i].id)) {
+        return !candidate_is_better(values[i], values[result_capacity - 1]);
       }
     }
+    return true;
   }
 
   PackedDiskGraphIndex& index;
   const float* query = nullptr;
   const DiskGraphSearchConfig& config;
   DiskGraphSearchResult& output;
+  ReaderContext context;
   QueryPageSession session;
-  std::unordered_set<std::uint32_t> visited;
-  std::priority_queue<SearchResult, std::vector<SearchResult>, CloserFirst>
-      candidates;
-  std::priority_queue<SearchResult, std::vector<SearchResult>, WorseResultFirst>
-      best;
+  TopLCandidatePool pool;
+  std::vector<SearchResult> staging;
   std::vector<float> adc_table;
+  std::size_t logical_l = 0;
   std::size_t effective_k = 0;
   std::size_t result_capacity = 0;
 };
@@ -335,6 +342,7 @@ void PackedDiskGraphIndex::configure_cache(const std::string& policy,
                                            std::size_t capacity_pages,
                                            bool protect_hot_pages,
                                            std::size_t hot_degree_threshold) {
+  std::unique_lock<std::shared_mutex> runtime_lock(runtime_mutex_);
   if (policy != "none" && policy != "lru" && policy != "2q" &&
       policy != "graph-aware-2q" && policy != "agent") {
     throw std::runtime_error(
@@ -365,8 +373,6 @@ void PackedDiskGraphIndex::reset_cache_locked() {
   page_cache_.reserve(cache_capacity_pages_);
   cache_frames_.clear();
   cache_frames_.resize(cache_capacity_pages_);
-  cache_page_slab_.clear();
-  cache_page_slab_.resize(cache_capacity_pages_ * metadata_.page_size);
   cache_free_frames_.clear();
   cache_free_frames_.reserve(cache_capacity_pages_);
   for (std::size_t i = cache_capacity_pages_; i > 0; --i) {
@@ -477,6 +483,7 @@ void PackedDiskGraphIndex::unpin_if_cached(std::uint32_t page_id) {
 void PackedDiskGraphIndex::configure_io(const std::string& mode,
                                         std::size_t batch_size,
                                         std::size_t io_depth) {
+  std::unique_lock<std::shared_mutex> runtime_lock(runtime_mutex_);
   page_reader_->configure(mode, batch_size, io_depth);
 }
 
@@ -606,7 +613,7 @@ float PackedDiskGraphIndex::compute_distance_direct(
   return squared_l2(query, vector_data(page, node), metadata_.dim);
 }
 
-const PackedDiskGraphIndex::DecodedPage*
+std::shared_ptr<const PackedDiskGraphIndex::DecodedPage>
 PackedDiskGraphIndex::lookup_cached_page(std::uint32_t page_id,
                                          DiskGraphSearchStats& stats) {
   if (!cache_enabled()) {
@@ -623,15 +630,14 @@ PackedDiskGraphIndex::lookup_cached_page(std::uint32_t page_id,
   ++stats.page_cache_hits;
   ++stats.cache_hits;
   entry.referenced = true;
-  return &entry.page;
+  return entry.page;
 }
 
-const PackedDiskGraphIndex::DecodedPage&
+std::shared_ptr<const PackedDiskGraphIndex::DecodedPage>
 PackedDiskGraphIndex::store_cached_page(DecodedPage page,
                                         DiskGraphSearchStats& stats) {
   if (!cache_enabled()) {
-    scratch_page_ = std::move(page);
-    return scratch_page_;
+    return std::make_shared<DecodedPage>(std::move(page));
   }
 
   const std::uint32_t page_id = page.page_id;
@@ -643,21 +649,14 @@ PackedDiskGraphIndex::store_cached_page(DecodedPage page,
     if (page.bytes.size() != metadata_.page_size) {
       throw std::runtime_error("Packed cache page has unexpected size");
     }
-    char* frame_data = cache_page_slab_.data() +
-        static_cast<std::size_t>(found->second) * metadata_.page_size;
-    std::memcpy(frame_data, page.bytes.data(), metadata_.page_size);
-    entry.page.page_id = page.page_id;
-    entry.page.node_count = page.node_count;
-    entry.page.frame_data = frame_data;
-    entry.page.frame_size = metadata_.page_size;
+    entry.page = std::make_shared<DecodedPage>(std::move(page));
     entry.referenced = true;
     return entry.page;
   }
 
   if (cache_free_frames_.empty()) {
     if (!evict_one_page_locked(&stats)) {
-      scratch_page_ = std::move(page);
-      return scratch_page_;
+      return std::make_shared<DecodedPage>(std::move(page));
     }
   }
 
@@ -665,19 +664,12 @@ PackedDiskGraphIndex::store_cached_page(DecodedPage page,
   const std::uint32_t frame = cache_free_frames_.back();
   cache_free_frames_.pop_back();
   CacheEntry& entry = cache_frames_[frame];
-  entry.page = std::move(page);
-  if (entry.page.bytes.size() != metadata_.page_size) {
+  entry.page = std::make_shared<DecodedPage>(std::move(page));
+  if (entry.page->bytes.size() != metadata_.page_size) {
     throw std::runtime_error("Packed cache page has unexpected size");
   }
-  char* frame_data = cache_page_slab_.data() +
-      static_cast<std::size_t>(frame) * metadata_.page_size;
-  std::memcpy(frame_data, entry.page.bytes.data(), metadata_.page_size);
-  entry.page.bytes.clear();
-  entry.page.bytes.shrink_to_fit();
-  entry.page.frame_data = frame_data;
-  entry.page.frame_size = metadata_.page_size;
   entry.occupied = true;
-  entry.hot = page_hot_score(entry.page) > 0;
+  entry.hot = page_hot_score(*entry.page) > 0;
   entry.pin_count = 0;
   entry.saved_queue = kNoQueue;
   entry.referenced = true;
@@ -751,7 +743,7 @@ bool PackedDiskGraphIndex::evict_one_page_locked(DiskGraphSearchStats* stats) {
   }
 
   CacheEntry& entry = cache_frames_[victim];
-  const std::uint32_t page_id = entry.page.page_id;
+  const std::uint32_t page_id = entry.page->page_id;
   const bool probationary_victim =
       entry.queue == kA1Cold || entry.queue == kA1Hot;
   queue_remove_locked(victim);
@@ -765,13 +757,14 @@ bool PackedDiskGraphIndex::evict_one_page_locked(DiskGraphSearchStats* stats) {
   return true;
 }
 
-const PackedDiskGraphIndex::DecodedPage& PackedDiskGraphIndex::load_page(
+std::shared_ptr<const PackedDiskGraphIndex::DecodedPage>
+PackedDiskGraphIndex::load_page(
     std::uint32_t page_id, DiskGraphSearchStats& stats) {
   ++stats.page_requests;
   ++stats.page_requests_before_dedup;
 
-  if (const DecodedPage* cached = lookup_cached_page(page_id, stats)) {
-    return *cached;
+  if (auto cached = lookup_cached_page(page_id, stats)) {
+    return cached;
   }
 
   ++stats.page_cache_misses;
@@ -803,7 +796,7 @@ PackedDiskGraphIndex::initialize_search_state(
     if (entry >= metadata_.vector_count) {
       continue;
     }
-    if (!state->visited.insert(entry).second) {
+    if (state->context.test_and_set(entry)) {
       continue;
     }
     accepted_entries.push_back(entry);
@@ -818,7 +811,8 @@ PackedDiskGraphIndex::initialize_search_state(
       std::min<std::size_t>(config.top_k,
                             static_cast<std::size_t>(metadata_.vector_count));
   state->result_capacity =
-      std::min<std::size_t>(std::max(state->effective_k, config.rerank_topk),
+      std::min<std::size_t>(
+          std::max(state->effective_k, state->context.limits().rerank_topk),
                             static_cast<std::size_t>(metadata_.vector_count));
 
   std::vector<SearchResult> ranked_entries;
@@ -837,9 +831,9 @@ PackedDiskGraphIndex::initialize_search_state(
 
   // entry point 按 PQ 距离顺序入堆，避免第一批扩展被任意 id 顺序主导。
   for (const auto& result : ranked_entries) {
-    state->candidates.push(result);
-    state->add_best(result);
+    state->staging.push_back(result);
   }
+  state->merge_staging();
   return state;
 }
 
@@ -863,8 +857,8 @@ std::vector<SearchResult> PackedDiskGraphIndex::select_candidate_batch(
     SearchState& state, std::size_t effective_beam_width) const {
   std::vector<SearchResult> window;
   const std::size_t remaining =
-      state.config.search_width > state.output.stats.expanded
-          ? state.config.search_width - state.output.stats.expanded
+      state.context.limits().search_width > state.output.stats.expanded
+          ? state.context.limits().search_width - state.output.stats.expanded
           : 0;
   const std::size_t batch_limit =
       std::min(effective_beam_width, remaining);
@@ -872,10 +866,32 @@ std::vector<SearchResult> PackedDiskGraphIndex::select_candidate_batch(
     return window;
   }
 
+  const auto& pool = state.pool.values();
+  const std::size_t logical_limit = state.logical_limit();
+  const std::size_t hot_limit = state.context.limits().candidate_hot_size;
+  std::vector<SearchResult> hot;
+  hot.reserve(std::min(hot_limit, logical_limit));
+  for (std::size_t i = 0; i < logical_limit && hot.size() < hot_limit; ++i) {
+    if (!state.context.is_expanded(pool[i].id)) hot.push_back(pool[i]);
+  }
+  if (hot.empty()) return window;
+
+  std::vector<std::uint32_t> ranked_page_ids;
+  ranked_page_ids.reserve(hot.size());
+  for (const auto& candidate : hot) {
+    ranked_page_ids.push_back(state.session.page_for_node(candidate.id));
+  }
+  const auto ranked_pages =
+      rank_topology_pages(ranked_page_ids, ranked_page_ids.size());
   window.reserve(batch_limit);
-  while (!state.candidates.empty() && window.size() < batch_limit) {
-    window.push_back(state.candidates.top());
-    state.candidates.pop();
+  for (const auto& page : ranked_pages) {
+    for (const auto& candidate : hot) {
+      if (state.session.page_for_node(candidate.id) == page.page_id) {
+        window.push_back(candidate);
+        if (window.size() == batch_limit) break;
+      }
+    }
+    if (window.size() == batch_limit) break;
   }
 
   std::unordered_set<std::uint32_t> batch_pages;
@@ -897,10 +913,8 @@ std::vector<SearchResult> PackedDiskGraphIndex::select_candidate_batch(
 void PackedDiskGraphIndex::expand_candidate_batch(
     SearchState& state, const std::vector<SearchResult>& batch,
     std::size_t effective_beam_width) {
-  std::vector<std::vector<SearchResult>> ranked_neighbors_by_candidate;
-  ranked_neighbors_by_candidate.reserve(batch.size());
-
   for (const auto& current : batch) {
+    if (!state.context.mark_expanded(current.id)) continue;
     const QueryPageSession::Node& node = state.load_node(current.id);
     const std::uint32_t current_page = state.session.page_for_node(current.id);
     (void)state.session.pin_page(current_page);
@@ -910,41 +924,43 @@ void PackedDiskGraphIndex::expand_candidate_batch(
     new_neighbors.reserve(node.neighbors.size());
     for (const auto neighbor_id : node.neighbors) {
       if (neighbor_id >= metadata_.vector_count ||
-          !state.visited.insert(neighbor_id).second) {
+          state.context.test_and_set(neighbor_id)) {
         continue;
       }
       new_neighbors.push_back(neighbor_id);
     }
 
-    std::vector<SearchResult> ranked_neighbors =
-        state.rank_neighbors_by_distance(new_neighbors);
-
-    ranked_neighbors_by_candidate.push_back(std::move(ranked_neighbors));
+    for (const auto neighbor_id : new_neighbors) {
+      const SearchResult candidate{neighbor_id,
+                                   state.candidate_distance(neighbor_id)};
+      if (state.pool.size() < state.pool.capacity() ||
+          candidate_is_better(candidate, state.pool.values().back())) {
+        state.staging.push_back(candidate);
+      } else {
+        ++state.output.stats.candidate_rejected_count;
+      }
+    }
     state.session.unpin_page(current_page);
   }
+
+  state.merge_staging();
 
   if (state.config.prefetch_policy == "topology") {
     const auto planner_start = std::chrono::steady_clock::now();
     const std::size_t candidate_limit =
         std::max<std::size_t>(1, effective_beam_width) * 2;
-    std::priority_queue<SearchResult, std::vector<SearchResult>, CloserFirst>
-        projected_frontier = state.candidates;
-    for (const auto& ranked : ranked_neighbors_by_candidate) {
-      for (const auto& candidate : ranked) projected_frontier.push(candidate);
-    }
-    const std::size_t scan_limit =
-        std::min(projected_frontier.size(), candidate_limit);
-    state.output.stats.prefetch_candidate_nodes += scan_limit;
     std::vector<std::uint32_t> ranked_page_ids;
-    ranked_page_ids.reserve(scan_limit);
-    for (std::size_t rank = 0; rank < scan_limit; ++rank) {
-      const auto candidate = projected_frontier.top();
-      projected_frontier.pop();
+    ranked_page_ids.reserve(candidate_limit);
+    for (const auto& candidate : state.pool.values()) {
+      if (ranked_page_ids.size() == candidate_limit) break;
+      if (state.context.is_expanded(candidate.id)) continue;
       if (state.session.is_node_materialized(candidate.id)) continue;
       const std::uint32_t page_id = state.session.page_for_node(candidate.id);
       ranked_page_ids.push_back(page_id);
     }
-    const auto ranked_pages = rank_topology_pages(ranked_page_ids, scan_limit);
+    state.output.stats.prefetch_candidate_nodes += ranked_page_ids.size();
+    const auto ranked_pages =
+        rank_topology_pages(ranked_page_ids, ranked_page_ids.size());
     state.session.record_topology_candidates(ranked_pages);
     std::vector<std::uint32_t> page_ids;
     page_ids.reserve(ranked_pages.size());
@@ -956,19 +972,14 @@ void PackedDiskGraphIndex::expand_candidate_batch(
             std::chrono::steady_clock::now() - planner_start).count();
   }
 
-  // 将 PQ 排序后的邻居推入候选堆（CPU 计算已在 rank_neighbors_by_distance 中完成）
-  for (const auto& ranked_neighbors : ranked_neighbors_by_candidate) {
-    for (const auto& candidate : ranked_neighbors) {
-      state.candidates.push(candidate);
-      state.add_best(candidate);
-    }
-  }
 }
 
 void PackedDiskGraphIndex::finalize_topk(SearchState& state) {
-  state.output.stats.visited = state.visited.size();
-  state.output.topk = sorted_results(state.best);
-  if (!state.adc_table.empty() && state.config.rerank_topk > 0) {
+  state.output.stats.visited = state.context.visited_count();
+  const auto& pool = state.pool.values();
+  const std::size_t result_count = std::min(state.result_capacity, pool.size());
+  state.output.topk.assign(pool.begin(), pool.begin() + result_count);
+  if (!state.adc_table.empty() && state.context.limits().rerank_topk > 0) {
     const auto rerank_pages = collect_rerank_pages(state);
     constexpr std::size_t kRerankChunkPages = 2;
     const std::size_t reads_before_rerank = state.output.stats.node_reads;
@@ -1006,16 +1017,12 @@ void PackedDiskGraphIndex::finalize_topk(SearchState& state) {
     state.output.topk.resize(state.effective_k);
   }
   state.session.finish_query();
+  state.output.stats.candidate_final_logical_l = state.logical_l;
 }
 
 DiskGraphSearchResult PackedDiskGraphIndex::search_one(
     const float* query, const DiskGraphSearchConfig& config) {
-  const auto lock_start = std::chrono::steady_clock::now();
-  std::unique_lock<std::mutex> search_lock(search_mutex_);
-  const double search_mutex_wait_us =
-      std::chrono::duration<double, std::micro>(
-          std::chrono::steady_clock::now() - lock_start)
-          .count();
+  std::shared_lock<std::shared_mutex> runtime_lock(runtime_mutex_);
   if (config.top_k == 0 || config.search_width == 0 ||
       config.entry_count == 0) {
     throw std::runtime_error("Packed graph search top_k, search_width, and entry_count must be positive");
@@ -1045,13 +1052,15 @@ DiskGraphSearchResult PackedDiskGraphIndex::search_one(
                  std::size_t{1}, config.search_width);
 
   DiskGraphSearchResult output;
-  output.stats.search_mutex_wait_us = search_mutex_wait_us;
   auto state = initialize_search_state(query, effective_config, output);
-  while (!state->candidates.empty() &&
-         output.stats.expanded < config.search_width) {
+  while (output.stats.expanded < state->context.limits().search_width) {
+    const std::size_t effective_context_beam =
+        state->context.limits().beam_width;
     std::vector<SearchResult> batch =
-        select_candidate_batch(*state, effective_beam_width);
+        select_candidate_batch(*state, effective_context_beam);
     if (batch.empty()) {
+      if (state->grow_logical_l()) continue;
+      output.stats.candidate_terminated_by_exhaustion = 1;
       break;
     }
 
@@ -1067,7 +1076,17 @@ DiskGraphSearchResult PackedDiskGraphIndex::search_one(
     output.stats.max_batch_size =
         std::max(output.stats.max_batch_size, batch.size());
 
-    expand_candidate_batch(*state, batch, effective_beam_width);
+    expand_candidate_batch(*state, batch, effective_context_beam);
+    if (state->converged()) {
+      output.stats.candidate_terminated_by_convergence = 1;
+      break;
+    }
+    if (state->unexpanded_in_logical_prefix() < effective_context_beam) {
+      (void)state->grow_logical_l();
+    }
+  }
+  if (output.stats.expanded >= state->context.limits().search_width) {
+    output.stats.candidate_terminated_by_budget = 1;
   }
   finalize_topk(*state);
   return output;

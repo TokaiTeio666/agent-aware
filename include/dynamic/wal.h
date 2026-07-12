@@ -3,7 +3,7 @@
 #include <filesystem>
 #include <vector>
 
-#include "dynamic/dynamic_record.h"
+#include "dynamic/dynamic_types.h"
 
 namespace agent_aware::dynamic {
 
@@ -13,9 +13,9 @@ class WalWriter {
                      std::uint64_t segment_id = 0);
   ~WalWriter();
 
-  bool append(const DynamicRecord& record);
-  bool append_batch(const std::vector<DynamicRecord>& records);
-  bool append_batch(const std::vector<DynamicRecord>& records,
+  bool append(const MaterializedRecord& record);
+  bool append_batch(const std::vector<MaterializedRecord>& records);
+  bool append_batch(const std::vector<MaterializedRecord>& records,
                     std::vector<DynamicLocator>& locators);
   bool sync();
   bool close();
@@ -32,8 +32,8 @@ class WalReader {
  public:
   explicit WalReader(const std::filesystem::path& path);
 
-  std::vector<DynamicRecord> replay();
-  bool read_at(const DynamicLocator& locator, DynamicRecord& out) const;
+  std::vector<MaterializedRecord> replay();
+  bool read_at(const DynamicLocator& locator, MaterializedRecord& out) const;
 
  private:
   std::filesystem::path path_;

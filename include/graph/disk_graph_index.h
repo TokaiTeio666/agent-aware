@@ -6,6 +6,7 @@
 #include <limits>
 #include <memory>
 #include <mutex>
+#include <shared_mutex>
 #include <string>
 #include <unordered_map>
 #include <unordered_set>
@@ -71,6 +72,9 @@ struct DiskGraphSearchConfig {
   std::size_t top_k = 10;
   std::size_t search_width = 64;
   std::size_t beam_width = 0;
+  std::size_t search_list_size = 0;
+  std::size_t max_search_list_size = 0;
+  std::size_t candidate_hot_size = 0;
   std::size_t entry_count = 1;
   std::vector<std::uint32_t> seed_ids;
   const PqAdcModel* pq_model = nullptr;
@@ -126,7 +130,6 @@ struct DiskGraphSearchStats {
   std::size_t pq_filter_reject_count = 0;
   std::size_t pq_filter_accept_count = 0;
   double demand_read_wait_us = 0.0;
-  double search_mutex_wait_us = 0.0;
   std::size_t unique_prefetch_pages = 0;
   std::size_t prefetch_candidate_nodes = 0;
   std::size_t prefetch_candidate_pages = 0;
@@ -146,6 +149,35 @@ struct DiskGraphSearchStats {
   std::size_t prefetch_adaptive_final_lead = 1;
   double prefetch_saved_wait_us = 0.0;
   double prefetch_planner_cpu_us = 0.0;
+  std::size_t query_workspace_budget_bytes = 0;
+  std::size_t query_workspace_peak_bytes = 0;
+  bool workspace_budget_exceeded = false;
+  bool workspace_degraded = false;
+  std::size_t effective_search_width = 0;
+  std::size_t effective_beam_width = 0;
+  std::size_t effective_rerank_topk = 0;
+  std::size_t effective_prefetch_top_k = 0;
+  std::size_t effective_prefetch_max_inflight = 0;
+  std::size_t workspace_prefetch_degrade_count = 0;
+  std::size_t workspace_rerank_degrade_count = 0;
+  std::size_t workspace_search_degrade_count = 0;
+  std::size_t workspace_candidate_pool_degrade_count = 0;
+  std::size_t requested_search_list_size = 0;
+  std::size_t requested_max_search_list_size = 0;
+  std::size_t requested_candidate_hot_size = 0;
+  std::size_t effective_search_list_size = 0;
+  std::size_t effective_max_search_list_size = 0;
+  std::size_t effective_candidate_hot_size = 0;
+  std::size_t candidate_pool_peak_size = 0;
+  std::size_t candidate_staging_peak_size = 0;
+  std::size_t candidate_admitted_count = 0;
+  std::size_t candidate_replacement_count = 0;
+  std::size_t candidate_rejected_count = 0;
+  std::size_t candidate_logical_l_growth_count = 0;
+  std::size_t candidate_final_logical_l = 0;
+  std::size_t candidate_terminated_by_convergence = 0;
+  std::size_t candidate_terminated_by_exhaustion = 0;
+  std::size_t candidate_terminated_by_budget = 0;
 };
 
 struct DiskGraphSearchResult {
@@ -246,7 +278,7 @@ class PackedDiskGraphIndex {
   };
 
   struct CacheEntry {
-    DecodedPage page;
+    std::shared_ptr<DecodedPage> page;
     std::uint32_t prev = std::numeric_limits<std::uint32_t>::max();
     std::uint32_t next = std::numeric_limits<std::uint32_t>::max();
     std::uint16_t pin_count = 0;
@@ -266,12 +298,12 @@ class PackedDiskGraphIndex {
   DecodedPage read_page(std::uint32_t page_id, DiskGraphSearchStats& stats);
   DecodedPage decode_page(std::uint32_t page_id,
                           std::vector<char> page) const;
-  const DecodedPage& load_page(std::uint32_t page_id,
-                               DiskGraphSearchStats& stats);
-  const DecodedPage* lookup_cached_page(std::uint32_t page_id,
-                                        DiskGraphSearchStats& stats);
-  const DecodedPage& store_cached_page(DecodedPage page,
-                                       DiskGraphSearchStats& stats);
+  std::shared_ptr<const DecodedPage> load_page(
+      std::uint32_t page_id, DiskGraphSearchStats& stats);
+  std::shared_ptr<const DecodedPage> lookup_cached_page(
+      std::uint32_t page_id, DiskGraphSearchStats& stats);
+  std::shared_ptr<const DecodedPage> store_cached_page(
+      DecodedPage page, DiskGraphSearchStats& stats);
   bool cache_enabled() const;
   bool evict_one_page(DiskGraphSearchStats* stats);
   bool evict_one_page_locked(DiskGraphSearchStats* stats);
@@ -321,7 +353,6 @@ class PackedDiskGraphIndex {
   bool cache_protect_hot_pages_ = false;
   std::size_t cache_hot_degree_threshold_ = 0;
   std::vector<CacheEntry> cache_frames_;
-  std::vector<char> cache_page_slab_;
   std::vector<std::uint32_t> cache_free_frames_;
   std::unordered_map<GraphPageIdentity, std::uint32_t,
                      GraphPageIdentityHash> page_cache_;
@@ -331,12 +362,11 @@ class PackedDiskGraphIndex {
   std::size_t ghost_cursor_ = 0;
   std::size_t probationary_target_ = 0;
   std::size_t hub_target_ = 0;
-  DecodedPage scratch_page_;
   std::vector<std::uint32_t> node_in_degrees_;
   bool node_in_degrees_ready_ = false;
   std::vector<std::uint8_t> page_hot_classes_;
   mutable std::mutex cache_mutex_;
-  mutable std::mutex search_mutex_;
+  mutable std::shared_mutex runtime_mutex_;
   PrefetchAdaptiveController prefetch_controller_;
 };
 

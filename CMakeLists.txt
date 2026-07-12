@@ -41,6 +41,7 @@ set(AGENT_AWARE_LIBRARY_SOURCES
   src/core/pq_encoder.cpp
   src/core/prefetch_adaptive_controller.cpp
   src/core/query_page_session.cpp
+  src/core/reader_context.cpp
   src/data/dataset.cpp
   src/dynamic/compaction.cpp
   src/dynamic/dynamic_write_manager.cpp
@@ -116,9 +117,15 @@ if(BUILD_TESTING)
                         PRIVATE agent_aware::agent_aware)
   add_test(NAME dynamic_write_concurrency
            COMMAND dynamic_write_concurrency_test)
+  add_executable(compact_memtable_test tests/compact_memtable.cpp)
+  target_link_libraries(compact_memtable_test PRIVATE agent_aware::agent_aware)
+  add_test(NAME compact_memtable COMMAND compact_memtable_test)
   add_executable(packed_layout_v3_test tests/packed_layout_v3.cpp)
   target_link_libraries(packed_layout_v3_test PRIVATE agent_aware::agent_aware)
   add_test(NAME packed_layout_v3 COMMAND packed_layout_v3_test)
+  add_executable(top_l_candidate_pool_test tests/top_l_candidate_pool.cpp)
+  target_link_libraries(top_l_candidate_pool_test PRIVATE agent_aware::agent_aware)
+  add_test(NAME top_l_candidate_pool COMMAND top_l_candidate_pool_test)
   add_executable(packed_generation_test tests/packed_generation.cpp)
   target_link_libraries(packed_generation_test PRIVATE agent_aware::agent_aware)
   add_test(NAME packed_generation COMMAND packed_generation_test)

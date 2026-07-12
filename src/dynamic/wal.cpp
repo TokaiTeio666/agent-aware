@@ -68,11 +68,10 @@ bool read_value(std::ifstream& input, T& value) {
   return static_cast<bool>(input);
 }
 
-bool encode_record(const DynamicRecord& record, std::vector<char>& output) {
+bool encode_record(const MaterializedRecord& record, std::vector<char>& output) {
   if (record.dim != record.vector.size() ||
       record.vector.size() > std::numeric_limits<std::uint32_t>::max() /
-                                 sizeof(float) ||
-      record.neighbors.size() > std::numeric_limits<std::uint32_t>::max()) {
+                                 sizeof(float)) {
     return false;
   }
 
@@ -82,9 +81,9 @@ bool encode_record(const DynamicRecord& record, std::vector<char>& output) {
   header.dim = record.dim;
   header.vector_bytes =
       static_cast<std::uint32_t>(record.vector.size() * sizeof(float));
-  header.neighbor_count = static_cast<std::uint32_t>(record.neighbors.size());
+  header.neighbor_count = 0;
   header.deleted = record.deleted ? 1 : 0;
-  header.payload_checksum = checksum_payload(record.vector, record.neighbors);
+  header.payload_checksum = checksum_payload(record.vector, {});
 
   append_value(output, header.magic);
   append_value(output, header.version);
@@ -99,11 +98,6 @@ bool encode_record(const DynamicRecord& record, std::vector<char>& output) {
   if (!record.vector.empty()) {
     const auto* begin = reinterpret_cast<const char*>(record.vector.data());
     output.insert(output.end(), begin, begin + header.vector_bytes);
-  }
-  if (!record.neighbors.empty()) {
-    const auto* begin = reinterpret_cast<const char*>(record.neighbors.data());
-    output.insert(output.end(), begin,
-                  begin + record.neighbors.size() * sizeof(NodeId));
   }
   return true;
 }
@@ -180,16 +174,16 @@ WalWriter::WalWriter(const std::filesystem::path& path,
 
 WalWriter::~WalWriter() { (void)close(); }
 
-bool WalWriter::append(const DynamicRecord& record) {
-  return append_batch(std::vector<DynamicRecord>{record});
+bool WalWriter::append(const MaterializedRecord& record) {
+  return append_batch(std::vector<MaterializedRecord>{record});
 }
 
-bool WalWriter::append_batch(const std::vector<DynamicRecord>& records) {
+bool WalWriter::append_batch(const std::vector<MaterializedRecord>& records) {
   std::vector<DynamicLocator> ignored;
   return append_batch(records, ignored);
 }
 
-bool WalWriter::append_batch(const std::vector<DynamicRecord>& records,
+bool WalWriter::append_batch(const std::vector<MaterializedRecord>& records,
                              std::vector<DynamicLocator>& locators) {
   if (closed_ || fd_ < 0) {
     return false;
@@ -249,8 +243,8 @@ bool WalWriter::valid() const { return !closed_ && fd_ >= 0; }
 
 WalReader::WalReader(const std::filesystem::path& path) : path_(path) {}
 
-std::vector<DynamicRecord> WalReader::replay() {
-  std::vector<DynamicRecord> records;
+std::vector<MaterializedRecord> WalReader::replay() {
+  std::vector<MaterializedRecord> records;
   std::ifstream input(path_, std::ios::binary);
   if (!input) {
     return records;
@@ -266,13 +260,13 @@ std::vector<DynamicRecord> WalReader::replay() {
       break;
     }
 
-    DynamicRecord record;
+    MaterializedRecord record;
     record.sequence_id = header.sequence_id;
     record.node_id = static_cast<NodeId>(header.node_id);
     record.dim = header.dim;
     record.deleted = header.deleted != 0;
     record.vector.resize(header.dim);
-    record.neighbors.resize(header.neighbor_count);
+    std::vector<NodeId> legacy_neighbors(header.neighbor_count);
 
     if (header.vector_bytes > 0) {
       input.read(reinterpret_cast<char*>(record.vector.data()),
@@ -282,13 +276,13 @@ std::vector<DynamicRecord> WalReader::replay() {
       }
     }
     if (header.neighbor_count > 0) {
-      input.read(reinterpret_cast<char*>(record.neighbors.data()),
-                 record.neighbors.size() * sizeof(NodeId));
+      input.read(reinterpret_cast<char*>(legacy_neighbors.data()),
+                 legacy_neighbors.size() * sizeof(NodeId));
       if (!input) {
         break;
       }
     }
-    if (checksum_payload(record.vector, record.neighbors) !=
+    if (checksum_payload(record.vector, legacy_neighbors) !=
         header.payload_checksum) {
       break;
     }
@@ -302,7 +296,7 @@ std::vector<DynamicRecord> WalReader::replay() {
 }
 
 bool WalReader::read_at(const DynamicLocator& locator,
-                        DynamicRecord& out) const {
+                        MaterializedRecord& out) const {
   if (locator.kind != DynamicStorageKind::kWal) return false;
   std::ifstream input(path_, std::ios::binary);
   if (!input) return false;
@@ -313,22 +307,22 @@ bool WalReader::read_at(const DynamicLocator& locator,
       !node_id_fits(static_cast<NodeId>(header.node_id), header.node_id)) {
     return false;
   }
-  DynamicRecord record;
+  MaterializedRecord record;
   record.sequence_id = header.sequence_id;
   record.node_id = static_cast<NodeId>(header.node_id);
   record.dim = header.dim;
   record.deleted = header.deleted != 0;
   record.vector.resize(header.dim);
-  record.neighbors.resize(header.neighbor_count);
+  std::vector<NodeId> legacy_neighbors(header.neighbor_count);
   if (header.vector_bytes > 0) {
     input.read(reinterpret_cast<char*>(record.vector.data()),
                header.vector_bytes);
   }
   if (header.neighbor_count > 0) {
-    input.read(reinterpret_cast<char*>(record.neighbors.data()),
-               record.neighbors.size() * sizeof(NodeId));
+    input.read(reinterpret_cast<char*>(legacy_neighbors.data()),
+               legacy_neighbors.size() * sizeof(NodeId));
   }
-  if (!input || checksum_payload(record.vector, record.neighbors) !=
+  if (!input || checksum_payload(record.vector, legacy_neighbors) !=
                     header.payload_checksum) {
     return false;
   }

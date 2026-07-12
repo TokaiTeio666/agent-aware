@@ -69,6 +69,17 @@ struct PackedGraphEngineConfig {
   std::uint64_t graph_merge_persisted_bytes = 64ULL * 1024ULL * 1024ULL;
   double graph_merge_delete_ratio = 0.05;
   std::size_t graph_merge_interval_ms = 300000;
+  std::shared_ptr<class SharedPackedGraphRuntime> shared_runtime;
+};
+
+class SharedPackedGraphRuntime {
+ public:
+  explicit SharedPackedGraphRuntime(const PackedGraphEngineConfig& config);
+  PackedDiskGraphIndex& index() { return *index_; }
+  const PackedDiskGraphIndex& index() const { return *index_; }
+
+ private:
+  std::shared_ptr<PackedDiskGraphIndex> index_;
 };
 
 class PackedGraphEngine final : public StorageEngine {
@@ -105,24 +116,26 @@ class PackedGraphEngine final : public StorageEngine {
   std::uint64_t base_sequence() const;
 
   const DiskGraphMetadata& metadata() const {
-    return index_.metadata();
+    return index().metadata();
   }
 
   const DiskGraphIoStatus& io_status() const {
-    return index_.io_status();
+    return index().io_status();
   }
   std::size_t cache_capacity_pages() const {
-    return index_.cache_capacity_pages();
+    return index().cache_capacity_pages();
   }
   std::size_t cache_resident_pages() const {
-    return index_.cache_resident_pages();
+    return index().cache_resident_pages();
   }
-  const PqAdcModel& pq_model() const { return index_.pq_model(); }
+  const PqAdcModel& pq_model() const { return index().pq_model(); }
 
  private:
   void merge_loop();
+  PackedDiskGraphIndex& index() { return runtime_->index(); }
+  const PackedDiskGraphIndex& index() const { return runtime_->index(); }
   PackedGraphEngineConfig config_;
-  PackedDiskGraphIndex index_;
+  std::shared_ptr<SharedPackedGraphRuntime> runtime_;
   std::shared_ptr<const PackedGraphGeneration> generation_;
   mutable std::mutex config_mutex_;
   mutable std::mutex merge_mutex_;

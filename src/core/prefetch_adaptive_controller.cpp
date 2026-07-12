@@ -9,6 +9,7 @@ namespace agent_aware {
 PrefetchAdaptiveController::Decision PrefetchAdaptiveController::decide(
     const std::string& trigger, bool enabled, std::size_t configured_top_k,
     DiskGraphSearchStats& stats) {
+  std::lock_guard<std::mutex> lock(mutex_);
   Decision decision;
   decision.top_k = configured_top_k;
   if (!enabled || configured_top_k == 0) {
@@ -34,6 +35,7 @@ PrefetchAdaptiveController::Decision PrefetchAdaptiveController::decide(
 void PrefetchAdaptiveController::record_feedback(
     const std::string& trigger, bool enabled, const std::string& outcome,
     double io_latency_us, DiskGraphSearchStats& stats) {
+  std::lock_guard<std::mutex> lock(mutex_);
   (void)io_latency_us;
   if (!enabled) return;
   auto& bucket = buckets_[trigger];

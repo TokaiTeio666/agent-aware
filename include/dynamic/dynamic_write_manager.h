@@ -18,7 +18,7 @@
 #include "core/types.h"
 #include "core/memory_budget.h"
 #include "core/pq_encoder.h"
-#include "dynamic/dynamic_record.h"
+#include "dynamic/dynamic_types.h"
 #include "dynamic/manifest.h"
 #include "dynamic/memtable.h"
 #include "dynamic/sstable.h"
@@ -29,19 +29,16 @@ namespace agent_aware::dynamic {
 struct DynamicWriteOptions {
   std::filesystem::path dynamic_dir;
   std::size_t memtable_flush_bytes = 64ULL * 1024ULL * 1024ULL;
-  std::size_t dynamic_graph_degree = 16;
   std::size_t write_queue_capacity = 4096;
   std::size_t wal_group_max_records = 64;
   std::size_t wal_group_max_delay_us = 1000;
   std::size_t version_index_shards = 64;
-  std::size_t neighbor_candidate_limit = 1024;
   std::size_t memtable_flush_records = 4096;
   std::size_t delta_candidate_top_l = 64;
   std::uint64_t delta_soft_limit_bytes = 5ULL * 1024ULL * 1024ULL;
   std::uint64_t delta_high_limit_bytes = 6ULL * 1024ULL * 1024ULL;
   std::uint64_t delta_hard_limit_bytes = 7ULL * 1024ULL * 1024ULL;
   std::shared_ptr<const PQEncoder> pq_model;
-  bool enable_wal = true;
   bool enable_auto_flush = true;
   bool enable_background_flush = true;
 };
@@ -53,7 +50,6 @@ struct DynamicWriteStats {
   std::uint64_t batches = 0;
   std::uint64_t batch_records = 0;
   std::uint64_t queue_wait_ns = 0;
-  std::uint64_t neighbor_prepare_ns = 0;
   std::uint64_t wal_append_ns = 0;
   std::uint64_t wal_sync_ns = 0;
   std::uint64_t memtable_apply_ns = 0;
@@ -66,7 +62,7 @@ struct DynamicWriteStats {
 
 struct DynamicSnapshot {
   std::uint64_t read_sequence = 0;
-  std::vector<DynamicRecord> records;
+  std::vector<MaterializedRecord> records;
   std::size_t deleted_count = 0;
 };
 
@@ -106,16 +102,16 @@ class DynamicWriteManager {
 
   std::uint64_t current_sequence() const;
   DynamicWriteStats write_stats() const;
-  std::unordered_map<NodeId, DynamicRecord> latest_records_for(
+  std::unordered_map<NodeId, MaterializedRecord> latest_records_for(
       const std::vector<NodeId>& node_ids, std::uint64_t read_sequence,
       bool include_deleted = true) const;
   DynamicSnapshot snapshot(std::uint64_t read_sequence) const;
 
-  std::vector<DynamicRecord> collect_all_delta_records() const;
-  std::vector<DynamicRecord> collect_all_delta_records_at(
+  std::vector<MaterializedRecord> collect_all_delta_records() const;
+  std::vector<MaterializedRecord> collect_all_delta_records_at(
       std::uint64_t read_sequence) const;
 
-  std::vector<DynamicRecord> search_delta_l2_at(
+  std::vector<MaterializedRecord> search_delta_pq_at(
       const float* query, std::uint32_t dim, std::size_t topk,
       std::uint64_t read_sequence,
       std::uint64_t exclusive_lower_sequence = 0,
@@ -136,7 +132,7 @@ class DynamicWriteManager {
 
   struct WriteRequest {
     RequestKind kind = RequestKind::mutation;
-    DynamicRecord record;
+    WritePayload payload;
     std::chrono::steady_clock::time_point submitted_at;
     mutable std::mutex mutex;
     std::condition_variable condition;
@@ -145,47 +141,37 @@ class DynamicWriteManager {
   };
 
   struct VersionShard {
-    struct Version {
-      std::uint64_t sequence_id = 0;
-      DynamicLocator locator;
-      std::vector<std::uint8_t> pq_code;
-      std::vector<float> volatile_vector;
-      std::uint32_t dim = 0;
-      bool deleted = false;
-    };
+    using Version = CompactDeltaVersion;
     mutable std::shared_mutex mutex;
     std::unordered_map<NodeId, std::vector<Version>> versions;
   };
 
   struct FlushTask {
-    std::vector<DynamicRecord> records;
+    std::unique_ptr<MemTable> table;
     std::uint64_t max_sequence = 0;
     std::uint64_t wal_segment_id = 0;
     std::shared_ptr<WriteRequest> waiter;
   };
 
-  bool submit_record(DynamicRecord record);
+  bool submit_record(WritePayload payload);
   bool submit_control(RequestKind kind);
   void commit_loop();
   void flush_loop();
   bool commit_batch(const std::vector<std::shared_ptr<WriteRequest>>& batch);
   bool rotate_memtable_locked(std::shared_ptr<WriteRequest> waiter = nullptr);
   bool flush_task(const FlushTask& task);
-  void apply_records(const std::vector<DynamicRecord>& records,
+  void apply_records(const std::vector<MaterializedRecord>& records,
                      bool pre_reserved = false);
-  std::uint64_t estimate_version_bytes(const DynamicRecord& record) const;
-  void redirect_records(const std::vector<DynamicRecord>& records);
+  std::uint64_t estimate_version_bytes(const MaterializedRecord& record) const;
+  void redirect_records(const std::vector<MaterializedRecord>& records);
   bool materialize(NodeId node_id, const VersionShard::Version& version,
-                   DynamicRecord& out) const;
+                   MaterializedRecord& out) const;
   void complete_request(const std::shared_ptr<WriteRequest>& request,
                         bool success);
   void fail_pending_requests();
   void set_failed();
   std::shared_ptr<VersionShard> shard_for(NodeId node_id) const;
-  std::vector<NodeId> select_incremental_neighbors(
-      NodeId node_id, const float* vector, std::uint32_t dim,
-      std::uint64_t read_sequence) const;
-  std::vector<DynamicRecord> collect_all_delta_records_at_internal(
+  std::vector<MaterializedRecord> collect_all_delta_records_at_internal(
       std::uint64_t read_sequence) const;
   std::filesystem::path manifest_path() const;
   std::filesystem::path wal_dir() const;
@@ -234,7 +220,6 @@ class DynamicWriteManager {
   std::atomic<std::uint64_t> stat_batches_{0};
   std::atomic<std::uint64_t> stat_batch_records_{0};
   std::atomic<std::uint64_t> stat_queue_wait_ns_{0};
-  std::atomic<std::uint64_t> stat_neighbor_prepare_ns_{0};
   std::atomic<std::uint64_t> stat_wal_append_ns_{0};
   std::atomic<std::uint64_t> stat_wal_sync_ns_{0};
   std::atomic<std::uint64_t> stat_memtable_apply_ns_{0};
@@ -245,9 +230,9 @@ class DynamicWriteManager {
   std::atomic<std::uint64_t> stat_flush_queue_high_watermark_{0};
 };
 
-std::vector<SearchResult> merge_base_and_delta_l2(
+std::vector<SearchResult> merge_base_and_delta_candidates(
     const std::vector<SearchResult>& base_results,
-    const std::vector<DynamicRecord>& delta_records, const float* query,
+    const std::vector<MaterializedRecord>& delta_records, const float* query,
     std::uint32_t dim, std::size_t topk);
 
 }  // namespace agent_aware::dynamic
