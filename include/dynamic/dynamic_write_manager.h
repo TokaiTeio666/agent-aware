@@ -8,6 +8,7 @@
 #include <deque>
 #include <filesystem>
 #include <memory>
+#include <limits>
 #include <mutex>
 #include <shared_mutex>
 #include <thread>
@@ -15,6 +16,8 @@
 #include <vector>
 
 #include "core/types.h"
+#include "core/memory_budget.h"
+#include "core/pq_encoder.h"
 #include "dynamic/dynamic_record.h"
 #include "dynamic/manifest.h"
 #include "dynamic/memtable.h"
@@ -32,6 +35,12 @@ struct DynamicWriteOptions {
   std::size_t wal_group_max_delay_us = 1000;
   std::size_t version_index_shards = 64;
   std::size_t neighbor_candidate_limit = 1024;
+  std::size_t memtable_flush_records = 4096;
+  std::size_t delta_candidate_top_l = 64;
+  std::uint64_t delta_soft_limit_bytes = 5ULL * 1024ULL * 1024ULL;
+  std::uint64_t delta_high_limit_bytes = 6ULL * 1024ULL * 1024ULL;
+  std::uint64_t delta_hard_limit_bytes = 7ULL * 1024ULL * 1024ULL;
+  std::shared_ptr<const PQEncoder> pq_model;
   bool enable_wal = true;
   bool enable_auto_flush = true;
   bool enable_background_flush = true;
@@ -59,6 +68,20 @@ struct DynamicSnapshot {
   std::uint64_t read_sequence = 0;
   std::vector<DynamicRecord> records;
   std::size_t deleted_count = 0;
+};
+
+struct DeltaSearchStats {
+  std::size_t visible_versions = 0;
+  std::size_t pq_scanned = 0;
+  std::size_t candidates_reranked = 0;
+  std::size_t vector_reads = 0;
+  std::uint64_t bytes_read = 0;
+};
+
+struct DynamicVisibleStats {
+  std::size_t unique_records = 0;
+  std::size_t deleted_records = 0;
+  std::uint64_t persisted_logical_bytes = 0;
 };
 
 struct DynamicCompactionStats {
@@ -94,9 +117,17 @@ class DynamicWriteManager {
 
   std::vector<DynamicRecord> search_delta_l2_at(
       const float* query, std::uint32_t dim, std::size_t topk,
-      std::uint64_t read_sequence) const;
+      std::uint64_t read_sequence,
+      std::uint64_t exclusive_lower_sequence = 0,
+      DeltaSearchStats* stats = nullptr) const;
+
+  MemoryBudgetSnapshot memory_budget_snapshot() const;
+  DynamicVisibleStats visible_stats(
+      std::uint64_t exclusive_lower_sequence = 0,
+      std::uint64_t read_sequence = std::numeric_limits<std::uint64_t>::max()) const;
 
   bool compact_once(DynamicCompactionStats* stats = nullptr);
+  std::uint64_t checkpoint_versions(std::uint64_t incorporated_sequence);
 
   bool close();
 
@@ -114,8 +145,16 @@ class DynamicWriteManager {
   };
 
   struct VersionShard {
+    struct Version {
+      std::uint64_t sequence_id = 0;
+      DynamicLocator locator;
+      std::vector<std::uint8_t> pq_code;
+      std::vector<float> volatile_vector;
+      std::uint32_t dim = 0;
+      bool deleted = false;
+    };
     mutable std::shared_mutex mutex;
-    std::unordered_map<NodeId, std::vector<DynamicRecord>> versions;
+    std::unordered_map<NodeId, std::vector<Version>> versions;
   };
 
   struct FlushTask {
@@ -132,7 +171,12 @@ class DynamicWriteManager {
   bool commit_batch(const std::vector<std::shared_ptr<WriteRequest>>& batch);
   bool rotate_memtable_locked(std::shared_ptr<WriteRequest> waiter = nullptr);
   bool flush_task(const FlushTask& task);
-  void apply_records(const std::vector<DynamicRecord>& records);
+  void apply_records(const std::vector<DynamicRecord>& records,
+                     bool pre_reserved = false);
+  std::uint64_t estimate_version_bytes(const DynamicRecord& record) const;
+  void redirect_records(const std::vector<DynamicRecord>& records);
+  bool materialize(NodeId node_id, const VersionShard::Version& version,
+                   DynamicRecord& out) const;
   void complete_request(const std::shared_ptr<WriteRequest>& request,
                         bool success);
   void fail_pending_requests();
@@ -150,6 +194,7 @@ class DynamicWriteManager {
   std::filesystem::path sstable_dir() const;
 
   DynamicWriteOptions options_;
+  MemoryBudget memory_budget_;
   mutable std::mutex lifecycle_mutex_;
   mutable std::mutex metadata_mutex_;
   ManifestData manifest_;
@@ -172,7 +217,9 @@ class DynamicWriteManager {
 
   std::mutex flush_queue_mutex_;
   std::condition_variable flush_queue_condition_;
+  std::condition_variable flush_queue_space_condition_;
   std::deque<FlushTask> flush_queue_;
+  std::atomic<std::uint64_t> frozen_resident_bytes_{0};
   bool flush_stop_ = false;
 
   std::thread commit_thread_;

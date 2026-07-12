@@ -3,7 +3,7 @@ export type WriteMode = 'INSERT' | 'UPDATE';
 
 export interface VectorStoreOpenConfig {
   baseIndexPath: string;
-  pqModelPath: string;
+  pqModelPath?: string;
   dynamicDir: string;
   expectedDimension?: number;
   cachePolicy?: 'none' | 'lru' | '2q' | 'graph-aware-2q';
@@ -18,6 +18,18 @@ export interface VectorStoreOpenConfig {
   prefetchPolicy?: 'none' | 'pq';
   prefetchSubmitTopK?: number;
   prefetchMaxInflight?: number;
+  deltaSoftLimitBytes?: number;
+  deltaHighLimitBytes?: number;
+  deltaHardLimitBytes?: number;
+  memtableFlushRecords?: number;
+  memtableFlushBytes?: number;
+  deltaCandidateTopL?: number;
+  enableAutoGraphMerge?: boolean;
+  graphMergeRecords?: number;
+  graphMergePersistedBytes?: number;
+  graphMergeDeleteRatio?: number;
+  graphMergeIntervalMs?: number;
+  graphMergeMaxSegments?: number;
 }
 
 export interface NativeEngineInfo {
@@ -40,6 +52,15 @@ export interface NativeEngineInfo {
 export interface NativeSearchStats {
   usedGraphPath: boolean;
   dynamicReadSequence: number;
+  baseGeneration: number;
+  baseSequence: number;
+  totalGraphMerges: number;
+  failedGraphMerges: number;
+  deltaVisibleVersions: number;
+  deltaPqScanned: number;
+  deltaCandidatesReranked: number;
+  deltaVectorReads: number;
+  deltaBytesRead: number;
   nodeReads: number;
   expanded: number;
   visited: number;
@@ -74,12 +95,29 @@ export interface NativeEngineMetrics {
   cacheCapacityPages: number;
   cacheResidentPages: number;
   memoryBudgetBytes: number;
+  deltaControlledBytes: number;
+  baseGraphCacheBytes: number;
+  mergeWorkspaceBytes: number;
+  baseGeneration: number;
+  baseSequence: number;
   totalSearches: number;
   totalWrites: number;
   totalDeletes: number;
   totalFlushes: number;
   totalIoErrors: number;
   aggregate: Record<string, number>;
+}
+
+export interface NativeMergeStatus {
+  phase: 'IDLE' | 'SNAPSHOT' | 'WRITING' | 'PUBLISHING' | 'COMPLETE' | 'FAILED' | 'CANCELLED';
+  generation: number;
+  fromSequence: number;
+  toSequence: number;
+  processedRecords: number;
+  reclaimedBytes: number;
+  workspaceBytes: number;
+  error: string;
+  cancellable: boolean;
 }
 
 export interface MemHarmonyError extends Error {
@@ -97,6 +135,9 @@ declare const agentAwareNative: {
   deleteVector(id: number): Promise<void>;
   setResourceProfile(profile: ResourceProfile): Promise<void>;
   flush(): Promise<void>;
+  triggerMerge(): Promise<void>;
+  getMergeStatus(): Promise<NativeMergeStatus>;
+  cancelMerge(): Promise<void>;
   getMetrics(): Promise<NativeEngineMetrics>;
   close(): Promise<void>;
 };

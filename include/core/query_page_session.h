@@ -13,7 +13,11 @@ namespace agent_aware {
 class QueryPageSession {
  public:
   using Page = PackedDiskGraphIndex::DecodedPage;
-  using Node = PackedDiskGraphIndex::DiskNode;
+  struct Node {
+    std::uint32_t id = 0;
+    std::vector<std::uint32_t> neighbors;
+    std::vector<float> vector;
+  };
 
   QueryPageSession(PackedDiskGraphIndex& index,
                    const DiskGraphSearchConfig& config,
@@ -23,7 +27,8 @@ class QueryPageSession {
   ~QueryPageSession();
 
   const Page& get_or_load_page(std::uint32_t page_id);
-  const Node& get_node(std::uint32_t node_id, bool count_same_page_reuse);
+  const Node& get_node(std::uint32_t node_id, bool count_same_page_reuse,
+                       bool require_vector = false);
   std::vector<std::uint32_t> collect_missing_pages(
       const std::vector<std::uint32_t>& page_ids) const;
   void ensure_pages_loaded_batch(const std::vector<std::uint32_t>& page_ids);
@@ -37,6 +42,7 @@ class QueryPageSession {
   std::uint32_t page_for_node(std::uint32_t node_id) const;
   bool page_available(std::uint32_t page_id) const;
   bool pin_page(std::uint32_t page_id);
+  void unpin_page(std::uint32_t page_id);
   void unpin_all();
   void finish_query();
 

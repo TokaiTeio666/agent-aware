@@ -69,6 +69,18 @@ struct HarmonyEngineConfig {
   std::string prefetch_policy = "pq";
   std::size_t prefetch_submit_top_k = 4;
   std::size_t prefetch_max_inflight = 8;
+  std::uint64_t delta_soft_limit_bytes = 5ULL * 1024ULL * 1024ULL;
+  std::uint64_t delta_high_limit_bytes = 6ULL * 1024ULL * 1024ULL;
+  std::uint64_t delta_hard_limit_bytes = 7ULL * 1024ULL * 1024ULL;
+  std::size_t memtable_flush_records = 4096;
+  std::size_t memtable_flush_bytes = 512ULL * 1024ULL;
+  std::size_t delta_candidate_top_l = 64;
+  bool enable_auto_graph_merge = true;
+  std::size_t graph_merge_records = 10000;
+  std::uint64_t graph_merge_persisted_bytes = 64ULL * 1024ULL * 1024ULL;
+  double graph_merge_delete_ratio = 0.05;
+  std::size_t graph_merge_interval_ms = 300000;
+  std::size_t graph_merge_max_segments = 8;
 };
 
 struct NativeEngineInfo {
@@ -100,6 +112,13 @@ struct EngineMetricsSnapshot {
   std::size_t cache_capacity_pages = 0;
   std::size_t cache_resident_pages = 0;
   std::size_t memory_budget_bytes = 0;
+  std::uint64_t delta_controlled_bytes = 0;
+  std::uint64_t base_graph_cache_bytes = 0;
+  std::uint64_t merge_workspace_bytes = 0;
+  std::uint64_t base_generation = 0;
+  std::uint64_t base_sequence = 0;
+  std::uint64_t total_graph_merges = 0;
+  std::uint64_t failed_graph_merges = 0;
 };
 
 class HarmonyEngineFacade {
@@ -115,6 +134,9 @@ class HarmonyEngineFacade {
   Status erase(std::uint32_t id);
   Status set_resource_profile(ResourceProfile profile);
   Status flush();
+  Status trigger_merge();
+  StatusOr<PackedGraphEngine::MergeStatus> merge_status() const;
+  Status cancel_merge();
   StatusOr<EngineMetricsSnapshot> metrics() const;
   Status close();
 

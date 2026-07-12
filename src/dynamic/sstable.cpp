@@ -8,6 +8,7 @@
 #include <limits>
 #include <sstream>
 #include <string>
+#include <unordered_map>
 
 namespace agent_aware::dynamic {
 namespace {
@@ -454,8 +455,13 @@ bool SSTableReader::open() {
         node_id > std::numeric_limits<NodeId>::max()) {
       return false;
     }
-    index_[static_cast<NodeId>(node_id)] = IndexEntry{sequence_id, offset};
+    index_.push_back(IndexEntry{static_cast<NodeId>(node_id), sequence_id,
+                                offset});
   }
+  std::sort(index_.begin(), index_.end(),
+            [](const IndexEntry& lhs, const IndexEntry& rhs) {
+              return lhs.node_id < rhs.node_id;
+            });
 
   std::ifstream data_input(data_path_, std::ios::binary);
   if (!data_input) {
@@ -470,14 +476,16 @@ bool SSTableReader::get(NodeId node_id, DynamicRecord& out) const {
   if (!opened_) {
     return false;
   }
-  const auto found = index_.find(node_id);
-  if (found == index_.end()) {
+  const auto found = std::lower_bound(
+      index_.begin(), index_.end(), node_id,
+      [](const IndexEntry& entry, NodeId id) { return entry.node_id < id; });
+  if (found == index_.end() || found->node_id != node_id) {
     return false;
   }
   DynamicRecord record;
-  if (!read_record_at(data_path_, found->second.offset, record) ||
+  if (!read_record_at(data_path_, found->offset, record) ||
       record.node_id != node_id ||
-      record.sequence_id != found->second.sequence_id) {
+      record.sequence_id != found->sequence_id) {
     return false;
   }
   out = std::move(record);
@@ -492,7 +500,7 @@ std::vector<DynamicRecord> SSTableReader::scan_all() const {
   records.reserve(index_.size());
   for (const auto& item : index_) {
     DynamicRecord record;
-    if (get(item.first, record)) {
+    if (get(item.node_id, record)) {
       records.push_back(std::move(record));
     }
   }
@@ -501,6 +509,36 @@ std::vector<DynamicRecord> SSTableReader::scan_all() const {
               return lhs.node_id < rhs.node_id;
             });
   return records;
+}
+
+bool SSTableReader::read_at(const DynamicLocator& locator,
+                            DynamicRecord& out) const {
+  if (!opened_ || locator.kind != DynamicStorageKind::kSSTable ||
+      locator.file_id != id_) {
+    return false;
+  }
+  if (!read_record_at(data_path_, locator.offset, out)) return false;
+  out.locator = locator;
+  return true;
+}
+
+std::vector<std::pair<DynamicRecord, DynamicLocator>>
+SSTableReader::scan_all_located() const {
+  std::vector<std::pair<DynamicRecord, DynamicLocator>> output;
+  if (!opened_) return output;
+  output.reserve(index_.size());
+  for (const auto& item : index_) {
+    DynamicRecord record;
+    DynamicLocator locator{DynamicStorageKind::kSSTable, id_,
+                           item.offset, 0, 0};
+    if (read_at(locator, record)) {
+      output.emplace_back(std::move(record), locator);
+    }
+  }
+  std::sort(output.begin(), output.end(), [](const auto& lhs, const auto& rhs) {
+    return lhs.first.node_id < rhs.first.node_id;
+  });
+  return output;
 }
 
 std::uint64_t SSTableReader::id() const {

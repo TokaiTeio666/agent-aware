@@ -2,6 +2,7 @@ import agentAwareNative from 'libagentAwareNative.so';
 import type {
   NativeEngineInfo,
   NativeEngineMetrics,
+  NativeMergeStatus,
   NativeSearchResponse,
   ResourceProfile,
   VectorStoreOpenConfig,
@@ -15,6 +16,9 @@ export interface NativeVectorStoreContract {
   deleteVector(id: number): Promise<void>;
   setResourceProfile(profile: ResourceProfile): Promise<void>;
   flush(): Promise<void>;
+  triggerMerge(): Promise<void>;
+  getMergeStatus(): Promise<NativeMergeStatus>;
+  cancelMerge(): Promise<void>;
   getMetrics(): Promise<NativeEngineMetrics>;
   close(): Promise<void>;
 }
@@ -57,6 +61,18 @@ export class NativeVectorStore implements NativeVectorStoreContract {
 
   flush(): Promise<void> {
     return agentAwareNative.flush();
+  }
+
+  triggerMerge(): Promise<void> {
+    return agentAwareNative.triggerMerge();
+  }
+
+  getMergeStatus(): Promise<NativeMergeStatus> {
+    return agentAwareNative.getMergeStatus();
+  }
+
+  cancelMerge(): Promise<void> {
+    return agentAwareNative.cancelMerge();
   }
 
   getMetrics(): Promise<NativeEngineMetrics> {

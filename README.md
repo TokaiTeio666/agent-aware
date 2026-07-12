@@ -207,6 +207,10 @@ cmake --build build -j"$(nproc)"
 ./build/agent-aware-build --sift-dir data/sift --index-path indexes/sift.idx
 ```
 
+V3 packed index 默认内嵌唯一的 PQ model，不再额外生成重复的
+`<index>.pq` 文件。仅旧部署确实需要独立 PQ companion 时，显式传入
+`--pq-path PATH` 导出。
+
 后续复用索引：
 
 ```bash

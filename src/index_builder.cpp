@@ -74,7 +74,7 @@ void help() {
   std::cout << "Usage: agent-aware-build [options]\n"
             << "  --base PATH or --sift-dir PATH\n"
             << "  --synthetic 0|1 --base-limit N --synthetic-dim N\n"
-            << "  --index-path PATH --pq-path PATH --manifest PATH --rebuild 0|1\n"
+            << "  --index-path PATH [--pq-path PATH] --manifest PATH --rebuild 0|1\n"
             << "  --graph-degree N --page-size N\n"
             << "  --pq-subspaces N --pq-centroids N --pq-train-limit N --pq-iterations N\n";
 }
@@ -143,11 +143,14 @@ int main(int argc, char** argv) {
     if (!a.index_path.parent_path().empty()) fs::create_directories(a.index_path.parent_path());
     const auto build_result =
         PackedDiskGraphBuilder::build(base, a.index_path.string(), bc);
-    const fs::path pq_path = a.pq_path.empty()
-                                 ? fs::path(a.index_path.string() + ".pq")
-                                 : a.pq_path;
-    if (!pq_path.parent_path().empty()) fs::create_directories(pq_path.parent_path());
-    pq.write_file(pq_path.string());
+    // V3 packed indexes already contain the PQ model. A companion file is
+    // exported only when explicitly requested for legacy deployments.
+    if (!a.pq_path.empty()) {
+      if (!a.pq_path.parent_path().empty()) {
+        fs::create_directories(a.pq_path.parent_path());
+      }
+      pq.write_file(a.pq_path.string());
+    }
     const fs::path manifest = a.manifest_path.empty() ? fs::path(a.index_path.string() + ".manifest.json") : a.manifest_path;
     PackedDiskGraphIndex index(a.index_path.string());
     write_manifest_atomically(manifest, index.metadata(), build_result.medoid);

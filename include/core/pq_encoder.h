@@ -88,6 +88,8 @@ class PQEncoder {
 
   std::vector<float> build_adc_table(const float* query) const;
   float adc_distance(std::uint32_t id, const std::vector<float>& table) const;
+  float adc_distance_code(const std::uint8_t* code,
+                          const std::vector<float>& table) const;
 
   void write(std::ostream& output) const;
   static PQEncoder read(std::istream& input);

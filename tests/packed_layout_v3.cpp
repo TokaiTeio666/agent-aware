@@ -40,12 +40,12 @@ int main() {
   require(packed_nodes_per_page(128, 32, 4096) == 6,
           "SIFT1M V3 pages must hold six nodes");
 
-  const VectorSet base = make_vectors(17, 8);
+  const VectorSet base = make_vectors(256, 8);
   PqAdcModel model;
   PQTrainingConfig pq;
   pq.subspaces = 4;
   pq.centroids = 4;
-  pq.train_limit = 12;
+  pq.train_limit = 64;
   pq.iterations = 2;
   pq.seed = 7;
   (void)model.train(base, pq);
@@ -78,6 +78,7 @@ int main() {
   require(build_result.medoid == VamanaBuilder(vamana_config).find_medoid(base),
           "packed builder did not expose the Vamana medoid");
 
+  const auto loads_before = PackedDiskGraphIndex::pq_disk_load_count();
   PackedDiskGraphIndex index(index_path.string());
   const auto& metadata = index.metadata();
   require(metadata.format_version == 3, "index is not V3");
@@ -87,8 +88,38 @@ int main() {
           "global PQ codebook size mismatch");
   require(index.pq_model().vector_count() == base.size(),
           "index PQ model vector count mismatch");
+  PackedDiskGraphIndex shared_index(index_path.string());
+  require(&shared_index.pq_model() == &index.pq_model(),
+          "independent index readers did not share the immutable PQ model");
+  require(PackedDiskGraphIndex::pq_disk_load_count() == loads_before + 1,
+          "independent index readers loaded duplicate PQ codes from disk");
   require(metadata.index_bytes == fs::file_size(index_path),
           "reported index size mismatch");
+
+  index.configure_cache("graph-aware-2q", 2, true, 0);
+  DiskGraphSearchConfig search;
+  search.top_k = 4;
+  search.search_width = 128;
+  search.beam_width = 16;
+  search.entry_count = base.size();
+  search.seed_ids.resize(base.size());
+  for (std::uint32_t id = 0; id < base.size(); ++id) search.seed_ids[id] = id;
+  search.rerank_topk = 4;
+  const auto cold = index.search_one(base.row(3), search);
+  require(!cold.topk.empty() && cold.stats.page_cache_misses > 0,
+          "cold graph-aware cache search did not read pages");
+  require(cold.stats.page_cache_evictions > 0,
+          "capacity-two graph-aware cache did not evict a page");
+  require(index.cache_resident_pages() <= 2,
+          "graph-aware cache exceeded its frame capacity");
+  const auto warm = index.search_one(base.row(3), search);
+  require(warm.stats.page_cache_hits > 0,
+          "warm graph-aware cache search did not hit resident pages");
+  require(cold.stats.page_cache_promotions == 0 &&
+              warm.stats.page_cache_promotions == 0,
+          "foreground cache hit maintained a strict 2Q/LRU chain");
+  require(index.cache_resident_pages() <= 2,
+          "graph-aware cache exceeded capacity after CLOCK reuse");
 
   const fs::path v2_path = root / "old-v2.idx";
   {

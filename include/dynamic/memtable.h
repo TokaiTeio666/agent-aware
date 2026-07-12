@@ -18,6 +18,8 @@ class MemTable {
   void clear();
 
   bool should_flush() const;
+  std::size_t resident_bytes() const;
+  std::size_t size() const;
 
  private:
   std::size_t flush_threshold_bytes_ = 0;

@@ -72,7 +72,12 @@ class DiskPageCodec {
       const DiskGraphMetadata& metadata, std::uint32_t page_id,
       std::vector<char> page);
 
-  static const PackedDiskGraphIndex::DiskNode& find_node(
+  static PackedDiskGraphIndex::DiskNode node_at(
+      const DiskGraphMetadata& metadata,
+      const PackedDiskGraphIndex::DecodedPage& page, std::uint32_t slot);
+
+  static PackedDiskGraphIndex::DiskNode find_node(
+      const DiskGraphMetadata& metadata,
       const PackedDiskGraphIndex::DecodedPage& page, std::uint32_t node_id);
 
   static const float* vector_data(

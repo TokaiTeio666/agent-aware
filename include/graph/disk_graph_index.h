@@ -3,6 +3,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <fstream>
+#include <limits>
 #include <memory>
 #include <mutex>
 #include <string>
@@ -25,9 +26,34 @@ struct TopologyPageCandidate {
   std::size_t candidate_count = 0;
 };
 
+struct GraphPageIdentity {
+  std::uint64_t generation_id = 0;
+  std::uint64_t segment_id = 0;
+  std::uint32_t physical_page_id = 0;
+  bool operator==(const GraphPageIdentity& other) const {
+    return generation_id == other.generation_id &&
+           segment_id == other.segment_id &&
+           physical_page_id == other.physical_page_id;
+  }
+};
+
+struct GraphPageIdentityHash {
+  std::size_t operator()(const GraphPageIdentity& key) const {
+    std::size_t value = std::hash<std::uint64_t>{}(key.generation_id);
+    value ^= std::hash<std::uint64_t>{}(key.segment_id) + 0x9e3779b9u +
+             (value << 6u) + (value >> 2u);
+    value ^= std::hash<std::uint32_t>{}(key.physical_page_id) +
+             0x9e3779b9u + (value << 6u) + (value >> 2u);
+    return value;
+  }
+};
+
 std::vector<TopologyPageCandidate> rank_topology_pages(
     const std::vector<std::uint32_t>& ranked_page_ids,
     std::size_t candidate_window);
+
+std::uint64_t estimate_page_cache_bytes(std::size_t page_size,
+                                        std::size_t capacity_pages);
 
 struct DiskGraphBuildConfig {
   std::size_t degree = 32;
@@ -164,7 +190,9 @@ class PackedDiskGraphBuilder {
 
 class PackedDiskGraphIndex {
  public:
-  explicit PackedDiskGraphIndex(const std::string& path);
+  explicit PackedDiskGraphIndex(
+      const std::string& path,
+      std::shared_ptr<const PqAdcModel> shared_pq_model = nullptr);
   ~PackedDiskGraphIndex();
 
   const DiskGraphMetadata& metadata() const {
@@ -179,7 +207,11 @@ class PackedDiskGraphIndex {
                     std::size_t io_depth = 1);
 
   const DiskGraphIoStatus& io_status() const;
-  const PqAdcModel& pq_model() const { return pq_model_; }
+  const PqAdcModel& pq_model() const { return *pq_model_; }
+  const std::shared_ptr<const PqAdcModel>& shared_pq_model() const {
+    return pq_model_;
+  }
+  static std::uint64_t pq_disk_load_count();
   std::size_t cache_capacity_pages() const;
   std::size_t cache_resident_pages() const;
 
@@ -193,24 +225,42 @@ class PackedDiskGraphIndex {
 
   struct DiskNode {
     std::uint32_t id = 0;
-    std::vector<std::uint32_t> neighbors;
-    std::vector<float> vector;
     std::size_t vector_offset = 0;
+    std::size_t neighbor_offset = 0;
+    std::uint32_t neighbor_count = 0;
   };
 
   struct DecodedPage {
     std::uint32_t page_id = 0;
+    std::uint32_t node_count = 0;
     std::vector<char> bytes;
-    std::vector<DiskNode> nodes;
+    const char* frame_data = nullptr;
+    std::size_t frame_size = 0;
+
+    const char* data() const {
+      return frame_data != nullptr ? frame_data : bytes.data();
+    }
+    std::size_t size() const {
+      return frame_data != nullptr ? frame_size : bytes.size();
+    }
   };
 
   struct CacheEntry {
     DecodedPage page;
-    std::uint64_t last_access = 0;
-    std::uint64_t frequency = 0;
-    bool protected_queue = false;
-    std::uint64_t hot_score = 0;
-    std::uint64_t pin_count = 0;
+    std::uint32_t prev = std::numeric_limits<std::uint32_t>::max();
+    std::uint32_t next = std::numeric_limits<std::uint32_t>::max();
+    std::uint16_t pin_count = 0;
+    std::uint8_t queue = 0;
+    std::uint8_t saved_queue = 0;
+    bool occupied = false;
+    bool hot = false;
+    bool referenced = false;
+  };
+
+  struct CacheQueue {
+    std::uint32_t head = std::numeric_limits<std::uint32_t>::max();
+    std::uint32_t tail = std::numeric_limits<std::uint32_t>::max();
+    std::size_t size = 0;
   };
 
   DecodedPage read_page(std::uint32_t page_id, DiskGraphSearchStats& stats);
@@ -225,19 +275,29 @@ class PackedDiskGraphIndex {
   bool cache_enabled() const;
   bool evict_one_page(DiskGraphSearchStats* stats);
   bool evict_one_page_locked(DiskGraphSearchStats* stats);
-  double cache_score(const CacheEntry& entry) const;
   std::uint64_t page_hot_score(const DecodedPage& page) const;
   bool pin_if_cached(std::uint32_t page_id);
   void unpin_if_cached(std::uint32_t page_id);
   void ensure_node_in_degrees();
-  const DiskNode& find_node_in_page(const DecodedPage& page,
-                                    std::uint32_t node_id) const;
+  void ensure_page_hot_scores();
+  DiskNode find_node_in_page(const DecodedPage& page,
+                             std::uint32_t node_id) const;
   const float* vector_data(const DecodedPage& page,
                            const DiskNode& node) const;
+  const std::uint32_t* neighbor_data(const DecodedPage& page,
+                                     const DiskNode& node) const;
   float compute_distance_direct(const float* query, const DecodedPage& page,
                                 const DiskNode& node) const;
   bool is_two_queue_policy() const;
   bool is_graph_aware_cache_policy() const;
+  void reset_cache_locked();
+  void queue_push_front_locked(std::uint8_t queue, std::uint32_t frame);
+  void queue_remove_locked(std::uint32_t frame);
+  void queue_touch_locked(std::uint32_t frame);
+  std::uint32_t queue_victim_locked(std::uint8_t queue) const;
+  std::uint8_t admission_queue_locked(bool hot, bool ghost_hit) const;
+  void remember_ghost_locked(std::uint32_t page_id);
+  bool consume_ghost_locked(std::uint32_t page_id);
   std::unique_ptr<SearchState> initialize_search_state(
       const float* query, const DiskGraphSearchConfig& config,
       DiskGraphSearchResult& output);
@@ -254,17 +314,27 @@ class PackedDiskGraphIndex {
   std::ifstream input_;
   std::unique_ptr<AsyncPageReader> page_reader_;
   DiskGraphMetadata metadata_;
-  PqAdcModel pq_model_;
+  std::shared_ptr<const PqAdcModel> pq_model_;
   std::vector<std::uint32_t> node_to_page_;
   std::string cache_policy_ = "none";
   std::size_t cache_capacity_pages_ = 0;
   bool cache_protect_hot_pages_ = false;
   std::size_t cache_hot_degree_threshold_ = 0;
-  std::uint64_t cache_clock_ = 0;
-  std::unordered_map<std::uint32_t, CacheEntry> page_cache_;
+  std::vector<CacheEntry> cache_frames_;
+  std::vector<char> cache_page_slab_;
+  std::vector<std::uint32_t> cache_free_frames_;
+  std::unordered_map<GraphPageIdentity, std::uint32_t,
+                     GraphPageIdentityHash> page_cache_;
+  CacheQueue cache_queues_[5];
+  std::vector<std::uint32_t> ghost_ring_;
+  std::unordered_map<std::uint32_t, std::size_t> ghost_pages_;
+  std::size_t ghost_cursor_ = 0;
+  std::size_t probationary_target_ = 0;
+  std::size_t hub_target_ = 0;
   DecodedPage scratch_page_;
   std::vector<std::uint32_t> node_in_degrees_;
   bool node_in_degrees_ready_ = false;
+  std::vector<std::uint8_t> page_hot_classes_;
   mutable std::mutex cache_mutex_;
   mutable std::mutex search_mutex_;
   PrefetchAdaptiveController prefetch_controller_;

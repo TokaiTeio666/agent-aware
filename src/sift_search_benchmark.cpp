@@ -61,7 +61,7 @@ struct Args {
   std::string packing_strategy = "bfs";
 
   bool enable_pq = true;
-  std::size_t pq_subspaces = 32;
+  std::size_t pq_subspaces = 24;
   std::size_t pq_centroids = 256;
   std::size_t pq_train_limit = 100000;
   std::size_t pq_iterations = 8;
@@ -840,15 +840,16 @@ MemoryBudgetReport apply_memory_budget_defaults(
             ? report.budget_bytes - report.fixed_resident_bytes
             : 0;
     args.cache_pages =
-        static_cast<std::size_t>(available / workers / args.page_size);
+        static_cast<std::size_t>(available / workers /
+          (args.page_size + 96));
     if (args.cache_pages == 0 && available > 0) {
       warnings.push_back(
           "memory budget leaves less than one cache page per worker");
     }
   }
 
-  report.cache_bytes =
-      static_cast<std::uint64_t>(args.cache_pages) * args.page_size * workers;
+  report.cache_bytes = agent_aware::estimate_page_cache_bytes(
+      args.page_size, args.cache_pages) * workers;
   report.estimated_resident_bytes =
       report.fixed_resident_bytes + report.cache_bytes;
   report.estimated_resident_ratio =
@@ -951,7 +952,8 @@ SearchAggregate run_searches(const Args& args,
     for (std::size_t worker = 0; worker < worker_count; ++worker) {
       workers.emplace_back([&, worker]() {
         try {
-          agent_aware::PackedDiskGraphIndex worker_index(args.index_path.string());
+          agent_aware::PackedDiskGraphIndex worker_index(
+              args.index_path.string(), index.shared_pq_model());
           configure_index_from_args(args, worker_index);
           partials[worker] = run_search_worker(
               args, dataset, worker_index, pq_model, entry_seed_ids, worker,

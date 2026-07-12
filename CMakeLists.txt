@@ -37,6 +37,7 @@ endif()
 set(AGENT_AWARE_LIBRARY_SOURCES
   src/core/async_page_reader.cpp
   src/core/brute_force.cpp
+  src/core/memory_budget.cpp
   src/core/pq_encoder.cpp
   src/core/prefetch_adaptive_controller.cpp
   src/core/query_page_session.cpp
@@ -49,6 +50,7 @@ set(AGENT_AWARE_LIBRARY_SOURCES
   src/dynamic/wal.cpp
   src/engine/storage_engine.cpp
   src/graph/disk_graph_builder.cpp
+  src/graph/packed_graph_generation.cpp
   src/graph/disk_graph_index.cpp
   src/graph/disk_page_codec.cpp
   src/graph/vamana_builder.cpp
@@ -117,6 +119,12 @@ if(BUILD_TESTING)
   add_executable(packed_layout_v3_test tests/packed_layout_v3.cpp)
   target_link_libraries(packed_layout_v3_test PRIVATE agent_aware::agent_aware)
   add_test(NAME packed_layout_v3 COMMAND packed_layout_v3_test)
+  add_executable(packed_generation_test tests/packed_generation.cpp)
+  target_link_libraries(packed_generation_test PRIVATE agent_aware::agent_aware)
+  add_test(NAME packed_generation COMMAND packed_generation_test)
+  add_executable(online_generation_merge_test tests/online_generation_merge.cpp)
+  target_link_libraries(online_generation_merge_test PRIVATE agent_aware::agent_aware)
+  add_test(NAME online_generation_merge COMMAND online_generation_merge_test)
   add_executable(async_page_reader_test
                  tests/async_page_reader.cpp)
   target_link_libraries(async_page_reader_test

@@ -97,61 +97,59 @@ PackedDiskGraphIndex::DecodedPage DiskPageCodec::decode_packed_page(
   PackedDiskGraphIndex::DecodedPage decoded;
   decoded.bytes = std::move(page);
   decoded.page_id = get_bytes<std::uint32_t>(decoded.bytes, cursor);
-  const auto node_count = get_bytes<std::uint32_t>(decoded.bytes, cursor);
-  if (decoded.page_id != page_id || node_count > metadata.nodes_per_page) {
+  decoded.node_count = get_bytes<std::uint32_t>(decoded.bytes, cursor);
+  if (decoded.page_id != page_id ||
+      decoded.node_count > metadata.nodes_per_page) {
     throw std::runtime_error("Corrupted packed graph page header");
   }
 
-  std::vector<std::uint32_t> ids(metadata.nodes_per_page);
-  std::vector<std::uint32_t> degrees(metadata.nodes_per_page);
-  for (std::uint32_t i = 0; i < metadata.nodes_per_page; ++i) {
-    ids[i] = get_bytes<std::uint32_t>(decoded.bytes, cursor);
-  }
-  for (std::uint32_t i = 0; i < metadata.nodes_per_page; ++i) {
-    degrees[i] = get_bytes<std::uint32_t>(decoded.bytes, cursor);
-  }
-
-  decoded.nodes.reserve(node_count);
-  for (std::uint32_t slot = 0; slot < metadata.nodes_per_page; ++slot) {
-    if (cursor + metadata.dim * sizeof(float) > decoded.bytes.size()) {
-      throw std::runtime_error("Packed vector block is truncated");
-    }
-    if (slot < node_count) {
-      PackedDiskGraphIndex::DiskNode node;
-      node.id = ids[slot];
-      // 向量字节保留在 decoded.bytes 中，节点只存 offset，避免 cache 页时复制每个向量。
-      node.vector_offset = cursor;
-      decoded.nodes.push_back(std::move(node));
-    }
-    cursor += metadata.dim * sizeof(float);
-  }
-
-  for (std::uint32_t slot = 0; slot < metadata.nodes_per_page; ++slot) {
-    std::vector<std::uint32_t> neighbors;
-    if (slot < node_count) {
-      neighbors.reserve(degrees[slot]);
-    }
-    for (std::uint32_t n = 0; n < metadata.degree; ++n) {
-      const auto neighbor = get_bytes<std::uint32_t>(decoded.bytes, cursor);
-      if (slot < node_count && n < degrees[slot] &&
-          neighbor != std::numeric_limits<std::uint32_t>::max()) {
-        neighbors.push_back(neighbor);
-      }
-    }
-    if (slot < node_count) {
-      decoded.nodes[slot].neighbors = std::move(neighbors);
-    }
+  const std::size_t required = sizeof(std::uint32_t) * 2 +
+      static_cast<std::size_t>(metadata.nodes_per_page) *
+          (sizeof(std::uint32_t) * 2 +
+           static_cast<std::size_t>(metadata.dim) * sizeof(float) +
+           static_cast<std::size_t>(metadata.degree) * sizeof(std::uint32_t));
+  if (required > decoded.bytes.size()) {
+    throw std::runtime_error("Packed graph page payload is truncated");
   }
 
   return decoded;
 }
 
-const PackedDiskGraphIndex::DiskNode& DiskPageCodec::find_node(
+PackedDiskGraphIndex::DiskNode DiskPageCodec::node_at(
+    const DiskGraphMetadata& metadata,
+    const PackedDiskGraphIndex::DecodedPage& page, std::uint32_t slot) {
+  if (slot >= page.node_count) {
+    throw std::runtime_error("Packed graph node slot is out of range");
+  }
+  const std::size_t ids = sizeof(std::uint32_t) * 2;
+  const std::size_t degrees =
+      ids + static_cast<std::size_t>(metadata.nodes_per_page) * sizeof(std::uint32_t);
+  const std::size_t vectors =
+      degrees + static_cast<std::size_t>(metadata.nodes_per_page) * sizeof(std::uint32_t);
+  const std::size_t neighbors = vectors +
+      static_cast<std::size_t>(metadata.nodes_per_page) * metadata.dim * sizeof(float);
+  PackedDiskGraphIndex::DiskNode node;
+  std::memcpy(&node.id, page.data() + ids + slot * sizeof(std::uint32_t),
+              sizeof(node.id));
+  std::memcpy(&node.neighbor_count,
+              page.data() + degrees + slot * sizeof(std::uint32_t),
+              sizeof(node.neighbor_count));
+  if (node.neighbor_count > metadata.degree) {
+    throw std::runtime_error("Packed graph node degree is corrupted");
+  }
+  node.vector_offset = vectors +
+      static_cast<std::size_t>(slot) * metadata.dim * sizeof(float);
+  node.neighbor_offset = neighbors +
+      static_cast<std::size_t>(slot) * metadata.degree * sizeof(std::uint32_t);
+  return node;
+}
+
+PackedDiskGraphIndex::DiskNode DiskPageCodec::find_node(
+    const DiskGraphMetadata& metadata,
     const PackedDiskGraphIndex::DecodedPage& page, std::uint32_t node_id) {
-  for (const auto& node : page.nodes) {
-    if (node.id == node_id) {
-      return node;
-    }
+  for (std::uint32_t slot = 0; slot < page.node_count; ++slot) {
+    auto node = node_at(metadata, page, slot);
+    if (node.id == node_id) return node;
   }
   throw std::runtime_error("Node is missing from packed page");
 }
@@ -162,10 +160,10 @@ const float* DiskPageCodec::vector_data(
     const PackedDiskGraphIndex::DiskNode& node) {
   const std::size_t bytes = static_cast<std::size_t>(metadata.dim) *
                             sizeof(float);
-  if (node.vector_offset + bytes > page.bytes.size()) {
+  if (node.vector_offset + bytes > page.size()) {
     throw std::runtime_error("Packed node vector points outside page");
   }
-  return reinterpret_cast<const float*>(page.bytes.data() + node.vector_offset);
+  return reinterpret_cast<const float*>(page.data() + node.vector_offset);
 }
 
 }  // namespace agent_aware

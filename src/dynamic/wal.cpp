@@ -7,6 +7,7 @@
 #include <fcntl.h>
 #include <fstream>
 #include <limits>
+#include <regex>
 #include <unistd.h>
 
 namespace agent_aware::dynamic {
@@ -160,9 +161,20 @@ bool node_id_fits(NodeId node_id, std::uint64_t value) {
          node_id == static_cast<NodeId>(value);
 }
 
+std::uint64_t segment_id_from_path(const std::filesystem::path& path) {
+  std::smatch match;
+  const std::regex pattern("wal_([0-9]+)\\.log");
+  const auto name = path.filename().string();
+  return std::regex_match(name, match, pattern)
+             ? static_cast<std::uint64_t>(std::stoull(match[1]))
+             : 0;
+}
+
 }  // namespace
 
-WalWriter::WalWriter(const std::filesystem::path& path) : path_(path) {
+WalWriter::WalWriter(const std::filesystem::path& path,
+                     std::uint64_t segment_id)
+    : path_(path), segment_id_(segment_id) {
   fd_ = ::open(path_.c_str(), O_CREAT | O_WRONLY | O_APPEND | O_CLOEXEC, 0644);
 }
 
@@ -173,16 +185,39 @@ bool WalWriter::append(const DynamicRecord& record) {
 }
 
 bool WalWriter::append_batch(const std::vector<DynamicRecord>& records) {
+  std::vector<DynamicLocator> ignored;
+  return append_batch(records, ignored);
+}
+
+bool WalWriter::append_batch(const std::vector<DynamicRecord>& records,
+                             std::vector<DynamicLocator>& locators) {
   if (closed_ || fd_ < 0) {
     return false;
   }
   std::vector<char> encoded;
+  std::vector<std::pair<std::size_t, std::uint32_t>> spans;
+  spans.reserve(records.size());
   for (const auto& record : records) {
+    const std::size_t begin = encoded.size();
     if (!encode_record(record, encoded)) {
       return false;
     }
+    spans.emplace_back(begin,
+                       static_cast<std::uint32_t>(encoded.size() - begin));
   }
-  return encoded.empty() || write_all(fd_, encoded.data(), encoded.size());
+  const off_t start = ::lseek(fd_, 0, SEEK_END);
+  if (start < 0 || (!encoded.empty() &&
+                    !write_all(fd_, encoded.data(), encoded.size()))) {
+    return false;
+  }
+  locators.clear();
+  locators.reserve(spans.size());
+  for (const auto& span : spans) {
+    locators.push_back(DynamicLocator{
+        DynamicStorageKind::kWal, segment_id_,
+        static_cast<std::uint64_t>(start) + span.first, span.second, 0});
+  }
+  return true;
 }
 
 bool WalWriter::sync() {
@@ -222,6 +257,7 @@ std::vector<DynamicRecord> WalReader::replay() {
   }
 
   while (input.peek() != std::char_traits<char>::eof()) {
+    const auto record_offset = static_cast<std::uint64_t>(input.tellg());
     WalRecordHeader header;
     if (!read_header(input, header) || !header_shape_is_valid(header)) {
       break;
@@ -256,9 +292,49 @@ std::vector<DynamicRecord> WalReader::replay() {
         header.payload_checksum) {
       break;
     }
+    const auto record_end = static_cast<std::uint64_t>(input.tellg());
+    record.locator = DynamicLocator{
+        DynamicStorageKind::kWal, segment_id_from_path(path_), record_offset,
+        static_cast<std::uint32_t>(record_end - record_offset), 0};
     records.push_back(std::move(record));
   }
   return records;
+}
+
+bool WalReader::read_at(const DynamicLocator& locator,
+                        DynamicRecord& out) const {
+  if (locator.kind != DynamicStorageKind::kWal) return false;
+  std::ifstream input(path_, std::ios::binary);
+  if (!input) return false;
+  input.seekg(static_cast<std::streamoff>(locator.offset));
+  if (!input) return false;
+  WalRecordHeader header;
+  if (!read_header(input, header) || !header_shape_is_valid(header) ||
+      !node_id_fits(static_cast<NodeId>(header.node_id), header.node_id)) {
+    return false;
+  }
+  DynamicRecord record;
+  record.sequence_id = header.sequence_id;
+  record.node_id = static_cast<NodeId>(header.node_id);
+  record.dim = header.dim;
+  record.deleted = header.deleted != 0;
+  record.vector.resize(header.dim);
+  record.neighbors.resize(header.neighbor_count);
+  if (header.vector_bytes > 0) {
+    input.read(reinterpret_cast<char*>(record.vector.data()),
+               header.vector_bytes);
+  }
+  if (header.neighbor_count > 0) {
+    input.read(reinterpret_cast<char*>(record.neighbors.data()),
+               record.neighbors.size() * sizeof(NodeId));
+  }
+  if (!input || checksum_payload(record.vector, record.neighbors) !=
+                    header.payload_checksum) {
+    return false;
+  }
+  record.locator = locator;
+  out = std::move(record);
+  return true;
 }
 
 }  // namespace agent_aware::dynamic

@@ -756,7 +756,7 @@ PqRuntime prepare_pq_runtime(const Args& args,
         " does not match index PQ subspaces " +
         std::to_string(metadata.pq_subspaces));
   }
-  auto model = std::make_shared<agent_aware::PqAdcModel>(index.pq_model());
+  auto model = index.shared_pq_model();
   runtime.stats.vector_count = model->vector_count();
   runtime.stats.dim = model->dim();
   runtime.stats.subspaces = model->subspaces();

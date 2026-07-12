@@ -14,7 +14,8 @@ namespace agent_aware::harmony {
 namespace {
 
 enum class AsyncOperation {
-  kOpen, kSearch, kUpsert, kDelete, kProfile, kFlush, kMetrics, kClose
+  kOpen, kSearch, kUpsert, kDelete, kProfile, kFlush, kTriggerMerge,
+  kMergeStatus, kCancelMerge, kMetrics, kClose
 };
 
 struct ModuleState {
@@ -39,6 +40,7 @@ struct AsyncContext {
   NativeEngineInfo engine_info;
   EngineSearchResult search_result;
   EngineMetricsSnapshot metrics;
+  PackedGraphEngine::MergeStatus merge_status;
 };
 
 bool get_named(napi_env env, napi_value object, const char* name,
@@ -87,12 +89,26 @@ bool get_size(napi_env env, napi_value object, const char* name,
   return true;
 }
 
+bool get_double(napi_env env, napi_value object, const char* name,
+                double& output) {
+  napi_value value;
+  if (!get_named(env, object, name, &value)) return true;
+  return napi_get_value_double(env, value, &output) == napi_ok &&
+         std::isfinite(output);
+}
+
+bool get_bool(napi_env env, napi_value object, const char* name, bool& output) {
+  napi_value value;
+  if (!get_named(env, object, name, &value)) return true;
+  return napi_get_value_bool(env, value, &output) == napi_ok;
+}
+
 bool parse_config(napi_env env, napi_value value, HarmonyEngineConfig& config) {
   napi_valuetype type;
   if (napi_typeof(env, value, &type) != napi_ok || type != napi_object) return false;
   std::size_t dimension = config.expected_dimension;
   return get_string(env, value, "baseIndexPath", config.base_index_path, true) &&
-         get_string(env, value, "pqModelPath", config.pq_model_path, true) &&
+         get_string(env, value, "pqModelPath", config.pq_model_path) &&
          get_string(env, value, "dynamicDir", config.dynamic_dir, true) &&
          get_string(env, value, "cachePolicy", config.cache_policy) &&
          get_string(env, value, "ioMode", config.io_mode) &&
@@ -107,6 +123,18 @@ bool parse_config(napi_env env, napi_value value, HarmonyEngineConfig& config) {
          get_size(env, value, "rerankTopK", config.rerank_top_k) &&
          get_size(env, value, "prefetchSubmitTopK", config.prefetch_submit_top_k) &&
          get_size(env, value, "prefetchMaxInflight", config.prefetch_max_inflight) &&
+         get_size(env, value, "deltaSoftLimitBytes", config.delta_soft_limit_bytes) &&
+         get_size(env, value, "deltaHighLimitBytes", config.delta_high_limit_bytes) &&
+         get_size(env, value, "deltaHardLimitBytes", config.delta_hard_limit_bytes) &&
+         get_size(env, value, "memtableFlushRecords", config.memtable_flush_records) &&
+         get_size(env, value, "memtableFlushBytes", config.memtable_flush_bytes) &&
+         get_size(env, value, "deltaCandidateTopL", config.delta_candidate_top_l) &&
+         get_bool(env, value, "enableAutoGraphMerge", config.enable_auto_graph_merge) &&
+         get_size(env, value, "graphMergeRecords", config.graph_merge_records) &&
+         get_size(env, value, "graphMergePersistedBytes", config.graph_merge_persisted_bytes) &&
+         get_double(env, value, "graphMergeDeleteRatio", config.graph_merge_delete_ratio) &&
+         get_size(env, value, "graphMergeIntervalMs", config.graph_merge_interval_ms) &&
+         get_size(env, value, "graphMergeMaxSegments", config.graph_merge_max_segments) &&
          dimension <= UINT32_MAX &&
          (config.expected_dimension = static_cast<std::uint32_t>(dimension), true);
 }
@@ -201,6 +229,13 @@ napi_value create_search_response(napi_env env, const EngineSearchResult& result
   const auto& graph = result.stats.graph;
   set_bool(env, stats, "usedGraphPath", result.stats.used_graph_path);
   set_number(env, stats, "dynamicReadSequence", result.stats.dynamic_read_sequence);
+  set_number(env, stats, "baseGeneration", result.stats.base_generation);
+  set_number(env, stats, "baseSequence", result.stats.base_sequence);
+  set_number(env, stats, "deltaVisibleVersions", result.stats.delta.visible_versions);
+  set_number(env, stats, "deltaPqScanned", result.stats.delta.pq_scanned);
+  set_number(env, stats, "deltaCandidatesReranked", result.stats.delta.candidates_reranked);
+  set_number(env, stats, "deltaVectorReads", result.stats.delta.vector_reads);
+  set_number(env, stats, "deltaBytesRead", result.stats.delta.bytes_read);
   set_number(env, stats, "nodeReads", graph.node_reads);
   set_number(env, stats, "expanded", graph.expanded);
   set_number(env, stats, "visited", graph.visited);
@@ -235,6 +270,13 @@ napi_value create_metrics(napi_env env, const EngineMetricsSnapshot& metrics) {
   set_number(env, object, "cacheCapacityPages", metrics.cache_capacity_pages);
   set_number(env, object, "cacheResidentPages", metrics.cache_resident_pages);
   set_number(env, object, "memoryBudgetBytes", metrics.memory_budget_bytes);
+  set_number(env, object, "deltaControlledBytes", metrics.delta_controlled_bytes);
+  set_number(env, object, "baseGraphCacheBytes", metrics.base_graph_cache_bytes);
+  set_number(env, object, "mergeWorkspaceBytes", metrics.merge_workspace_bytes);
+  set_number(env, object, "baseGeneration", metrics.base_generation);
+  set_number(env, object, "baseSequence", metrics.base_sequence);
+  set_number(env, object, "totalGraphMerges", metrics.total_graph_merges);
+  set_number(env, object, "failedGraphMerges", metrics.failed_graph_merges);
   set_number(env, object, "totalSearches", metrics.total_searches);
   set_number(env, object, "totalWrites", metrics.total_writes);
   set_number(env, object, "totalDeletes", metrics.total_deletes);
@@ -248,6 +290,36 @@ napi_value create_metrics(napi_env env, const EngineMetricsSnapshot& metrics) {
   set_number(env, aggregate, "prefetchUsefulPages", metrics.aggregate_search.prefetch_useful_pages);
   set_number(env, aggregate, "prefetchWastedPages", metrics.aggregate_search.prefetch_wasted_pages);
   napi_set_named_property(env, object, "aggregate", aggregate);
+  return object;
+}
+
+const char* merge_phase_name(PackedGraphEngine::MergeStatus::Phase phase) {
+  using Phase = PackedGraphEngine::MergeStatus::Phase;
+  switch (phase) {
+    case Phase::kIdle: return "IDLE";
+    case Phase::kSnapshot: return "SNAPSHOT";
+    case Phase::kWriting: return "WRITING";
+    case Phase::kPublishing: return "PUBLISHING";
+    case Phase::kComplete: return "COMPLETE";
+    case Phase::kFailed: return "FAILED";
+    case Phase::kCancelled: return "CANCELLED";
+  }
+  return "FAILED";
+}
+
+napi_value create_merge_status(napi_env env,
+                               const PackedGraphEngine::MergeStatus& status) {
+  napi_value object;
+  napi_create_object(env, &object);
+  set_string(env, object, "phase", merge_phase_name(status.phase));
+  set_number(env, object, "generation", status.generation);
+  set_number(env, object, "fromSequence", status.from_sequence);
+  set_number(env, object, "toSequence", status.to_sequence);
+  set_number(env, object, "processedRecords", status.processed_records);
+  set_number(env, object, "reclaimedBytes", status.reclaimed_bytes);
+  set_number(env, object, "workspaceBytes", status.workspace_bytes);
+  set_string(env, object, "error", status.error);
+  set_bool(env, object, "cancellable", status.cancellable);
   return object;
 }
 
@@ -287,6 +359,15 @@ void execute(napi_env, void* data) {
       context.status = context.module->facade.set_resource_profile(context.profile); break;
     case AsyncOperation::kFlush:
       context.status = context.module->facade.flush(); break;
+    case AsyncOperation::kTriggerMerge:
+      context.status = context.module->facade.trigger_merge(); break;
+    case AsyncOperation::kMergeStatus: {
+      auto result = context.module->facade.merge_status();
+      context.status = result.status;
+      context.merge_status = std::move(result.value); break;
+    }
+    case AsyncOperation::kCancelMerge:
+      context.status = context.module->facade.cancel_merge(); break;
     case AsyncOperation::kMetrics: {
       auto result = context.module->facade.metrics();
       context.status = result.status; context.metrics = std::move(result.value); break;
@@ -310,6 +391,8 @@ void complete(napi_env env, napi_status async_status, void* data) {
       result = create_search_response(env, context->search_result);
     else if (context->operation == AsyncOperation::kMetrics)
       result = create_metrics(env, context->metrics);
+    else if (context->operation == AsyncOperation::kMergeStatus)
+      result = create_merge_status(env, context->merge_status);
     else
       napi_get_undefined(env, &result);
     napi_resolve_deferred(env, context->deferred, result);
@@ -419,6 +502,9 @@ napi_value no_args(napi_env env, napi_callback_info info,
   return queue(env, make_context(env, info, operation, name, argc, argv));
 }
 napi_value flush(napi_env e, napi_callback_info i) { return no_args(e, i, AsyncOperation::kFlush, "flush"); }
+napi_value trigger_merge(napi_env e, napi_callback_info i) { return no_args(e, i, AsyncOperation::kTriggerMerge, "triggerMerge"); }
+napi_value merge_status(napi_env e, napi_callback_info i) { return no_args(e, i, AsyncOperation::kMergeStatus, "getMergeStatus"); }
+napi_value cancel_merge(napi_env e, napi_callback_info i) { return no_args(e, i, AsyncOperation::kCancelMerge, "cancelMerge"); }
 napi_value metrics(napi_env e, napi_callback_info i) { return no_args(e, i, AsyncOperation::kMetrics, "getMetrics"); }
 napi_value close(napi_env e, napi_callback_info i) { return no_args(e, i, AsyncOperation::kClose, "close"); }
 
@@ -439,6 +525,9 @@ napi_value init(napi_env env, napi_value exports) {
       {"deleteVector", nullptr, erase, nullptr, nullptr, nullptr, napi_default, state},
       {"setResourceProfile", nullptr, profile, nullptr, nullptr, nullptr, napi_default, state},
       {"flush", nullptr, flush, nullptr, nullptr, nullptr, napi_default, state},
+      {"triggerMerge", nullptr, trigger_merge, nullptr, nullptr, nullptr, napi_default, state},
+      {"getMergeStatus", nullptr, merge_status, nullptr, nullptr, nullptr, napi_default, state},
+      {"cancelMerge", nullptr, cancel_merge, nullptr, nullptr, nullptr, napi_default, state},
       {"getMetrics", nullptr, metrics, nullptr, nullptr, nullptr, napi_default, state},
       {"close", nullptr, close, nullptr, nullptr, nullptr, napi_default, state},
 #ifndef NDEBUG

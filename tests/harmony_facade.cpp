@@ -1,4 +1,6 @@
 #include <filesystem>
+#include <chrono>
+#include <thread>
 #include <stdexcept>
 #include <string>
 
@@ -53,6 +55,18 @@ int main() {
   config.io_depth = 2;
   config.prefetch_policy = "none";
 
+  HarmonyEngineConfig embedded_config = config;
+  embedded_config.pq_model_path.clear();
+  embedded_config.dynamic_dir = (root / "embedded-dynamic").string();
+  HarmonyEngineFacade embedded_facade;
+  const auto embedded_opened = embedded_facade.open(embedded_config);
+  require(embedded_opened.status.ok(), "embedded PQ facade open failed");
+  const auto embedded_search =
+      embedded_facade.search(data.queries.row(0), 16, 10);
+  require(embedded_search.status.ok() && !embedded_search.value.topk.empty(),
+          "embedded PQ facade search failed");
+  require(embedded_facade.close().ok(), "embedded PQ facade close failed");
+
   HarmonyEngineFacade facade;
   const auto opened = facade.open(config);
   require(opened.status.ok(), "facade open failed");
@@ -62,10 +76,25 @@ int main() {
   require(search.status.ok() && !search.value.topk.empty(), "search failed");
   require(!facade.search(data.queries.row(0), 15, 10).status.ok(),
           "dimension mismatch was accepted");
-  require(facade.upsert(5000, data.queries.row(1), 16,
+  require(facade.upsert(500, data.queries.row(1), 16,
                         WriteMode::kInsert).ok(), "insert failed");
-  require(facade.erase(5000).ok(), "erase failed");
+  require(facade.erase(500).ok(), "erase failed");
   require(facade.flush().ok(), "flush failed");
+  require(facade.trigger_merge().ok(), "manual graph merge trigger failed");
+  bool merge_complete = false;
+  for (int i = 0; i < 2000; ++i) {
+    const auto merge = facade.merge_status();
+    require(merge.status.ok(), "merge status failed");
+    if (merge.value.phase == PackedGraphEngine::MergeStatus::Phase::kComplete) {
+      merge_complete = true;
+      break;
+    }
+    if (merge.value.phase == PackedGraphEngine::MergeStatus::Phase::kFailed) {
+      throw std::runtime_error(merge.value.error);
+    }
+    std::this_thread::sleep_for(std::chrono::milliseconds(1));
+  }
+  require(merge_complete, "manual graph merge did not complete");
   require(facade.set_resource_profile(ResourceProfile::kCritical).ok(),
           "critical profile failed");
   const auto metrics = facade.metrics();

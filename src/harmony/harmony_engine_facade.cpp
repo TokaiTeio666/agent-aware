@@ -49,26 +49,45 @@ StatusOr<NativeEngineInfo> HarmonyEngineFacade::open(
     return {{ErrorCode::kAlreadyInitialized, "Engine is already open", false}, {}};
   }
   if (config.expected_dimension == 0 || config.base_index_path.empty() ||
-      config.pq_model_path.empty() || config.dynamic_dir.empty() ||
+      config.dynamic_dir.empty() ||
       config.io_batch_size == 0 || config.io_depth == 0 ||
-      config.search_width == 0 || config.entry_count == 0) {
+      config.search_width == 0 || config.entry_count == 0 ||
+      config.delta_candidate_top_l == 0 || config.memtable_flush_bytes == 0 ||
+      config.delta_soft_limit_bytes == 0 ||
+      config.delta_soft_limit_bytes > config.delta_high_limit_bytes ||
+      config.delta_high_limit_bytes > config.delta_hard_limit_bytes) {
     return {{ErrorCode::kInvalidArgument, "Invalid engine configuration", false}, {}};
   }
   if (!std::filesystem::is_regular_file(config.base_index_path) ||
-      !std::filesystem::is_regular_file(config.pq_model_path)) {
+      (!config.pq_model_path.empty() &&
+       !std::filesystem::is_regular_file(config.pq_model_path))) {
     return {{ErrorCode::kIndexNotFound, "Index resource is unavailable", false}, {}};
   }
 
   state_ = State::kOpening;
   try {
-    auto external_pq =
-        std::make_shared<PqAdcModel>(PqAdcModel::read_file(config.pq_model_path));
-    if (external_pq->dim() != config.expected_dimension) {
-      throw std::invalid_argument("dimension mismatch");
+    std::shared_ptr<const PqAdcModel> external_pq;
+    if (!config.pq_model_path.empty()) {
+      external_pq = std::make_shared<const PqAdcModel>(
+          PqAdcModel::read_file(config.pq_model_path));
+      if (external_pq->dim() != config.expected_dimension) {
+        throw std::invalid_argument("dimension mismatch");
+      }
     }
     std::filesystem::create_directories(config.dynamic_dir);
+    // Dynamic recovery needs the immutable packed PQ codebook so recovered
+    // versions can rebuild compact PQ codes without retaining raw vectors.
+    PackedDiskGraphIndex packed_probe(config.base_index_path, external_pq);
+    const auto shared_pq = packed_probe.shared_pq_model();
     dynamic::DynamicWriteOptions dynamic_options;
     dynamic_options.dynamic_dir = config.dynamic_dir;
+    dynamic_options.pq_model = shared_pq;
+    dynamic_options.memtable_flush_bytes = config.memtable_flush_bytes;
+    dynamic_options.memtable_flush_records = config.memtable_flush_records;
+    dynamic_options.delta_candidate_top_l = config.delta_candidate_top_l;
+    dynamic_options.delta_soft_limit_bytes = config.delta_soft_limit_bytes;
+    dynamic_options.delta_high_limit_bytes = config.delta_high_limit_bytes;
+    dynamic_options.delta_hard_limit_bytes = config.delta_hard_limit_bytes;
     auto manager =
         std::make_shared<dynamic::DynamicWriteManager>(dynamic_options);
     if (!manager->open()) throw std::runtime_error("WAL open failed");
@@ -80,8 +99,14 @@ StatusOr<NativeEngineInfo> HarmonyEngineFacade::open(
     engine_config.io_mode = config.io_mode;
     engine_config.io_batch_size = config.io_batch_size;
     engine_config.io_depth = config.io_depth;
-    engine_config.pq_model = external_pq;
+    engine_config.pq_model = shared_pq;
     engine_config.dynamic_manager = manager;
+    engine_config.enable_auto_graph_merge = config.enable_auto_graph_merge;
+    engine_config.graph_merge_records = config.graph_merge_records;
+    engine_config.graph_merge_persisted_bytes =
+        config.graph_merge_persisted_bytes;
+    engine_config.graph_merge_delete_ratio = config.graph_merge_delete_ratio;
+    engine_config.graph_merge_interval_ms = config.graph_merge_interval_ms;
     engine_config.search.search_width = config.search_width;
     engine_config.search.beam_width = config.beam_width;
     engine_config.search.entry_count = config.entry_count;
@@ -94,7 +119,7 @@ StatusOr<NativeEngineInfo> HarmonyEngineFacade::open(
     if (engine->metadata().dim != config.expected_dimension) {
       throw std::invalid_argument("dimension mismatch");
     }
-    if (!same_pq(*external_pq, engine->pq_model())) {
+    if (external_pq && !same_pq(*external_pq, engine->pq_model())) {
       throw std::runtime_error("PQ companion does not match packed index");
     }
 
@@ -108,6 +133,9 @@ StatusOr<NativeEngineInfo> HarmonyEngineFacade::open(
     metrics_.cache_resident_pages = engine_->cache_resident_pages();
     metrics_.memory_budget_bytes =
         metrics_.cache_capacity_pages * engine_->metadata().page_size;
+    metrics_.base_graph_cache_bytes = metrics_.memory_budget_bytes;
+    metrics_.base_generation = engine_->base_generation();
+    metrics_.base_sequence = engine_->base_sequence();
     profile_ = ResourceProfile::kNormal;
     state_ = State::kReady;
 
@@ -229,6 +257,8 @@ Status HarmonyEngineFacade::set_resource_profile(ResourceProfile profile) {
       1, (raw_bytes * percent / 100) / metadata.page_size);
   try {
     engine_->configure_runtime(pages, depth, prefetch > 0, prefetch);
+    engine_->set_auto_merge_enabled(
+        profile != ResourceProfile::kCritical && config_.enable_auto_graph_merge);
     profile_ = profile;
     std::lock_guard<std::mutex> lock(metrics_mutex_);
     metrics_.io = engine_->io_status();
@@ -255,6 +285,37 @@ Status HarmonyEngineFacade::flush() {
   return Status::Ok();
 }
 
+Status HarmonyEngineFacade::trigger_merge() {
+  std::shared_lock<std::shared_mutex> boundary(query_boundary_mutex_);
+  if (state_ != State::kReady || !engine_) {
+    return {ErrorCode::kNotInitialized, "Engine is not ready", false};
+  }
+  if (!engine_->trigger_merge()) {
+    return {ErrorCode::kBusy, "Graph merge is already running", true};
+  }
+  return Status::Ok();
+}
+
+StatusOr<PackedGraphEngine::MergeStatus>
+HarmonyEngineFacade::merge_status() const {
+  std::shared_lock<std::shared_mutex> boundary(query_boundary_mutex_);
+  if (state_ != State::kReady || !engine_) {
+    return {{ErrorCode::kNotInitialized, "Engine is not ready", false}, {}};
+  }
+  return {Status::Ok(), engine_->merge_status()};
+}
+
+Status HarmonyEngineFacade::cancel_merge() {
+  std::shared_lock<std::shared_mutex> boundary(query_boundary_mutex_);
+  if (state_ != State::kReady || !engine_) {
+    return {ErrorCode::kNotInitialized, "Engine is not ready", false};
+  }
+  if (!engine_->cancel_merge()) {
+    return {ErrorCode::kBusy, "Graph merge cannot be cancelled", false};
+  }
+  return Status::Ok();
+}
+
 StatusOr<EngineMetricsSnapshot> HarmonyEngineFacade::metrics() const {
   std::shared_lock<std::shared_mutex> boundary(query_boundary_mutex_);
   if (state_ != State::kReady || !engine_) {
@@ -266,6 +327,19 @@ StatusOr<EngineMetricsSnapshot> HarmonyEngineFacade::metrics() const {
   snapshot.dynamic_sequence = dynamic_manager_->current_sequence();
   snapshot.cache_capacity_pages = engine_->cache_capacity_pages();
   snapshot.cache_resident_pages = engine_->cache_resident_pages();
+  const auto budget = dynamic_manager_->memory_budget_snapshot();
+  snapshot.delta_controlled_bytes =
+      budget.bytes[static_cast<std::size_t>(MemoryDomain::kDeltaControlled)];
+  snapshot.base_graph_cache_bytes =
+      engine_->cache_resident_pages() * engine_->metadata().page_size;
+  snapshot.base_generation = engine_->base_generation();
+  snapshot.base_sequence = engine_->base_sequence();
+  const auto merge = engine_->merge_status();
+  snapshot.merge_workspace_bytes = merge.workspace_bytes;
+  snapshot.total_graph_merges =
+      merge.phase == PackedGraphEngine::MergeStatus::Phase::kComplete ? 1 : 0;
+  snapshot.failed_graph_merges =
+      merge.phase == PackedGraphEngine::MergeStatus::Phase::kFailed ? 1 : 0;
   return {Status::Ok(), std::move(snapshot)};
 }
 

@@ -3,7 +3,6 @@
 #include <cstddef>
 #include <cstdint>
 #include <filesystem>
-#include <unordered_map>
 #include <vector>
 
 #include "dynamic/dynamic_record.h"
@@ -30,6 +29,8 @@ class SSTableReader {
   bool open();
 
   std::vector<DynamicRecord> scan_all() const;
+  bool read_at(const DynamicLocator& locator, DynamicRecord& out) const;
+  std::vector<std::pair<DynamicRecord, DynamicLocator>> scan_all_located() const;
 
   std::uint64_t id() const;
   std::uint64_t max_sequence_id() const;
@@ -37,6 +38,7 @@ class SSTableReader {
  private:
   bool get(NodeId node_id, DynamicRecord& out) const;
   struct IndexEntry {
+    NodeId node_id = 0;
     std::uint64_t sequence_id = 0;
     std::uint64_t offset = 0;
   };
@@ -45,7 +47,7 @@ class SSTableReader {
   std::filesystem::path data_path_;
   std::filesystem::path index_path_;
   std::filesystem::path meta_path_;
-  std::unordered_map<NodeId, IndexEntry> index_;
+  std::vector<IndexEntry> index_;
   std::uint64_t id_ = 0;
   int level_ = 0;
   std::size_t record_count_ = 0;

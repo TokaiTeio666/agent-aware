@@ -56,4 +56,14 @@ bool MemTable::should_flush() const {
   return current_bytes_ >= flush_threshold_bytes_;
 }
 
+std::size_t MemTable::resident_bytes() const {
+  std::shared_lock<std::shared_mutex> lock(mutex_);
+  return current_bytes_;
+}
+
+std::size_t MemTable::size() const {
+  std::shared_lock<std::shared_mutex> lock(mutex_);
+  return records_.size();
+}
+
 }  // namespace agent_aware

@@ -9,6 +9,7 @@
 #include <utility>
 
 #include "core/async_page_reader.h"
+#include "graph/disk_page_codec.h"
 
 namespace agent_aware {
 namespace {
@@ -92,20 +93,25 @@ const QueryPageSession::Page* QueryPageSession::try_get_cached_page(
 }
 
 const QueryPageSession::Node& QueryPageSession::get_node(
-    std::uint32_t node_id, bool count_same_page_reuse) {
+    std::uint32_t node_id, bool count_same_page_reuse, bool require_vector) {
   accessed_nodes_.insert(node_id);
   auto found = local_nodes_.find(node_id);
   if (found != local_nodes_.end()) {
     if (count_same_page_reuse) {
       ++stats_.same_page_node_reuse;
     }
-    return found->second;
+    if (!require_vector || !found->second.vector.empty()) return found->second;
   }
 
-  (void)get_or_load_page(page_for_node(node_id));
+  const Page& page = get_or_load_page(page_for_node(node_id));
   found = local_nodes_.find(node_id);
   if (found == local_nodes_.end()) {
     throw std::runtime_error("Node is missing from packed page");
+  }
+  if (require_vector && found->second.vector.empty()) {
+    const auto disk_node = index_.find_node_in_page(page, node_id);
+    const float* values = index_.vector_data(page, disk_node);
+    found->second.vector.assign(values, values + index_.metadata_.dim);
   }
   return found->second;
 }
@@ -373,6 +379,13 @@ bool QueryPageSession::pin_page(std::uint32_t page_id) {
   return true;
 }
 
+void QueryPageSession::unpin_page(std::uint32_t page_id) {
+  const auto found = pinned_pages_.find(page_id);
+  if (found == pinned_pages_.end()) return;
+  index_.unpin_if_cached(page_id);
+  pinned_pages_.erase(found);
+}
+
 void QueryPageSession::unpin_all() {
   for (const auto page_id : pinned_pages_) {
     index_.unpin_if_cached(page_id);
@@ -448,7 +461,9 @@ bool QueryPageSession::page_in_cache(std::uint32_t page_id) const {
     return false;
   }
   std::lock_guard<std::mutex> lock(index_.cache_mutex_);
-  return index_.page_cache_.find(page_id) != index_.page_cache_.end();
+  return index_.page_cache_.find(
+             GraphPageIdentity{0, 0, page_id}) !=
+         index_.page_cache_.end();
 }
 
 void QueryPageSession::record_duplicate_skipped(std::size_t count) {
@@ -494,12 +509,15 @@ void QueryPageSession::materialize_page(const Page& page) {
   if (!materialized_pages_.insert(page.page_id).second) {
     return;
   }
-  for (const auto& node : page.nodes) {
-    auto inserted = local_nodes_.emplace(node.id, node);
+  for (std::uint32_t slot = 0; slot < page.node_count; ++slot) {
+    const auto node = DiskPageCodec::node_at(index_.metadata_, page, slot);
+    auto inserted = local_nodes_.try_emplace(node.id);
     Node& local_node = inserted.first->second;
-    if (local_node.vector.empty()) {
-      const float* values = index_.vector_data(page, node);
-      local_node.vector.assign(values, values + index_.metadata_.dim);
+    if (inserted.second) {
+      local_node.id = node.id;
+      const std::uint32_t* neighbors = index_.neighbor_data(page, node);
+      local_node.neighbors.assign(neighbors,
+                                  neighbors + node.neighbor_count);
     }
   }
 }

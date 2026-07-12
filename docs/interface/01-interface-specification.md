@@ -228,7 +228,7 @@ export interface SearchResponse {
 ```ts
 export interface AgentMemoryOptions {
   baseIndexPath: string;
-  pqModelPath: string;
+  pqModelPath?: string;
   embeddingModelPath: string;
   tokenizerPath: string;
   dynamicDir: string;
@@ -521,7 +521,7 @@ CREATE INDEX idx_memory_operation_memory
 ```ts
 export interface VectorStoreOpenConfig {
   baseIndexPath: string;
-  pqModelPath: string;
+  pqModelPath?: string;
   dynamicDir: string;
   expectedDimension: number;
   cachePolicy: 'none' | 'lru' | '2q' | 'graph-aware-2q';

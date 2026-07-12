@@ -188,10 +188,22 @@ float PQEncoder::adc_distance(std::uint32_t id,
       table.size() != subspaces_ * centroids_) {
     throw std::runtime_error("Invalid PQ ADC lookup");
   }
-  float distance = 0.0f;
   const std::size_t offset = static_cast<std::size_t>(id) * subspaces_;
+  return adc_distance_code(codes_.data() + offset, table);
+}
+
+float PQEncoder::adc_distance_code(
+    const std::uint8_t* code, const std::vector<float>& table) const {
+  if (!enabled() || code == nullptr ||
+      table.size() != subspaces_ * centroids_) {
+    throw std::runtime_error("Invalid PQ ADC code lookup");
+  }
+  float distance = 0.0f;
   for (std::size_t m = 0; m < subspaces_; ++m) {
-    distance += table[m * centroids_ + codes_[offset + m]];
+    if (code[m] >= centroids_) {
+      throw std::runtime_error("Invalid PQ code centroid id");
+    }
+    distance += table[m * centroids_ + code[m]];
   }
   return distance;
 }

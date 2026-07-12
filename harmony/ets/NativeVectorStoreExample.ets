@@ -4,7 +4,6 @@ export async function openVectorStore(filesDir: string): Promise<NativeVectorSto
   const store = new NativeVectorStore();
   await store.open({
     baseIndexPath: `${filesDir}/index/base.idx`,
-    pqModelPath: `${filesDir}/index/base.idx.pq`,
     dynamicDir: `${filesDir}/dynamic`,
   });
   return store;
