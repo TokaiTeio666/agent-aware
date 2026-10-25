@@ -288,8 +288,14 @@ std::size_t QueryPageSession::submit_topology_prefetch(
   const std::size_t reader_pending = index_.page_reader_->pending_async_reads();
   const std::size_t inflight_room = prefetch_max_inflight_ > pending_prefetch_pages_.size()
       ? prefetch_max_inflight_ - pending_prefetch_pages_.size() : 0;
-  const std::size_t reader_room = reader_capacity > reader_pending
-      ? reader_capacity - reader_pending : 0;
+  // 缓冲池只按"当前空闲缓冲"算剩余容量并不安全：批处理 demand 读一次要
+  // demand_batch_limit() 个缓冲，如果预取把池占满就会让 demand 的批量提交
+  // 直接抛异常。这里始终为下一次 demand 批量读预留其最大用量。
+  const std::size_t demand_reserve = demand_batch_limit();
+  const std::size_t reader_room = reader_capacity > reader_pending + demand_reserve
+      ? reader_capacity - reader_pending - demand_reserve : 0;
+  // prefetch_query_limit_ 是"每次查询最多预取的页数"，0 表示该查询不设总量上限
+  // （仍受每批 decision.top_k 与 in-flight 限制）。
   const std::size_t query_room = prefetch_query_limit_ == 0
       ? decision.top_k
       : (prefetch_query_limit_ > prefetch_query_submitted_
@@ -297,7 +303,9 @@ std::size_t QueryPageSession::submit_topology_prefetch(
   const std::size_t limit = std::min({decision.top_k, inflight_room,
                                       reader_room, query_room});
   if (limit == 0) {
-    ++stats_.demand_priority_blocks_prefetch;
+    if (reader_room == 0 && reader_pending + demand_reserve >= reader_capacity) {
+      ++stats_.demand_priority_blocks_prefetch;
+    }
     ++stats_.prefetch_skip_budget;
     return 0;
   }
@@ -324,7 +332,19 @@ std::size_t QueryPageSession::submit_topology_prefetch(
   }
   if (requests.empty()) return 0;
 
-  const auto submitted = index_.page_reader_->batch_submit(requests, stats_);
+  // 预算竞争（缓冲池被 demand 占满或超出查询额度）时降级为"本次不预取"，
+  // 绝不把异常抛给搜索路径——一轮 benchmark 不应因为预取调度失败整体失败。
+  std::vector<AsyncPageReader::SubmittedRead> submitted;
+  try {
+    submitted = index_.page_reader_->batch_submit(requests, stats_);
+  } catch (const std::exception&) {
+    for (const auto& read_request : requests) {
+      submitted_prefetch_pages_.erase(read_request.page_id);
+    }
+    ++stats_.prefetch_submit_failures;
+    ++stats_.prefetch_skip_budget;
+    return 0;
+  }
   if (!submitted.empty()) ++stats_.prefetch_submit_batches;
   for (const auto& read : submitted) {
     prefetch_tokens_.emplace(read.token, read.page_id);

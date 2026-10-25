@@ -1,13 +1,15 @@
 #include "dynamic/sstable.h"
 
 #include <algorithm>
-#include <charconv>
+#include <cstdio>
 #include <cctype>
 #include <fstream>
 #include <iomanip>
 #include <limits>
 #include <sstream>
 #include <string>
+
+#include "core/platform_io.h"
 
 namespace agent_aware::dynamic {
 namespace {
@@ -36,18 +38,22 @@ std::string sstable_name(std::uint64_t sstable_id) {
   return name.str();
 }
 
-std::filesystem::path with_extension(std::filesystem::path path,
+// 直接拼接后缀而不是 replace_extension：基名 "sst_000001" 的后缀 ".000001"
+// 在 MSVC 上会被当作扩展名替换掉（生成 "sst.meta"），而 libstdc++ 不会，
+// 导致同一目录下 writer/reader 看到的文件名不一致。
+std::filesystem::path with_extension(const std::filesystem::path& path,
                                      const std::string& extension) {
-  path.replace_extension(extension);
-  return path;
+  return std::filesystem::path(path.string() + extension);
 }
 
 std::filesystem::path normalize_base_path(const std::filesystem::path& path) {
-  const auto extension = path.extension().string();
-  if (extension == ".data" || extension == ".index" || extension == ".meta") {
-    auto base = path;
-    base.replace_extension();
-    return base;
+  const auto text = path.string();
+  for (const char* extension : {".data", ".index", ".meta"}) {
+    const std::string suffix(extension);
+    if (text.size() > suffix.size() &&
+        text.compare(text.size() - suffix.size(), suffix.size(), suffix) == 0) {
+      return std::filesystem::path(text.substr(0, text.size() - suffix.size()));
+    }
   }
   return path;
 }
@@ -281,7 +287,17 @@ bool write_meta(const std::filesystem::path& meta_path, std::uint64_t id,
          << "  \"min_sequence_id\": " << min_sequence_id << ",\n"
          << "  \"max_sequence_id\": " << max_sequence_id << "\n"
          << "}\n";
-  return static_cast<bool>(output);
+  output.close();
+  if (!output) {
+    return false;
+  }
+  std::FILE* file = std::fopen(meta_path.string().c_str(), "rb");
+  if (file == nullptr) {
+    return false;
+  }
+  const bool synced = fsync_file(file);
+  std::fclose(file);
+  return synced;
 }
 
 bool parse_json_integer(const std::string& text, const std::string& key,
@@ -313,10 +329,26 @@ bool parse_json_integer(const std::string& text, const std::string& key,
     return false;
   }
 
-  const auto* begin = text.data() + value_pos;
-  const auto* end = text.data() + value_end;
-  const auto result = std::from_chars(begin, end, out);
-  return result.ec == std::errc{} && result.ptr == end;
+  // 与 manifest.cpp 相同：纯手写解析，不依赖 std::from_chars / std::stoll。
+  bool negative = false;
+  std::size_t pos = value_pos;
+  if (text[pos] == '-') {
+    negative = true;
+    ++pos;
+  }
+  if (pos >= value_end) {
+    return false;
+  }
+  std::int64_t value = 0;
+  for (; pos < value_end; ++pos) {
+    const int digit = text[pos] - '0';
+    if (value > (std::numeric_limits<std::int64_t>::max() - digit) / 10) {
+      return false;
+    }
+    value = value * 10 + digit;
+  }
+  out = negative ? -value : value;
+  return true;
 }
 
 bool load_meta(const std::filesystem::path& meta_path, std::uint64_t& id,
@@ -407,10 +439,23 @@ bool SSTableWriter::write(const std::vector<DynamicRecord>& records) {
       return false;
     }
   }
-  data_output.flush();
-  index_output.flush();
+  data_output.close();
+  index_output.close();
   if (!data_output || !index_output) {
     return false;
+  }
+  // SSTable 必须在 manifest 引用它之前真正落盘，否则断电后 manifest 会指向
+  // 半写文件，重启时 SSTableReader::open() 失败，整个动态层都无法启动。
+  for (const auto& path : {data_path, index_path}) {
+    std::FILE* file = std::fopen(path.string().c_str(), "rb");
+    if (file == nullptr) {
+      return false;
+    }
+    const bool synced = fsync_file(file);
+    std::fclose(file);
+    if (!synced) {
+      return false;
+    }
   }
 
   return write_meta(meta_path, sstable_id_, level_, latest_records.size(),

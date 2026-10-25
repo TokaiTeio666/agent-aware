@@ -268,6 +268,21 @@ PackedDiskGraphIndex::PackedDiskGraphIndex(const std::string& path)
   page_reader_ = std::make_unique<AsyncPageReader>(path_, metadata_.page_size);
 }
 
+std::size_t PackedDiskGraphIndex::resident_page_bytes(
+    const DiskGraphMetadata& metadata) {
+  // 解码页保留原始字节（bytes），同时为每个节点复制一份邻接 vector；
+  // 邻接在解码时按 degree reserve，因此按满载容量估算。
+  return static_cast<std::size_t>(metadata.page_size) +
+         static_cast<std::size_t>(metadata.nodes_per_page) *
+             static_cast<std::size_t>(metadata.degree) *
+             sizeof(std::uint32_t);
+}
+
+std::size_t PackedDiskGraphIndex::cache_resident_bytes() const {
+  std::lock_guard<std::mutex> lock(cache_mutex_);
+  return page_cache_.size() * resident_page_bytes(metadata_);
+}
+
 PackedDiskGraphIndex::~PackedDiskGraphIndex() = default;
 
 void PackedDiskGraphIndex::configure_cache(const std::string& policy,
@@ -365,18 +380,21 @@ void PackedDiskGraphIndex::ensure_node_in_degrees() {
   }
 
   // 这是 cache 策略使用的离线统计，刻意走 read_page，校验正常查询也会读取的同一份字节。
-  node_in_degrees_.assign(static_cast<std::size_t>(metadata_.vector_count), 0);
+  // 先写到临时数组再发布，否则并发配置两个 index 时读者可能看到半张表。
+  std::vector<std::uint32_t> degrees(
+      static_cast<std::size_t>(metadata_.vector_count), 0);
   DiskGraphSearchStats ignored;
   for (std::uint32_t page_id = 0; page_id < metadata_.page_count; ++page_id) {
     DecodedPage page = read_page(page_id, ignored);
     for (const auto& node : page.nodes) {
       for (const auto neighbor : node.neighbors) {
-        if (neighbor < node_in_degrees_.size()) {
-          ++node_in_degrees_[neighbor];
+        if (neighbor < degrees.size()) {
+          ++degrees[neighbor];
         }
       }
     }
   }
+  node_in_degrees_ = std::move(degrees);
   node_in_degrees_ready_ = true;
 }
 
@@ -616,6 +634,16 @@ std::unique_ptr<PackedDiskGraphIndex::SearchState>
 PackedDiskGraphIndex::initialize_search_state(
     const float* query, const DiskGraphSearchConfig& config,
     DiskGraphSearchResult& output) {
+  // 同一 index 上的多个会话共享 scratch_page_（无 cache 路径）与页缓冲池，
+  // 因此会话期必须独占搜索锁。这里显式记账，让"并发检索"的代价可见，
+  // 而不是依赖调用方恰好持有 search_mutex_。
+  ++live_sessions_;
+  if (live_sessions_ > 1) {
+    --live_sessions_;
+    throw std::runtime_error(
+        "Packed graph index supports one concurrent query session per index; "
+        "open one index per worker");
+  }
   auto state = std::make_unique<SearchState>(*this, query, config, output);
   if (!config.adc_enable || config.pq_model == nullptr ||
       !config.pq_model->enabled()) {
@@ -872,8 +900,17 @@ DiskGraphSearchResult PackedDiskGraphIndex::search_one(
                  std::size_t{1}, config.search_width);
 
   DiskGraphSearchResult output;
+  // 只在真正拿到锁之后计时：此前写在该字段里的值恒为 0（锁前从未打点），
+  // 无法用于论证锁竞争。
   output.stats.search_mutex_wait_us = search_mutex_wait_us;
-  auto state = initialize_search_state(query, effective_config, output);
+  // initialize_search_state 成功后才持有会话；它自身的失败（已并发、非 PQ 路径、
+  // ADC 表构建）不会在这里减计数，否则 size_t 下溢会让该 index 永久拒绝搜索。
+  struct SessionRelease {
+    std::atomic<std::size_t>& live;
+    ~SessionRelease() { live.fetch_sub(1, std::memory_order_relaxed); }
+  } release{live_sessions_};
+  std::unique_ptr<SearchState> state =
+      initialize_search_state(query, effective_config, output);
   while (!state->candidates.empty() &&
          output.stats.expanded < config.search_width) {
     std::vector<SearchResult> batch =

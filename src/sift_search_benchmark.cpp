@@ -24,6 +24,7 @@
 #include <sys/stat.h>
 #endif
 
+#include "core/platform_io.h"
 #include "data/dataset.h"
 #include "graph/disk_graph_index.h"
 
@@ -65,6 +66,8 @@ struct Args {
   std::size_t pq_centroids = 256;
   std::size_t pq_train_limit = 100000;
   std::size_t pq_iterations = 8;
+  bool pq_options_explicit = false;
+  bool pq_centroids_explicit = false;
   std::size_t rerank_topk = 100;
 
   std::size_t top_k = 10;
@@ -83,6 +86,7 @@ struct Args {
   bool protect_hot_pages = true;
   std::size_t hot_degree_threshold = 0;
   std::size_t num_search_threads = 1;
+  bool memory_budget_enforce = true;
   bool enable_prefetch = false;
   bool enable_prefetch_explicit = false;
   std::string prefetch_policy = "none";
@@ -97,11 +101,21 @@ struct Args {
 struct MemoryBudgetReport {
   std::uint64_t dataset_bytes = 0;
   std::uint64_t budget_bytes = 0;
+  // 模型常驻部分：每 worker 的 PQ codes/码本与 node→page 目录。
+  std::uint64_t model_bytes = 0;
+  std::uint64_t directory_bytes = 0;
   std::uint64_t fixed_resident_bytes = 0;
+  std::uint64_t in_degree_bytes = 0;
+  std::uint64_t io_buffer_bytes = 0;
   std::uint64_t cache_bytes = 0;
   std::uint64_t estimated_resident_bytes = 0;
   double estimated_resident_ratio = 0.0;
+  // 每页解码后的邻接 vector 容量之和（已经计入 cache_bytes）。
+  std::uint64_t cache_neighbor_overhead_bytes = 0;
   bool cache_pages_auto = false;
+  bool cache_truncated = false;
+  bool budget_pass = true;
+  std::size_t requested_cache_pages = 0;
 };
 
 struct SearchAggregate {
@@ -207,6 +221,7 @@ void print_help() {
       << "  --cache-policy NAME          none/lru/2q/graph-aware-2q/agent, default graph-aware-2q\n"
       << "  --cache-pages N              Page cache capacity, default auto within memory budget\n"
       << "  --memory-budget-ratio R      Resident memory budget ratio, default 0.20\n"
+      << "  --memory-budget-enforce 0|1  Truncate --cache-pages to the budget, default 1\n"
       << "  --io-mode NAME               pread, odirect, or io_uring, default io_uring\n"
       << "  --io-batch N                 I/O batch size, default 16\n"
       << "  --io-depth N                 I/O depth for io_uring, default 32\n"
@@ -320,9 +335,11 @@ Args parse_args(int argc, char** argv) {
     } else if (name == "--pq-subspaces" || name == "--pq_subspaces") {
       args.pq_subspaces = parse_size_value(require_value(i, argc, argv, name),
                                            name, 1);
+      args.pq_options_explicit = true;
     } else if (name == "--pq-centroids" || name == "--pq_centroids") {
       args.pq_centroids = parse_size_value(require_value(i, argc, argv, name),
                                            name, 2);
+      args.pq_centroids_explicit = true;
     } else if (name == "--pq-train-limit" || name == "--pq_train_limit") {
       args.pq_train_limit =
           parse_size_value(require_value(i, argc, argv, name), name, 1);
@@ -380,6 +397,10 @@ Args parse_args(int argc, char** argv) {
     } else if (name == "--memory-budget-ratio" ||
                name == "--memory_budget_ratio") {
       args.memory_budget_ratio = std::stod(require_value(i, argc, argv, name));
+    } else if (name == "--memory-budget-enforce" ||
+               name == "--memory_budget_enforce") {
+      args.memory_budget_enforce =
+          parse_bool_value(require_value(i, argc, argv, name), name);
     } else if (name == "--protect-hot-pages") {
       args.protect_hot_pages =
           parse_bool_value(require_value(i, argc, argv, name), name);
@@ -498,8 +519,11 @@ std::string json_escape(const std::string& value) {
 
 std::vector<std::string> command_lines(const std::string& command) {
   std::vector<std::string> lines;
-#ifndef _WIN32
+#if defined(_WIN32)
+  FILE* pipe = _popen(command.c_str(), "r");
+#else
   FILE* pipe = popen(command.c_str(), "r");
+#endif
   if (pipe == nullptr) {
     return lines;
   }
@@ -514,9 +538,10 @@ std::vector<std::string> command_lines(const std::string& command) {
       lines.push_back(std::move(line));
     }
   }
-  (void)pclose(pipe);
+#if defined(_WIN32)
+  (void)_pclose(pipe);
 #else
-  (void)command;
+  (void)pclose(pipe);
 #endif
   return lines;
 }
@@ -784,26 +809,22 @@ std::vector<std::uint32_t> select_search_entries(
   return {static_cast<std::uint32_t>(manifest.entry_id)};
 }
 
-std::optional<agent_aware::PQTrainingStats> train_pq_if_enabled(
-    const Args& args, const agent_aware::VectorSet& base,
-    agent_aware::PqAdcModel& pq_model) {
-  if (!args.enable_pq) {
-    return std::nullopt;
-  }
-  agent_aware::PQTrainingConfig config;
-  config.subspaces = args.pq_subspaces;
-  config.centroids = args.pq_centroids;
-  config.train_limit = args.pq_train_limit;
-  config.iterations = args.pq_iterations;
-  config.seed = args.seed;
-  return pq_model.train(base, config);
-}
-
 agent_aware::PQTrainingStats pq_stats_from_model(
     const agent_aware::PqAdcModel& model, std::size_t training_vectors) {
   return agent_aware::PQTrainingStats{
       model.vector_count(), training_vectors, model.dim(), model.subspaces(),
       model.centroids(), model.code_bytes(), model.codebook_bytes()};
+}
+
+// 搜索阶段复用索引内的 PQ 模型，而不是重新训练：训练已在 agent-aware-build
+// 时完成并写进 V3 索引，重训既会改变码本（索引里的 codes 对不上），也会让
+// 每个 benchmark 进程额外付出训练时间。这里只记录模型规模。
+std::optional<agent_aware::PQTrainingStats> load_index_pq_stats(
+    const agent_aware::PqAdcModel& model) {
+  if (!model.enabled()) {
+    throw std::runtime_error("Packed graph index does not contain a PQ model");
+  }
+  return pq_stats_from_model(model, 0);
 }
 
 MemoryBudgetReport apply_memory_budget_defaults(
@@ -812,9 +833,7 @@ MemoryBudgetReport apply_memory_budget_defaults(
     const std::optional<agent_aware::PQTrainingStats>& pq_stats,
     std::vector<std::string>& warnings) {
   MemoryBudgetReport report;
-  report.dataset_bytes =
-      metadata.vector_count * metadata.dim *
-      sizeof(float);
+  report.dataset_bytes = metadata.vector_count * metadata.dim * sizeof(float);
   report.budget_bytes = static_cast<std::uint64_t>(
       std::floor(static_cast<double>(report.dataset_bytes) *
                  args.memory_budget_ratio));
@@ -826,29 +845,78 @@ MemoryBudgetReport apply_memory_budget_defaults(
   const std::size_t workers =
       std::min(args.num_search_threads,
                std::max<std::size_t>(1, dataset.queries.size()));
-  // 多线程搜索每个 worker 都会创建一份 index/cache 实例，因此 directory 和 cache 估算按 worker 数放大。
-  const std::size_t directory_copies = workers == 1 ? 1 : workers + 1;
-  const std::uint64_t node_directory_bytes =
-      metadata.vector_count *
-      sizeof(std::uint32_t) * directory_copies;
-  report.fixed_resident_bytes = pq_bytes + node_directory_bytes;
+  // 多线程搜索每个 worker 都会打开一份 index：PQ 码、目录、页 cache、io_uring
+  // 对齐缓冲都按 worker 数放大（主线程那份不计入搜索期常驻）。hub-aware 策略下
+  // 每个 worker 还会额外持有一份 node 入度表。
+  const std::size_t copies = workers;
+  report.model_bytes = pq_bytes * copies;
+  report.directory_bytes =
+      static_cast<std::uint64_t>(metadata.vector_count) *
+      sizeof(std::uint32_t) * copies;
+  const bool needs_in_degrees =
+      args.cache_policy == "graph-aware-2q" || args.cache_policy == "agent" ||
+      args.protect_hot_pages;
+  report.in_degree_bytes =
+      needs_in_degrees
+          ? static_cast<std::uint64_t>(metadata.vector_count) *
+                sizeof(std::uint32_t) * copies
+          : 0;
+  // io_uring 模式下每个 index 持有 io_depth 个页大小对齐缓冲。
+  const bool uring_possible = args.io_mode == "io_uring";
+  report.io_buffer_bytes =
+      uring_possible
+          ? static_cast<std::uint64_t>(args.io_depth) * metadata.page_size *
+                copies
+          : 0;
+  report.fixed_resident_bytes = report.model_bytes + report.directory_bytes +
+                                report.in_degree_bytes +
+                                report.io_buffer_bytes;
+
+  // 解码页的真实常驻代价 = 页字节 + 每个节点一份邻接 vector，比 page_size 大得多；
+  // 预算必须按它换算 cache 页数，否则"预算内"只是公式上的。
+  const std::size_t resident_page_bytes =
+      agent_aware::PackedDiskGraphIndex::resident_page_bytes(metadata);
+  report.cache_neighbor_overhead_bytes =
+      static_cast<std::uint64_t>(resident_page_bytes - metadata.page_size);
+
+  const std::uint64_t available =
+      report.budget_bytes > report.fixed_resident_bytes
+          ? report.budget_bytes - report.fixed_resident_bytes
+          : 0;
+  const std::uint64_t max_total_pages =
+      resident_page_bytes == 0 ? 0 : available / resident_page_bytes;
+  const auto pages_per_worker = static_cast<std::size_t>(
+      max_total_pages / std::max<std::size_t>(1, workers));
 
   if (!args.cache_pages_requested && args.cache_policy != "none") {
     report.cache_pages_auto = true;
-    const std::uint64_t available =
-        report.budget_bytes > report.fixed_resident_bytes
-            ? report.budget_bytes - report.fixed_resident_bytes
-            : 0;
-    args.cache_pages =
-        static_cast<std::size_t>(available / workers / args.page_size);
+    args.cache_pages = pages_per_worker;
     if (args.cache_pages == 0 && available > 0) {
       warnings.push_back(
-          "memory budget leaves less than one cache page per worker");
+          "memory budget leaves less than one decoded cache page per worker");
     }
+  } else if (args.cache_policy != "none" &&
+             args.cache_pages > pages_per_worker) {
+    report.requested_cache_pages = args.cache_pages;
+    // 预算从"提示"变成硬约束：超出时截断到预算允许的页数并如实记录，
+    // --memory-budget-enforce 0 仅用于对照实验。
+    if (args.memory_budget_enforce) {
+      args.cache_pages = pages_per_worker;
+      report.cache_truncated = true;
+      warnings.push_back(
+          "requested --cache-pages exceeds the memory budget; truncated to " +
+          std::to_string(pages_per_worker) + " pages per worker");
+    } else {
+      report.budget_pass = false;
+      warnings.push_back(
+          "--memory-budget-enforce 0 and --cache-pages exceed the memory "
+          "budget; budget_pass=false");
+    }
+  } else {
+    report.requested_cache_pages = args.cache_pages;
   }
-
-  report.cache_bytes =
-      static_cast<std::uint64_t>(args.cache_pages) * args.page_size * workers;
+  report.cache_bytes = static_cast<std::uint64_t>(args.cache_pages) *
+                       resident_page_bytes * workers;
   report.estimated_resident_bytes =
       report.fixed_resident_bytes + report.cache_bytes;
   report.estimated_resident_ratio =
@@ -856,7 +924,17 @@ MemoryBudgetReport apply_memory_budget_defaults(
           ? 0.0
           : static_cast<double>(report.estimated_resident_bytes) /
                 static_cast<double>(report.dataset_bytes);
-  if (report.estimated_resident_bytes > report.budget_bytes) {
+  // 估算值必须等于"实际生效"的 cache 页数：被截断或超过预算时仍按请求页数
+  // 估算，会把 estimated_resident_ratio 报成一个并不会发生的配置。
+  if (report.fixed_resident_bytes > report.budget_bytes) {
+    report.budget_pass = false;
+    warnings.push_back(
+        "PQ codes + codebook + directory alone exceed the dataset memory "
+        "budget; no cache configuration can bring the process inside it");
+  }
+  if (report.estimated_resident_bytes > report.budget_bytes &&
+      !report.cache_truncated) {
+    report.budget_pass = false;
     warnings.push_back(
         "estimated resident memory exceeds configured dataset budget");
   }
@@ -990,6 +1068,7 @@ std::string json_for_run(const Args& args,
                          const std::optional<agent_aware::PQTrainingStats>&
                              pq_stats,
                          const MemoryBudgetReport& memory_budget,
+                         std::uint64_t baseline_rss,
                          const std::vector<std::uint32_t>& entry_seed_ids,
                          const std::vector<std::string>& warnings) {
   const double elapsed_s = std::max(1e-9, aggregate.elapsed_ms / 1000.0);
@@ -1000,6 +1079,8 @@ std::string json_for_run(const Args& args,
       percentile_latency_ms(aggregate.query_latency_ms, 95.0);
   const double latency_p99_ms =
       percentile_latency_ms(aggregate.query_latency_ms, 99.0);
+  const double latency_p999_ms =
+      percentile_latency_ms(aggregate.query_latency_ms, 99.9);
   const double recall =
       aggregate.recall_queries == 0
           ? 0.0
@@ -1041,9 +1122,17 @@ std::string json_for_run(const Args& args,
           ? "fallback"
           : (io_status.io_uring_enabled ? "io_uring" : "sync");
   const auto dirty_files =
+#if defined(_WIN32)
+      command_lines("git status --porcelain --untracked-files=all 2>nul");
+#else
       command_lines("git status --porcelain --untracked-files=all 2>/dev/null");
+#endif
   const std::string git_commit =
+#if defined(_WIN32)
+      first_command_line("git rev-parse HEAD 2>nul");
+#else
       first_command_line("git rev-parse HEAD 2>/dev/null");
+#endif
 
   std::ostringstream json;
   json << std::boolalpha;
@@ -1127,11 +1216,46 @@ std::string json_for_run(const Args& args,
        << ",\n";
   json << "  \"fixed_resident_bytes\": "
        << memory_budget.fixed_resident_bytes << ",\n";
+  json << "  \"model_bytes\": " << memory_budget.model_bytes << ",\n";
+  json << "  \"directory_bytes\": " << memory_budget.directory_bytes
+       << ",\n";
+  json << "  \"in_degree_bytes\": " << memory_budget.in_degree_bytes << ",\n";
+  json << "  \"io_buffer_bytes\": " << memory_budget.io_buffer_bytes << ",\n";
+  json << "  \"resident_page_bytes\": "
+       << agent_aware::PackedDiskGraphIndex::resident_page_bytes(
+              index_metadata)
+       << ",\n";
+  json << "  \"cache_neighbor_overhead_bytes\": "
+       << memory_budget.cache_neighbor_overhead_bytes << ",\n";
   json << "  \"cache_bytes\": " << memory_budget.cache_bytes << ",\n";
+  json << "  \"requested_cache_pages\": "
+       << memory_budget.requested_cache_pages << ",\n";
+  json << "  \"cache_pages_truncated\": " << memory_budget.cache_truncated
+       << ",\n";
+  json << "  \"memory_budget_enforce\": " << args.memory_budget_enforce
+       << ",\n";
+  json << "  \"memory_budget_pass\": " << memory_budget.budget_pass << ",\n";
   json << "  \"estimated_resident_bytes\": "
        << memory_budget.estimated_resident_bytes << ",\n";
   json << "  \"estimated_resident_ratio\": "
        << memory_budget.estimated_resident_ratio << ",\n";
+  json << "  \"measured_baseline_rss_bytes\": " << baseline_rss << ",\n";
+  // 真实内存：VmHWM/PeakWorkingSet 覆盖模型、目录、cache、会话临时对象和其它
+  // 未建模的分配，是在"预算公式"之外唯一可被外部工具复核的数字。
+  const std::uint64_t measured_peak = agent_aware::process_peak_resident_bytes();
+  const std::uint64_t measured_current =
+      agent_aware::process_current_resident_bytes();
+  json << "  \"measured_peak_rss_bytes\": " << measured_peak << ",\n";
+  json << "  \"measured_current_rss_bytes\": " << measured_current << ",\n";
+  json << "  \"measured_peak_rss_ratio\": "
+       << (memory_budget.dataset_bytes == 0
+               ? 0.0
+               : static_cast<double>(measured_peak) /
+                     static_cast<double>(memory_budget.dataset_bytes))
+       << ",\n";
+  json << "  \"rss_within_budget\": "
+       << (measured_peak != 0 && measured_peak <= memory_budget.budget_bytes)
+       << ",\n";
   json << "  \"top_k\": " << args.top_k << ",\n";
   json << "  \"entry_count\": 1,\n";
   json << "  \"entry_strategy\": \"single-medoid\",\n";
@@ -1207,6 +1331,12 @@ std::string json_for_run(const Args& args,
   json << "  \"avg_query_latency_ms\": " << avg_query_latency_ms << ",\n";
   json << "  \"latency_p95_ms\": " << latency_p95_ms << ",\n";
   json << "  \"latency_p99_ms\": " << latency_p99_ms << ",\n";
+  json << "  \"latency_p999_ms\": " << latency_p999_ms << ",\n";
+  json << "  \"bytes_read_per_query\": "
+       << static_cast<double>(aggregate.stats.completed_reads) *
+              static_cast<double>(index_metadata.page_size) /
+              query_count_for_rates
+       << ",\n";
   json << "  \"reads_per_query\": " << reads_per_query << ",\n";
   json << "  \"demand_reads_per_query\": " << demand_reads_per_query << ",\n";
   json << "  \"duplicate_skipped_per_query\": "
@@ -1411,11 +1541,33 @@ int main(int argc, char** argv) {
     }
 
     const agent_aware::PqAdcModel* pq_model_ptr = &index.pq_model();
-    const auto pq_stats = std::optional<agent_aware::PQTrainingStats>(
-        pq_stats_from_model(index.pq_model(), 0));
+    const auto pq_stats = load_index_pq_stats(index.pq_model());
+    // --pq-subspaces/--pq-centroids 只在显式传入且与索引不一致时提示：默认值
+    // 并不代表用户意图，不能对每个未传该参数的运行都报警。
+    if ((args.pq_options_explicit &&
+         index.metadata().pq_subspaces != args.pq_subspaces) ||
+        (args.pq_centroids_explicit &&
+         index.metadata().pq_centroids != args.pq_centroids)) {
+      warnings.push_back(
+          "--pq-subspaces/--pq-centroids only apply to agent-aware-build; "
+          "search uses the PQ model stored in the index");
+    }
     const auto memory_budget =
         apply_memory_budget_defaults(args, dataset, index.metadata(), pq_stats,
                                      warnings);
+    // 预算里的 estimated_resident_bytes 只覆盖本进程的静态结构；而预算本身是
+    // 按"数据集 × 比例"定义的进程总上限，操作系统、主索引、查询集等常驻部分
+    // 必须先扣掉。预热前取一次 RSS 作为基线（此时只加载了索引和查询集）。
+    const std::uint64_t baseline_rss =
+        agent_aware::process_current_resident_bytes();
+    if (memory_budget.budget_bytes > 0 &&
+        baseline_rss + memory_budget.estimated_resident_bytes >
+            memory_budget.budget_bytes) {
+      warnings.push_back(
+          "measured baseline RSS (" + std::to_string(baseline_rss) +
+          " B) plus modelled search structures exceeds the dataset memory "
+          "budget; reduce --memory_budget_ratio inputs or data scale");
+    }
     configure_index_from_args(args, index);
     const auto io_status = index.io_status();
     if (!io_status.fallback_reason.empty()) {
@@ -1432,7 +1584,7 @@ int main(int argc, char** argv) {
     const std::string json =
         json_for_run(args, dataset, index.metadata(), io_status, aggregate, binary_path,
                      pq_stats,
-                     memory_budget, entry_seed_ids, warnings);
+                     memory_budget, baseline_rss, entry_seed_ids, warnings);
     write_json_output(args.output_json, json);
     std::cout << json;
     return 0;

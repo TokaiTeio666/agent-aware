@@ -32,9 +32,29 @@ struct DynamicWriteOptions {
   std::size_t wal_group_max_delay_us = 1000;
   std::size_t version_index_shards = 64;
   std::size_t neighbor_candidate_limit = 1024;
+  // 每个 node_id 在版本索引中保留的最近版本数。读路径只需要"<= 读序列的最新
+  // 一条"，更老的版本对任何读序列都不可见，因此可以安全裁剪；0 表示不限制
+  // （仅用于对照实验，长时间写入会导致内存线性增长）。
+  std::size_t version_history_limit = 4;
   bool enable_wal = true;
   bool enable_auto_flush = true;
   bool enable_background_flush = true;
+};
+
+// 一次 open() 的恢复过程报告。benchmark 直接写入 JSON，避免把"重放耗时"
+// 和"重建版本索引耗时"混成一个数字。
+struct DynamicRecoveryReport {
+  std::size_t sstable_count = 0;
+  std::size_t sstable_records = 0;
+  std::size_t wal_segments = 0;
+  std::size_t wal_records = 0;
+  std::size_t wal_truncated_segments = 0;
+  std::string wal_truncation_reason;
+  std::uint64_t replayed_sequence = 0;
+  std::uint64_t visible_delta_records = 0;
+  double sstable_replay_ms = 0.0;
+  double wal_replay_ms = 0.0;
+  double version_build_ms = 0.0;
 };
 
 struct DynamicWriteStats {
@@ -76,11 +96,19 @@ class DynamicWriteManager {
   ~DynamicWriteManager();
 
   bool open();
+  // insert 与 update 都表示"把 node_id 设为 vector"。对已存在（含已被删除）
+  // 的 id，新版本就是以新的 sequence 重新可见，因此 update 只是 insert 的
+  // 别名；写入侧不会校验 id 是否存在（那需要在提交线程上再加一次读）。
   bool insert(NodeId node_id, const float* vector, std::uint32_t dim);
   bool update(NodeId node_id, const float* vector, std::uint32_t dim);
   bool erase(NodeId node_id);
   bool flush();
 
+  DynamicRecoveryReport recovery_report() const;
+  // 版本索引中当前的物理记录数（含各 id 的历史版本），用于观察裁剪效果。
+  std::size_t version_index_record_count() const;
+  // 本进程提交到版本索引的写入总条数（裁剪前），配合上一项可观察裁剪效果。
+  std::uint64_t version_record_write_count() const;
   std::uint64_t current_sequence() const;
   DynamicWriteStats write_stats() const;
   std::unordered_map<NodeId, DynamicRecord> latest_records_for(
@@ -161,6 +189,10 @@ class DynamicWriteManager {
   std::uint64_t metadata_generation_ = 0;
 
   std::vector<std::shared_ptr<VersionShard>> version_shards_;
+  // 本进程内写入合计，避免版本裁剪后无法解释"已写多少条"。
+  std::atomic<std::size_t> version_index_records_{0};
+  std::atomic<std::uint64_t> committed_write_records_{0};
+  DynamicRecoveryReport recovery_report_;
   std::atomic<std::uint64_t> latest_sequence_{0};
   std::atomic<std::uint64_t> next_sequence_id_{1};
   std::atomic<std::uint64_t> next_sstable_id_{1};

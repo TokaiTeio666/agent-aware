@@ -26,6 +26,7 @@
 
 #include "core/benchmark_support.h"
 #include "core/brute_force.h"
+#include "core/platform_io.h"
 #include "data/dataset.h"
 #include "dynamic/dynamic_write_manager.h"
 #include "dynamic/manifest.h"
@@ -56,7 +57,10 @@ struct Args {
   bool enable_compaction = false;
   bool compaction_background = false;
   std::size_t compaction_interval_ms = 1000;
-  double recall_sample_rate = 1.0;
+  // 默认不做 exact Recall 回算：每次回算都要全量扫描 base 并对全部可见 delta
+  // 排序，把它算进读延迟会让默认参数下的 QPS 完全不可比。正确性场景显式传
+  // --recall_sample_rate 1 并配合 --recall_max_samples_per_sec 限速。
+  double recall_sample_rate = 0.0;
   double recall_max_samples_per_sec = 0.0;
   std::size_t base_count = 1000;
   std::size_t query_count = 256;
@@ -195,6 +199,11 @@ struct ScenarioResult {
   double memory_usage_mb = 0.0;
   double disk_usage_mb = 0.0;
   double recovery_time_ms = 0.0;
+  // 进程级真实常驻内存（不限动态层），以及动态层的恢复分解。
+  std::uint64_t process_peak_rss_bytes = 0;
+  std::size_t version_index_record_count = 0;
+  std::size_t committed_write_records = 0;
+  agent_aware::dynamic::DynamicRecoveryReport recovery;
   std::string search_mode = "memory_exact";
   double graph_reads_per_read = 0.0;
   double cache_hit_rate = 0.0;
@@ -262,7 +271,7 @@ void print_help() {
       << "  --write_threads N            Writer threads for concurrent mode\n"
       << "  --read_ratio R               Run one custom scenario\n"
       << "  --write_ratio R              Custom scenario write ratio\n"
-      << "  --recall_sample_rate R       Dynamic recall sampling rate, default 1\n"
+      << "  --recall_sample_rate R       Dynamic recall sampling rate, default 0\n"
       << "  --recall_max_samples_per_sec R  Optional global recall sample rate cap\n"
       << "  --topk N                     Search top-k, default 10\n"
       << "  --insert_batch_size N        Inserts per write event\n"
@@ -471,7 +480,11 @@ std::string trim_ascii(std::string value) {
 std::string capture_command(const char* command) {
   std::array<char, 256> buffer{};
   std::string output;
+#if defined(_WIN32)
+  FILE* pipe = _popen(command, "r");
+#else
   FILE* pipe = popen(command, "r");
+#endif
   if (pipe == nullptr) {
     return "unknown";
   }
@@ -482,7 +495,11 @@ std::string capture_command(const char* command) {
       break;
     }
   }
+#if defined(_WIN32)
+  const int status = _pclose(pipe);
+#else
   const int status = pclose(pipe);
+#endif
   if (status != 0 && output.empty()) {
     return "unknown";
   }
@@ -491,13 +508,25 @@ std::string capture_command(const char* command) {
 }
 
 std::string git_commit() {
+#if defined(_WIN32)
+  return capture_command("git rev-parse --short HEAD 2>nul");
+#else
   return capture_command("git rev-parse --short HEAD 2>/dev/null");
+#endif
 }
 
 std::string git_dirty_status() {
-  const std::string status =
-      capture_command("git status --short 2>/dev/null");
-  return status == "unknown" || status.empty() ? "clean" : "dirty";
+  // "unknown" 不能折叠成 "clean"：没有 git 时无法判断工作树是否干净，
+  // 结果文件必须如实记录，否则会被误读为"干净构建产出的数字"。
+#if defined(_WIN32)
+  const std::string status = capture_command("git status --short 2>nul");
+#else
+  const std::string status = capture_command("git status --short 2>/dev/null");
+#endif
+  if (status == "unknown") {
+    return "unknown";
+  }
+  return status.empty() ? "clean" : "dirty";
 }
 
 std::size_t count_sstables(const std::filesystem::path& dynamic_dir) {
@@ -948,9 +977,11 @@ ScenarioResult finalize_result(
   result.read_breakdown = summarize_breakdown(std::move(metrics.read_breakdown));
   result.recall_samples = metrics.recall_samples;
   result.recall_sample_rate = args.recall_sample_rate;
+  // 没有采样时 recall 应记为缺失（JSON null / CSV 空），而不是伪造的 1.0：
+  // 0 个样本既不能证明正确性，也不代表 100% 召回。
   result.recall_at_10 =
       metrics.recall_samples == 0
-          ? 1.0
+          ? 0.0
           : metrics.recall_sum / static_cast<double>(metrics.recall_samples);
   if (metrics.recall_samples > 0) {
     result.recall_read_sequence_min = metrics.recall_sequence_min;
@@ -970,6 +1001,8 @@ ScenarioResult finalize_result(
   result.disk_usage_mb =
       static_cast<double>(directory_bytes(scenario_dir)) / (1024.0 * 1024.0);
   result.recovery_time_ms = recovery_ms;
+  result.process_peak_rss_bytes =
+      agent_aware::process_peak_resident_bytes();
   result.search_mode = args.index_path.empty() ? "memory_exact" : "ssd_graph";
   result.graph_reads_per_read =
       metrics.read_ops == 0 ? 0.0
@@ -1085,6 +1118,8 @@ ScenarioResult close_scenario(
   }
   const auto records = manager->collect_all_delta_records();
   const auto write_pipeline = manager->write_stats();
+  const auto version_records = manager->version_index_record_count();
+  const auto committed_records = manager->version_record_write_count();
   if (!manager->close()) {
     throw std::runtime_error("Dynamic close failed");
   }
@@ -1100,10 +1135,17 @@ ScenarioResult close_scenario(
     throw std::runtime_error("Dynamic recovery open failed");
   }
   const double recovery_ms = elapsed_ms(recovery_start, Clock::now());
+  const auto recovery = recovered.recovery_report();
   (void)recovered.close();
-  return finalize_result(args, scenario, scenario_dir, records,
-                         std::move(metrics), compaction, start, end, flush_ms,
-                         recovery_ms, pq_runtime, write_pipeline);
+  auto result = finalize_result(args, scenario, scenario_dir, records,
+                                std::move(metrics), compaction, start, end,
+                                flush_ms, recovery_ms, pq_runtime,
+                                write_pipeline);
+  // 恢复实测：重新打开动态目录，记录 SSTable/WAL 重放与版本索引重建的分解。
+  result.recovery = recovery;
+  result.version_index_record_count = version_records;
+  result.committed_write_records = committed_records;
+  return result;
 }
 
 ScenarioResult run_sequential_scenario(
@@ -1180,7 +1222,11 @@ ScenarioResult run_concurrent_scenario(
   }
 
   std::atomic<bool> stop{false};
-  std::atomic<std::size_t> claimed_ops{0};
+  // 只由"已经完成"的槽位推进：若用 CAS 在领取时就递增，下一个 slot 的
+  // reader/writer 会与上一个操作并发执行，reader 等待写线程时多个线程在同一个
+  // 缓存行上 CAS/yield 自旋，短运行（预热后仅几十次操作）的吞吐会出现
+  // 20%-40% 的轮次间漂移（见 results/2026-10-25-windows-msvc/stability）。
+  std::atomic<std::size_t> confirmed_ops{0};
   std::atomic<std::size_t> query_cursor{0};
   std::atomic<std::int64_t> next_recall_ns{0};
   std::atomic<std::uint32_t> next_node_id{
@@ -1192,7 +1238,7 @@ ScenarioResult run_concurrent_scenario(
     // Reader/writer 各自只能领取匹配的确定性槽位，使 timed 模式的实际操作数
     // 仍遵守配置比例，而不是退化为由两类 worker 的相对速度决定。
     while (!stop.load(std::memory_order_relaxed)) {
-      auto id = claimed_ops.load(std::memory_order_relaxed);
+      const auto id = confirmed_ops.load(std::memory_order_acquire);
       if (args.duration_sec <= 0.0 && id >= args.num_operations) {
         stop.store(true, std::memory_order_relaxed);
         return false;
@@ -1202,17 +1248,17 @@ ScenarioResult run_concurrent_scenario(
       const auto reads_after = static_cast<std::size_t>(
           std::floor(static_cast<double>(id + 1) * scenario.read_ratio));
       const bool slot_is_read = reads_after > reads_before;
-      if (slot_is_read != wants_read) {
-        std::this_thread::yield();
-        continue;
-      }
-      if (claimed_ops.compare_exchange_weak(
-              id, id + 1, std::memory_order_relaxed,
-              std::memory_order_relaxed)) {
+      if (slot_is_read == wants_read) {
         return true;
       }
+      std::this_thread::yield();
     }
     return false;
+  };
+  // 每个 worker 按顺序完成自己领取的槽位：槽位 i 只有在 i-1 完成后才有人领取，
+  // 因此一次操作结束时推进 confirmed_ops 就等价于"按序提交"。
+  auto confirm_operation = [&]() {
+    confirmed_ops.fetch_add(1, std::memory_order_release);
   };
 
   std::vector<ThreadMetrics> reader_metrics(read_threads);
@@ -1253,6 +1299,7 @@ ScenarioResult run_concurrent_scenario(
                       queries.size()];
           execute_read(args, base, query.data(), manager, engine.get(), metrics,
                        rng, next_recall_ns);
+          confirm_operation();
         }
       } catch (...) {
         errors[thread_id] = std::current_exception();
@@ -1274,6 +1321,7 @@ ScenarioResult run_concurrent_scenario(
                     next_node_id.fetch_add(1, std::memory_order_relaxed)),
                 write_index.fetch_add(1, std::memory_order_relaxed)};
           });
+          confirm_operation();
         }
       } catch (...) {
         errors[read_threads + thread_id] = std::current_exception();
@@ -1513,7 +1561,13 @@ void write_json(const std::filesystem::path& output_path,
            << "      \"write_p50_ms\": " << result.write_latency.p50 << ",\n"
            << "      \"write_p95_ms\": " << result.write_latency.p95 << ",\n"
            << "      \"write_p99_ms\": " << result.write_latency.p99 << ",\n"
-           << "      \"recall_at_10\": " << result.recall_at_10 << ",\n"
+           << "      \"recall_at_10\": ";
+  if (result.recall_samples == 0) {
+    output << "null";
+  } else {
+    output << result.recall_at_10;
+  }
+  output << ",\n"
            << "      \"recall_samples\": " << result.recall_samples << ",\n"
            << "      \"recall_sample_rate\": " << result.recall_sample_rate << ",\n"
            << "      \"recall_read_sequence_min\": "
@@ -1530,6 +1584,36 @@ void write_json(const std::filesystem::path& output_path,
            << "      \"memory_usage_mb\": " << result.memory_usage_mb << ",\n"
            << "      \"disk_usage_mb\": " << result.disk_usage_mb << ",\n"
            << "      \"recovery_time_ms\": " << result.recovery_time_ms << ",\n"
+           << "      \"recovery\": {\n"
+           << "        \"sstable_count\": " << result.recovery.sstable_count
+           << ",\n"
+           << "        \"sstable_records\": " << result.recovery.sstable_records
+           << ",\n"
+           << "        \"wal_segments\": " << result.recovery.wal_segments
+           << ",\n"
+           << "        \"wal_records\": " << result.recovery.wal_records
+           << ",\n"
+           << "        \"wal_truncated_segments\": "
+           << result.recovery.wal_truncated_segments << ",\n"
+           << "        \"wal_truncation_reason\": \""
+           << json_escape(result.recovery.wal_truncation_reason) << "\",\n"
+           << "        \"replayed_sequence\": " << result.recovery.replayed_sequence
+           << ",\n"
+           << "        \"visible_delta_records\": "
+           << result.recovery.visible_delta_records << ",\n"
+           << "        \"sstable_replay_ms\": " << result.recovery.sstable_replay_ms
+           << ",\n"
+           << "        \"wal_replay_ms\": " << result.recovery.wal_replay_ms
+           << ",\n"
+           << "        \"version_build_ms\": " << result.recovery.version_build_ms
+           << "\n"
+           << "      },\n"
+           << "      \"version_index_record_count\": "
+           << result.version_index_record_count << ",\n"
+           << "      \"committed_write_records\": "
+           << result.committed_write_records << ",\n"
+           << "      \"process_peak_rss_bytes\": "
+           << result.process_peak_rss_bytes << ",\n"
            << "      \"search_mode\": \"" << json_escape(result.search_mode)
            << "\",\n"
            << "      \"graph_reads_per_read\": "

@@ -4,6 +4,7 @@
 #include <deque>
 #include <fstream>
 #include <limits>
+#include <sstream>
 #include <stdexcept>
 #include <vector>
 
@@ -86,7 +87,16 @@ DiskGraphBuildResult PackedDiskGraphBuilder::build(
   const std::size_t nodes_per_page = packed_nodes_per_page(
       base.dim, config.degree, config.page_size);
   if (nodes_per_page == 0) {
-    throw std::runtime_error("Packed page cannot hold even one node");
+    // 单节点约需 dim*4 + degree*4 + 8 字节，再加整页的 id/degree SoA 区与页头。
+    // 报错信息带上可执行的最小 page_size，避免使用者反复试 4096。
+    std::ostringstream message;
+    message << "Packed page cannot hold even one node (dim=" << base.dim
+            << ", degree=" << config.degree
+            << ", page_size=" << config.page_size
+            << "); use page_size >= "
+            << (8 + base.dim * sizeof(float) + config.degree * sizeof(std::uint32_t))
+            << " or a smaller --graph-degree";
+    throw std::runtime_error(message.str());
   }
 
   const auto built_graph = build_vamana_graph(base, config);

@@ -1,13 +1,12 @@
 #include "dynamic/wal.h"
 
-#include <cerrno>
 #include <cstddef>
 #include <cstdint>
 #include <cstring>
-#include <fcntl.h>
 #include <fstream>
 #include <limits>
-#include <unistd.h>
+
+#include "core/platform_io.h"
 
 namespace agent_aware::dynamic {
 namespace {
@@ -39,18 +38,29 @@ std::uint32_t checksum_bytes(const unsigned char* data, std::size_t size) {
   return hash;
 }
 
-std::uint32_t checksum_payload(const std::vector<float>& vector,
-                               const std::vector<NodeId>& neighbors) {
+// 校验覆盖解码所需的全部头部字段与载荷：tombstone 位、node id、sequence
+// 或 dim 翻转都会被识别为坏记录，而不是被当作有效写入重放。
+std::uint32_t checksum_record(const WalRecordHeader& header,
+                              const std::vector<float>& vector,
+                              const std::vector<NodeId>& neighbors) {
   std::uint32_t hash = 2166136261u;
+  auto fold = [&hash](const void* data, std::size_t size) {
+    const std::uint32_t part = checksum_bytes(
+        static_cast<const unsigned char*>(data), size);
+    hash ^= part + 0x9e3779b9u + (hash << 6u) + (hash >> 2u);
+  };
+  fold(&header.op_type, sizeof(header.op_type));
+  fold(&header.sequence_id, sizeof(header.sequence_id));
+  fold(&header.node_id, sizeof(header.node_id));
+  fold(&header.dim, sizeof(header.dim));
+  fold(&header.vector_bytes, sizeof(header.vector_bytes));
+  fold(&header.neighbor_count, sizeof(header.neighbor_count));
+  fold(&header.deleted, sizeof(header.deleted));
   if (!vector.empty()) {
-    hash = checksum_bytes(reinterpret_cast<const unsigned char*>(vector.data()),
-                          vector.size() * sizeof(float));
+    fold(vector.data(), vector.size() * sizeof(float));
   }
   if (!neighbors.empty()) {
-    const auto neighbor_hash = checksum_bytes(
-        reinterpret_cast<const unsigned char*>(neighbors.data()),
-        neighbors.size() * sizeof(NodeId));
-    hash ^= neighbor_hash + 0x9e3779b9u + (hash << 6u) + (hash >> 2u);
+    fold(neighbors.data(), neighbors.size() * sizeof(NodeId));
   }
   return hash;
 }
@@ -83,7 +93,8 @@ bool encode_record(const DynamicRecord& record, std::vector<char>& output) {
       static_cast<std::uint32_t>(record.vector.size() * sizeof(float));
   header.neighbor_count = static_cast<std::uint32_t>(record.neighbors.size());
   header.deleted = record.deleted ? 1 : 0;
-  header.payload_checksum = checksum_payload(record.vector, record.neighbors);
+  header.payload_checksum =
+      checksum_record(header, record.vector, record.neighbors);
 
   append_value(output, header.magic);
   append_value(output, header.version);
@@ -103,24 +114,6 @@ bool encode_record(const DynamicRecord& record, std::vector<char>& output) {
     const auto* begin = reinterpret_cast<const char*>(record.neighbors.data());
     output.insert(output.end(), begin,
                   begin + record.neighbors.size() * sizeof(NodeId));
-  }
-  return true;
-}
-
-bool write_all(int fd, const char* data, std::size_t size) {
-  std::size_t written = 0;
-  while (written < size) {
-    const auto result = ::write(fd, data + written, size - written);
-    if (result < 0) {
-      if (errno == EINTR) {
-        continue;
-      }
-      return false;
-    }
-    if (result == 0) {
-      return false;
-    }
-    written += static_cast<std::size_t>(result);
   }
   return true;
 }
@@ -163,7 +156,7 @@ bool node_id_fits(NodeId node_id, std::uint64_t value) {
 }  // namespace
 
 WalWriter::WalWriter(const std::filesystem::path& path) : path_(path) {
-  fd_ = ::open(path_.c_str(), O_CREAT | O_WRONLY | O_APPEND | O_CLOEXEC, 0644);
+  file_ = std::fopen(path_.string().c_str(), "ab");
 }
 
 WalWriter::~WalWriter() { (void)close(); }
@@ -173,7 +166,7 @@ bool WalWriter::append(const DynamicRecord& record) {
 }
 
 bool WalWriter::append_batch(const std::vector<DynamicRecord>& records) {
-  if (closed_ || fd_ < 0) {
+  if (closed_ || file_ == nullptr) {
     return false;
   }
   std::vector<char> encoded;
@@ -182,51 +175,62 @@ bool WalWriter::append_batch(const std::vector<DynamicRecord>& records) {
       return false;
     }
   }
-  return encoded.empty() || write_all(fd_, encoded.data(), encoded.size());
+  return encoded.empty() ||
+         std::fwrite(encoded.data(), 1, encoded.size(), file_) ==
+             encoded.size();
 }
 
 bool WalWriter::sync() {
-  if (closed_ || fd_ < 0) {
+  if (closed_ || file_ == nullptr) {
     return false;
   }
-  while (::fdatasync(fd_) != 0) {
-    if (errno != EINTR) {
-      return false;
-    }
-  }
-  return true;
+  return std::fflush(file_) == 0 && fsync_file(file_);
 }
 
 bool WalWriter::close() {
   if (closed_) {
     return true;
   }
-  bool ok = fd_ >= 0 && sync();
-  if (fd_ >= 0 && ::close(fd_) != 0) {
+  bool ok = file_ != nullptr && sync();
+  if (file_ != nullptr && std::fclose(file_) != 0) {
     ok = false;
   }
-  fd_ = -1;
+  file_ = nullptr;
   closed_ = true;
   return ok;
 }
 
-bool WalWriter::valid() const { return !closed_ && fd_ >= 0; }
+bool WalWriter::valid() const { return !closed_ && file_ != nullptr; }
 
 WalReader::WalReader(const std::filesystem::path& path) : path_(path) {}
 
-std::vector<DynamicRecord> WalReader::replay() {
-  std::vector<DynamicRecord> records;
+WalReplayReport WalReader::replay_with_report() {
+  WalReplayReport report;
   std::ifstream input(path_, std::ios::binary);
   if (!input) {
-    return records;
+    report.missing = true;
+    return report;
   }
 
+  // 逐条严格解码；一旦遇到坏记录就停止，并把原因与截断位置暴露给调用方，
+  // 而不是静默丢弃其后的已提交记录。
+  std::uint64_t offset = 0;
   while (input.peek() != std::char_traits<char>::eof()) {
+    const std::uint64_t record_start = offset;
     WalRecordHeader header;
-    if (!read_header(input, header) || !header_shape_is_valid(header)) {
+    if (!read_header(input, header)) {
+      report.truncated_bytes = record_start;
+      report.reason = "incomplete_record_header";
+      break;
+    }
+    if (!header_shape_is_valid(header)) {
+      report.truncated_bytes = record_start;
+      report.reason = "invalid_record_header";
       break;
     }
     if (!node_id_fits(static_cast<NodeId>(header.node_id), header.node_id)) {
+      report.truncated_bytes = record_start;
+      report.reason = "node_id_out_of_range";
       break;
     }
 
@@ -242,6 +246,8 @@ std::vector<DynamicRecord> WalReader::replay() {
       input.read(reinterpret_cast<char*>(record.vector.data()),
                  header.vector_bytes);
       if (!input) {
+        report.truncated_bytes = record_start;
+        report.reason = "incomplete_vector_payload";
         break;
       }
     }
@@ -249,16 +255,29 @@ std::vector<DynamicRecord> WalReader::replay() {
       input.read(reinterpret_cast<char*>(record.neighbors.data()),
                  record.neighbors.size() * sizeof(NodeId));
       if (!input) {
+        report.truncated_bytes = record_start;
+        report.reason = "incomplete_neighbor_payload";
         break;
       }
     }
-    if (checksum_payload(record.vector, record.neighbors) !=
+    if (checksum_record(header, record.vector, record.neighbors) !=
         header.payload_checksum) {
+      report.truncated_bytes = record_start;
+      report.reason = "payload_checksum_mismatch";
       break;
     }
-    records.push_back(std::move(record));
+    // 记录偏移，供截断定位使用。
+    offset = static_cast<std::uint64_t>(input.tellg());
+    report.records.push_back(std::move(record));
   }
-  return records;
+  report.replayed_records = report.records.size();
+  report.last_sequence =
+      report.records.empty() ? 0 : report.records.back().sequence_id;
+  return report;
+}
+
+std::vector<DynamicRecord> WalReader::replay() {
+  return replay_with_report().records;
 }
 
 }  // namespace agent_aware::dynamic

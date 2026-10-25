@@ -1,11 +1,14 @@
 #include "dynamic/manifest.h"
 
-#include <charconv>
 #include <cctype>
+#include <cstdio>
 #include <fstream>
+#include <limits>
 #include <regex>
 #include <string>
 #include <utility>
+
+#include "core/platform_io.h"
 
 namespace agent_aware::dynamic {
 namespace {
@@ -42,10 +45,27 @@ bool parse_json_integer(const std::string& text, const std::string& key,
     return false;
   }
 
-  const auto* begin = text.data() + value_pos;
-  const auto* end = text.data() + value_end;
-  const auto result = std::from_chars(begin, end, out);
-  return result.ec == std::errc{} && result.ptr == end;
+  // 纯手写解析：不依赖 std::from_chars（需 <charconv>，且部分标准库实现与
+  // iostream 头文件共存时整数重载会失效）或 std::stoll（受区域设置影响）。
+  bool negative = false;
+  std::size_t pos = value_pos;
+  if (text[pos] == '-') {
+    negative = true;
+    ++pos;
+  }
+  if (pos >= value_end) {
+    return false;
+  }
+  std::int64_t value = 0;
+  for (; pos < value_end; ++pos) {
+    const int digit = text[pos] - '0';
+    if (value > (std::numeric_limits<std::int64_t>::max() - digit) / 10) {
+      return false;
+    }
+    value = value * 10 + digit;
+  }
+  out = negative ? -value : value;
+  return true;
 }
 
 std::string escape_json_string(const std::string& value) {
@@ -82,11 +102,15 @@ bool Manifest::load(ManifestData& data) const {
   std::int64_t next_sequence_value = 0;
   std::int64_t next_sstable_value = 0;
   std::int64_t checkpoint_value = 0;
+  // wal_checkpoint 可能不存在：没有发生过 flush 的目录在 Checkpoint(0) 时
+  // 不写 SSTable 就直接返回，因此 v1 文件里可能缺这个键，此时按 0 处理。
+  // 其余三个键是必需字段，缺失说明文件被截断或格式不符。
+  const bool has_checkpoint =
+      parse_json_integer(text, "wal_checkpoint", checkpoint_value);
   if (!parse_json_integer(text, "version", version_value) ||
       version_value != kManifestVersion ||
       !parse_json_integer(text, "next_sequence_id", next_sequence_value) ||
       !parse_json_integer(text, "next_sstable_id", next_sstable_value) ||
-      !parse_json_integer(text, "wal_checkpoint", checkpoint_value) ||
       next_sequence_value <= 0 || next_sstable_value <= 0 ||
       checkpoint_value < 0) {
     return false;
@@ -146,24 +170,44 @@ bool Manifest::save(const ManifestData& data) const {
     output << "  ],\n";
     output << "  \"wal_checkpoint\": " << data.wal_checkpoint << "\n";
     output << "}\n";
-    output.flush();
+    // 先关闭流再重新打开做 fsync：否则缓冲区内容可能还没交给内核。
+    output.close();
     if (!output) {
       return false;
     }
   }
 
-  error.clear();
-  std::filesystem::rename(tmp_path, path_, error);
-  if (!error) {
-    return true;
+  // 先把临时文件落盘，再 rename：顺序反过来会在崩溃窗口里留下一个
+  // "名字已提交、内容未落盘"的 manifest。
+  {
+    std::FILE* file = std::fopen(tmp_path.c_str(), "rb");
+    if (file == nullptr) {
+      return false;
+    }
+    const bool synced = fsync_file(file);
+    std::fclose(file);
+    if (!synced) {
+      return false;
+    }
   }
 
-  // 某些文件系统 rename 不会覆盖已有目标，因此在临时文件安全关闭后删除旧 manifest 再重试。
-  error.clear();
-  std::filesystem::remove(path_, error);
+  // Windows 上 rename 不能覆盖已存在的目标，因此"更新已有 manifest"时第一次
+  // rename 必然失败，需要先删旧文件再 rename。窗口内 manifest 短暂缺失，但
+  // tmp 文件已经 fsync，崩溃后最多退回"没有 manifest + 有 SSTable 文件"的
+  // 旧目录语义，而不会引用半写文件。
   error.clear();
   std::filesystem::rename(tmp_path, path_, error);
-  return !error;
+  if (error) {
+    error.clear();
+    std::filesystem::remove(path_, error);
+    error.clear();
+    std::filesystem::rename(tmp_path, path_, error);
+  }
+  if (error) {
+    return false;
+  }
+  // rename 只保证目录项可见性；目录本身还要 fsync 才算持久。
+  return fsync_directory(path_.parent_path().string().c_str());
 }
 
 }  // namespace agent_aware::dynamic

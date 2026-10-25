@@ -112,6 +112,18 @@ DynamicWriteManager::DynamicWriteManager(DynamicWriteOptions options)
 
 DynamicWriteManager::~DynamicWriteManager() { (void)close(); }
 
+DynamicRecoveryReport DynamicWriteManager::recovery_report() const {
+  return recovery_report_;
+}
+
+std::size_t DynamicWriteManager::version_index_record_count() const {
+  return version_index_records_.load(std::memory_order_relaxed);
+}
+
+std::uint64_t DynamicWriteManager::version_record_write_count() const {
+  return committed_write_records_.load(std::memory_order_relaxed);
+}
+
 std::shared_ptr<DynamicWriteManager::VersionShard>
 DynamicWriteManager::shard_for(NodeId node_id) const {
   return version_shards_[static_cast<std::size_t>(node_id) %
@@ -143,8 +155,16 @@ bool DynamicWriteManager::open() {
     return false;
   }
 
+  recovery_report_ = DynamicRecoveryReport{};
   std::uint64_t max_sequence = 0;
+  // 恢复阶段把 SSTable 与 WAL 记录烘焙成每个 id 的最新可见版本（去重 + 裁剪旧
+  // 版本），因此启动内存与启动时间只随"不同 id 数"增长，而不是写入历史总量。
+  // 代价是恢复中的 id 无法再用更早的 read_sequence 读到旧版本——恢复后的
+  // 读序列从当前最新序列开始。
+  std::unordered_map<NodeId, DynamicRecord> latest_versions;
   sstables_.clear();
+  recovery_report_.sstable_count = manifest_.sstables.size();
+  const auto sstable_start = Clock::now();
   for (const auto& entry : manifest_.sstables) {
     const auto base_path = entry.base_path.is_absolute()
                                ? entry.base_path
@@ -154,13 +174,21 @@ bool DynamicWriteManager::open() {
       return false;
     }
     auto records = reader->scan_all();
-    for (const auto& record : records) {
+    recovery_report_.sstable_records += records.size();
+    for (auto& record : records) {
       max_sequence = std::max(max_sequence, record.sequence_id);
+      auto found = latest_versions.find(record.node_id);
+      if (found == latest_versions.end() ||
+          record.sequence_id >= found->second.sequence_id) {
+        latest_versions[record.node_id] = std::move(record);
+      }
     }
-    apply_records(records);
     max_sequence = std::max(max_sequence, reader->max_sequence_id());
     sstables_.push_back(std::move(reader));
   }
+  recovery_report_.sstable_replay_ms =
+      std::chrono::duration<double, std::milli>(Clock::now() - sstable_start)
+          .count();
 
   std::uint64_t max_segment = 0;
   std::vector<std::filesystem::path> wal_paths;
@@ -184,17 +212,58 @@ bool DynamicWriteManager::open() {
 
   memtable_ = std::make_unique<MemTable>(options_.memtable_flush_bytes);
   // Only uncheckpointed WAL records belong in the active MemTable.
+  const auto wal_start = Clock::now();
+  recovery_report_.wal_segments = wal_paths.size();
   for (const auto& path : wal_paths) {
-    const auto records = WalReader(path).replay();
-    for (const auto& record : records) {
+    // 坏记录之后的内容不能静默丢弃：上报截断位置与原因，并把段末尾的
+    // 不可信尾部当作"未提交"处理（其 sequence 不会进入恢复后的读序列）。
+    const auto report = WalReader(path).replay_with_report();
+    if (!report.reason.empty()) {
+      ++recovery_report_.wal_truncated_segments;
+      recovery_report_.wal_truncation_reason =
+          path.filename().string() + ":" + report.reason + "@" +
+          std::to_string(report.truncated_bytes);
+    }
+    for (const auto& record : report.records) {
       if (record.sequence_id <= manifest_.wal_checkpoint) {
         continue;
       }
+      ++recovery_report_.wal_records;
       max_sequence = std::max(max_sequence, record.sequence_id);
-      memtable_->insert(record);
-      apply_records(std::vector<DynamicRecord>{record});
+      auto found = latest_versions.find(record.node_id);
+      if (found == latest_versions.end() ||
+          record.sequence_id >= found->second.sequence_id) {
+        latest_versions[record.node_id] = record;
+      }
     }
   }
+  recovery_report_.wal_replay_ms =
+      std::chrono::duration<double, std::milli>(Clock::now() - wal_start)
+          .count();
+
+  const auto build_start = Clock::now();
+  std::vector<DynamicRecord> recovered;
+  recovered.reserve(latest_versions.size());
+  for (const auto& item : latest_versions) {
+    recovered.push_back(item.second);
+  }
+  std::sort(recovered.begin(), recovered.end(),
+            [](const DynamicRecord& lhs, const DynamicRecord& rhs) {
+              return lhs.sequence_id < rhs.sequence_id;
+            });
+  // MemTable 只承载尚未落盘（未被 manifest checkpoint 覆盖）的记录；版本索引
+  // 才承载全部可见版本。两者分开，避免把已 flush 的数据重复计成"待刷写"。
+  for (const auto& record : recovered) {
+    if (record.sequence_id > manifest_.wal_checkpoint) {
+      memtable_->insert(record);
+    }
+  }
+  apply_records(recovered);
+  recovery_report_.visible_delta_records = recovered.size();
+  recovery_report_.replayed_sequence = max_sequence;
+  recovery_report_.version_build_ms =
+      std::chrono::duration<double, std::milli>(Clock::now() - build_start)
+          .count();
 
   manifest_.next_sequence_id =
       std::max(manifest_.next_sequence_id, max_sequence + 1);
@@ -359,6 +428,8 @@ bool DynamicWriteManager::commit_batch(
                               std::memory_order_relaxed);
 
   const auto apply_start = Clock::now();
+  committed_write_records_.fetch_add(records.size(),
+                                     std::memory_order_relaxed);
   apply_records(records);
   for (const auto& record : records) {
     if (!memtable_->insert(record)) {
@@ -389,11 +460,19 @@ bool DynamicWriteManager::commit_batch(
 
 void DynamicWriteManager::commit_loop() {
   for (;;) {
+    // 先拿"队头到达时间"再进等待：组提交截止时间从第一条记录入队时开始算，
+    // 而不是从它被弹出后才算，否则队头最长可以多等一个 collection delay。
+    const auto wait_started = Clock::now();
     std::shared_ptr<WriteRequest> first;
     {
       std::unique_lock<std::mutex> lock(queue_mutex_);
-      queue_condition_.wait(
-          lock, [&] { return !write_queue_.empty() || failed_.load(); });
+      const bool ready = queue_condition_.wait_for(
+          lock, std::chrono::microseconds(options_.wal_group_max_delay_us),
+          [&] { return !write_queue_.empty() || failed_.load(); });
+      if (!ready && write_queue_.empty()) {
+        // 截止时间内没有新请求到达：空转或重试。
+        continue;
+      }
       if (write_queue_.empty()) {
         if (failed_.load()) {
           fail_pending_requests();
@@ -405,6 +484,10 @@ void DynamicWriteManager::commit_loop() {
       write_queue_.pop_front();
       queue_space_condition_.notify_one();
     }
+    const auto deadline =
+        first->submitted_at +
+        std::chrono::microseconds(options_.wal_group_max_delay_us);
+    (void)wait_started;
 
     if (first->kind == RequestKind::stop) {
       (void)rotate_memtable_locked();
@@ -421,11 +504,12 @@ void DynamicWriteManager::commit_loop() {
 
     std::vector<std::shared_ptr<WriteRequest>> batch;
     batch.push_back(first);
-    const auto deadline = Clock::now() +
-                          std::chrono::microseconds(options_.wal_group_max_delay_us);
+    // Wait at most until the head's dispatch deadline; every later record in the
+    // batch is collected before the same deadline.
     while (batch.size() < options_.wal_group_max_records) {
       std::unique_lock<std::mutex> lock(queue_mutex_);
       if (write_queue_.empty()) {
+        if (Clock::now() >= deadline) break;
         if (queue_condition_.wait_until(lock, deadline, [&] {
               return !write_queue_.empty() || failed_.load();
             })) {
@@ -435,6 +519,9 @@ void DynamicWriteManager::commit_loop() {
         }
       }
       if (write_queue_.empty() || write_queue_.front()->kind != RequestKind::mutation) {
+        break;
+      }
+      if (write_queue_.front()->submitted_at >= deadline) {
         break;
       }
       batch.push_back(write_queue_.front());
@@ -455,10 +542,26 @@ void DynamicWriteManager::commit_loop() {
 
 void DynamicWriteManager::apply_records(
     const std::vector<DynamicRecord>& records) {
+  // 版本索引按 id 保留最近 version_history_limit 个版本：读路径只取
+  // "<= 读序列的最新一条"，更老的版本对本进程内的任何读序列都不可见。
+  // 这里维护的是下界（已裁剪的记录数），运行时再按 sequence/提交顺序推进。
+  const std::size_t history_limit = options_.version_history_limit;
+  std::size_t pruned = 0;
   for (const auto& record : records) {
     auto shard = shard_for(record.node_id);
     std::unique_lock<std::shared_mutex> lock(shard->mutex);
-    shard->versions[record.node_id].push_back(record);
+    auto& versions = shard->versions[record.node_id];
+    if (history_limit != 0 && versions.size() >= history_limit) {
+      // 新版本 sequence 一定最大，按插入顺序裁掉最旧的若干条。
+      const std::size_t drop = versions.size() - history_limit + 1;
+      versions.erase(versions.begin(), versions.begin() + drop);
+      pruned += drop;
+    }
+    versions.push_back(record);
+    ++version_index_records_;
+  }
+  if (pruned != 0) {
+    version_index_records_.fetch_sub(pruned, std::memory_order_relaxed);
   }
 }
 
@@ -602,6 +705,8 @@ bool DynamicWriteManager::insert(NodeId node_id, const float* vector,
 
 bool DynamicWriteManager::update(NodeId node_id, const float* vector,
                                  std::uint32_t dim) {
+  // update 与 insert 同义：对 base id 写入较新版本会覆盖其可见向量，对已删除
+  // id 写入会以新 sequence 使其重新可见（delete 只屏蔽更早的版本）。
   return insert(node_id, vector, dim);
 }
 

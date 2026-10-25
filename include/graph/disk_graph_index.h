@@ -1,6 +1,7 @@
 #pragma once
 
 #include <cstddef>
+#include <atomic>
 #include <cstdint>
 #include <fstream>
 #include <memory>
@@ -106,6 +107,7 @@ struct DiskGraphSearchStats {
   std::size_t prefetch_candidate_pages = 0;
   std::size_t prefetch_submitted = 0;
   std::size_t prefetch_submit_batches = 0;
+  std::size_t prefetch_submit_failures = 0;
   std::size_t prefetch_ready_hit = 0;
   std::size_t prefetch_pending_hit = 0;
   std::size_t prefetch_useful_pages = 0;
@@ -171,6 +173,12 @@ class PackedDiskGraphIndex {
     return metadata_;
   }
   const std::vector<std::uint32_t>& node_in_degrees();
+
+  // 一个解码页在常驻内存里实际占用的字节数：原始页字节 + 每个节点一份
+  // 邻接 vector 的容量。预算估算必须用这个值，而不是 page_size。
+  static std::size_t resident_page_bytes(const DiskGraphMetadata& metadata);
+  // 当前已缓存页的估算常驻字节数。
+  std::size_t cache_resident_bytes() const;
 
   void configure_cache(const std::string& policy, std::size_t capacity_pages,
                        bool protect_hot_pages = false,
@@ -251,6 +259,7 @@ class PackedDiskGraphIndex {
   std::string path_;
   std::ifstream input_;
   std::unique_ptr<AsyncPageReader> page_reader_;
+  std::atomic<std::size_t> live_sessions_{0};
   DiskGraphMetadata metadata_;
   PqAdcModel pq_model_;
   std::vector<std::uint32_t> node_to_page_;
@@ -262,7 +271,7 @@ class PackedDiskGraphIndex {
   std::unordered_map<std::uint32_t, CacheEntry> page_cache_;
   DecodedPage scratch_page_;
   std::vector<std::uint32_t> node_in_degrees_;
-  bool node_in_degrees_ready_ = false;
+  std::atomic<bool> node_in_degrees_ready_{false};
   mutable std::mutex cache_mutex_;
   mutable std::mutex search_mutex_;
   PrefetchAdaptiveController prefetch_controller_;
