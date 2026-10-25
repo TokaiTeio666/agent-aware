@@ -41,3 +41,8 @@ indexes/
 *.pt
 *.pth
 *.ckpt
+
+# 本地工具配置与演示文稿不入库（pptx 等二进制素材请放在仓库外）
+.claude/settings.local.json
+*.pptx
+*.ppt
