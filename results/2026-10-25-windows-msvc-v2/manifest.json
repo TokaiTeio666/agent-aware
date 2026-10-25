@@ -1,0 +1,18 @@
+{
+  "matrix": {
+    "search_widths": [96, 128, 156, 192],
+    "cache_policies": ["none", "lru", "2q", "graph-aware-2q"],
+    "rounds": 3,
+    "query_limit": 2000,
+    "base_count": 100000,
+    "mixed_duration_sec": 30,
+    "mixed_search_width": 156
+  },
+  "index": {"path": "t\\i100.idx", "sha256": "6d0084b76ca686dcc3a335a7f50cbaa6a56f549268a4602536932d1aefd57957"},
+  "binaries": {
+    "agent-aware-search": {"sha256": "4c6aede9d572cb75eafae6c19681771939925406f09096876cebfba6bffb64e0"},
+    "bench_mixed_rw": {"sha256": "b1e0dc3f7f62c7ff01488b084177f592f498eb2a85afb0e75e318bb3baa5e413"},
+    "note": "built with MSVC 14.42.34433, /O2 /MD /std:c++17, AGENT_AWARE_HAS_LIBURING=0, AGENT_AWARE_ENABLE_DIRECT_IO=0; the Windows build has no io_uring/O_DIRECT, so io_effective_mode is pread"
+  },
+  "dataset_recipe": "recipe=gmm-v1 base=100000 queries=2000 dim=128 clusters=1000 seed=20261025 top_k=10 sigma_base=0.15 sigma_query=0.10 "
+}

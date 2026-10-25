@@ -10,7 +10,13 @@ exit.status
 /data/
 sift/
 sift.tar.gz
-results/
+# 旧版实验产物不纳入版本库；results/ 下只保留可复现实验的原始 JSON
+# （体积很小，用于文档引用与回归对比），本地 scratch 动态目录等仍被忽略。
+results/*
+!results/**/
+!results/**/*.json
+!results/**/*.txt
+!results/**/*.md
 
 !src/data/
 !src/data/**

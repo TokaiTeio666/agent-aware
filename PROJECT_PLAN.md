@@ -11,13 +11,14 @@
 
 | 能力 | 当前状态 | 说明 |
 | --- | --- | --- |
-| SSD 主路径 | 已完成 SIFT1M 平衡点单轮验证 | `search_width=156`：Recall@10 `0.9748`、avg `48.10 ms`、P99 `66.29 ms`、QPS `20.79`、reads/query `109.82` |
-| 高并发纯读 | 已完成 baseline | 8 reader 下 `56.55 read_qps`，P95 `178 ms` |
-| 混合读写 | 已完成三轮配对验证 | SIFT1M 纯读 `703.18 read_qps`；95/5 无 compaction `647.05/34.06 read/write qps`；80/20 + compaction `578.23/144.58`，详见 `docs/experiments/mixed-read-write.md` |
-| 动态写入一致性 | 已完成基础版 | WAL/MemTable/SSTable/manifest/compaction/recovery 均有测试覆盖 |
-| 读侧锁优化 | 已完成 | `DynamicWriteManager` 使用 immutable read view 发布，`latest_record_lookup` P95 从秒级降至约 0.07ms |
-| I/O 尾延迟量化 | 部分完成 | `128/156/192` 首轮扫描已完成，`156` 为当前平衡点；仍需三轮复验、bytes/query 和真实 NVMe 数据 |
-| 后续重点 | 待推进 | topology 预取已接入，待完成 SIFT1M cold/hot 五轮验收；另需 Delta memory graph、周期性 rebuild packed graph、完整参数矩阵和真实 NVMe 复测 |
+| SSD 主路径 | 合成 100k×128 三轮验证 | `search_width=156`：Recall@10 `0.8767`、avg `1.136 ms`、P99 `2.002 ms`、reads/query `61.62`（Windows `pread`），见 `docs/experiments/search-width-tuning.md` |
+| 高并发纯读 | 待重测 | 旧数据（8 reader `56.55 read_qps`）来自已删除实现，不可引用；当前每线程独立 index |
+| 混合读写 | 三轮验证（含调度器修复） | 纯读 `2245.1 read_qps`；95/5 无 compaction `1204.9/63.42`；80/20 + compaction `248.2/62.05`；见 `docs/experiments/mixed-read-write.md` |
+| 动态写入一致性 | 基础版 | WAL/MemTable/SSTable/manifest/compaction 有测试；干净关闭/重开已实测，崩溃注入未做 |
+| 读侧并发 | 部分完成 | 当前是 `read_sequence` 原子值 + 逐 shard 过滤，不是 immutable read view；`latest_record_lookup` 旧 P95 数据对应已删除的实现 |
+| 内存预算 | 不满足（如实报告） | 100k×128 下 20% 预算约 9.77 MB，实测基线 RSS 13.7 MB，见 `docs/experiments/memory-budget.md` |
+| I/O 尾延迟量化 | 部分完成 | `96/128/156/192` × 4 种缓存策略 3 轮已完成（`pread`）；仍需 io_uring、真实 NVMe 与更大数据集 |
+| 后续重点 | 待推进 | 大数据集（预算占比与缓存可测性）、读写非阻塞调度、`fdatasync` 组提交、崩溃注入、预取正式 A/B |
 
 ## 1. 项目概述
 
