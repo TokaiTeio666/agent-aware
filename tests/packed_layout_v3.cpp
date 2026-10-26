@@ -72,11 +72,14 @@ int main() {
   build.pq_model = &model;
   const auto build_result =
       PackedDiskGraphBuilder::build(base, index_path.string(), build);
-  const VamanaBuildConfig vamana_config{
-      build.degree, std::max<std::size_t>(build.degree, 256), 1.2,
-      build.random_seed, true, build.deleted_ids};
-  require(build_result.medoid == VamanaBuilder(vamana_config).find_medoid(base),
-          "packed builder did not expose the Vamana medoid");
+  // 入口不是几何 medoid，而是"从它出发能到达最多节点"的点（见
+  // disk_graph_builder.cpp 的 select_entry_node）：medoid 在大规模图上
+  // 会落进只有上百个点的孤岛。这里验证入口落在范围内、且不是被删除的点。
+  require(build_result.medoid < base.size(),
+          "packed builder returned an out-of-range entry node");
+  require(std::find(build.deleted_ids.begin(), build.deleted_ids.end(),
+                    build_result.medoid) == build.deleted_ids.end(),
+          "packed builder selected a deleted node as the entry");
 
   PackedDiskGraphIndex index(index_path.string());
   const auto& metadata = index.metadata();
