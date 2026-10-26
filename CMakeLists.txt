@@ -102,6 +102,29 @@ if(BUILD_TESTING)
   target_link_libraries(async_page_reader_test
                         PRIVATE agent_aware::agent_aware)
   add_test(NAME async_page_reader COMMAND async_page_reader_test)
+  # 召回结论的诊断工具，需要数据集/索引路径，手动运行，不进 ctest：
+  #   brute_force_check  精确暴力基线（真值文件是否可信）
+  #   index_integrity    索引向量逐位比对 + 入口可达率 + 邻居局部性
+  #   graph_probe        入口/真值起点/多起点三组召回对照
+  add_executable(brute_force_check tests/brute_force_check.cpp)
+  target_link_libraries(brute_force_check PRIVATE agent_aware::agent_aware)
+  add_executable(graph_probe tests/graph_probe.cpp)
+  target_link_libraries(graph_probe PRIVATE agent_aware::agent_aware)
+  add_executable(index_integrity tests/index_integrity.cpp)
+  target_link_libraries(index_integrity PRIVATE agent_aware::agent_aware)
+  #   entry_audit        入口节点入度审计（入口是否是个"只出不进"的起点）
+  add_executable(entry_audit tests/entry_audit.cpp)
+  target_link_libraries(entry_audit PRIVATE agent_aware::agent_aware)
+  add_executable(packed_degree_guard_test tests/packed_degree_guard.cpp)
+  target_link_libraries(packed_degree_guard_test
+                        PRIVATE agent_aware::agent_aware)
+  add_test(NAME packed_degree_guard COMMAND packed_degree_guard_test)
+  add_executable(u_reach tests/u_reach.cpp)
+  target_link_libraries(u_reach PRIVATE agent_aware::agent_aware)
+  add_executable(node_neighborhood tests/node_neighborhood.cpp)
+  target_link_libraries(node_neighborhood PRIVATE agent_aware::agent_aware)
+  add_executable(neighbor_recall tests/neighbor_recall.cpp)
+  target_link_libraries(neighbor_recall PRIVATE agent_aware::agent_aware)
   add_executable(platform_io_test tests/platform_io.cpp)
   target_link_libraries(platform_io_test PRIVATE agent_aware::agent_aware)
   add_test(NAME platform_io COMMAND platform_io_test)
