@@ -3,6 +3,7 @@
 > 对照对象：[`current-issues.md`](current-issues.md)（审计时 HEAD `6d7b69d`，当前基线 `b9f3e46`）
 > 修复代码：当前工作树（未提交）；旧文档与旧结果：[`docs/archive/2026-10-legacy/`](../archive/2026-10-legacy/)
 > 新实验：[`docs/experiments/`](../experiments/)、[`results/`](../../results/)
+> 同类问题归类与教训：[`retrospective-2026-10-25.md`](retrospective-2026-10-25.md)
 
 状态定义：**已修复**（有代码 + 验证）、**部分修复**（核心问题仍在或只修了一半）、**未修复**（本轮未动）、
 **已改文档**（实现不变，文档不再夸大）。

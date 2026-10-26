@@ -82,7 +82,12 @@ def main() -> None:
                 + base_norm[None, :])
         truth[start:start + chunk.shape[0]] = np.argsort(
             dist, axis=1, kind="stable")[:, :args.top_k]
-    (out / "sift_groundtruth.ivecs").write_bytes(truth.astype("<i4").tobytes())
+    # .ivecs 格式：每个向量前有一个 int32 维度头，与 .fvecs 的 float32 维度头对应。
+    # 之前直接写裸 int32 数据，C++ 读取端按 ivecs 解析会报 "truncated ivecs payload"。
+    truth_ivecs = np.empty((args.queries, args.top_k + 1), dtype=np.int32)
+    truth_ivecs[:, 0] = args.top_k
+    truth_ivecs[:, 1:] = truth
+    (out / "sift_groundtruth.ivecs").write_bytes(truth_ivecs.astype("<i4").tobytes())
 
     (out / "RECIPE.txt").write_text(
         f"recipe={RECIPE}\nbase={args.base}\nqueries={args.queries}\n"
