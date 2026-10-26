@@ -44,6 +44,11 @@ degree 32，每页 6 节点，172,064 个 4 KiB 页。每查询 500 条，top-10
   这是仓库第一次能证明"这次实验测的是磁盘"。
 - `pread` 路径在本次配置下**完全不走 I/O**：`physical_read_per_query = 0`，延迟 0.48 ms。
   此前 README 报的 1.14 ms 一类数字正属于这种口径。
+  **（复核补充，见 §4.5）** 这里的"0"不是 pread 的特性，而是页缓存已被
+  `ensure_node_in_degrees()` 填满的结果。真冷条件下（`--protect-hot-pages 0`）
+  `pread` 的物理读是 2.23 MB/查询、延迟 6.69 ms，`logical_to_physical_read_ratio = 0.39`。
+  所以 `pread` 不是"不走 I/O"，而是"大部分命中页缓存"——这正是它在真冷时
+  比 `io_uring` 快的原因（它自己把缓存读热了）。
 
 ## 2. 冷/热对照
 
@@ -54,16 +59,20 @@ degree 32，每页 6 节点，172,064 个 4 KiB 页。每查询 500 条，top-10
 | 冷（3 次） | 0.000 | 1.000 | 464,486 B | 3.08 / 3.33 / 3.66 ms |
 | 热（2 次，无逐出） | 1.000 | 1.000 | 464,486 B | 3.01 / 3.66 ms |
 
-**这是 Phase 0 最重要的发现**：索引构造阶段（`PackedDiskGraphIndex` 构造函数读 PQ 段和
-775 KB 目录）就把 672 MiB 索引拉进页缓存 —— `startup=0 → before=1`。
-但 `io_uring` 用 `O_DIRECT` 打开，**读路径完全绕过页缓存**，所以冷/热对照对延迟几乎没有影响，
-`index_fully_cached_during_run = true` 也不代表"读来自内存"。
+**这是 Phase 0 最重要的发现**：索引构造之后、搜索开始之前，672 MiB 索引就已经全部驻留
+—— `startup=0 → before=1`。但 `io_uring` 用 `O_DIRECT` 打开，**读路径完全绕过页缓存**，
+所以冷/热对照对延迟几乎没有影响，`index_fully_cached_during_run = true` 也不代表"读来自内存"。
 
 也就是说：
 
 - 对于 `pread`/`odirect` 之外的路径，`index_cache_residency_before` 不是延迟的解释变量。
   **判断延迟来源应该看 `logical_to_physical_read_ratio`，而不是驻留比例。**
-- 构造函数把整个索引扫一遍是不必要的 I/O（约 672 MiB），且会污染页缓存。列为待修项。
+- ~~构造函数把整个索引扫一遍是不必要的 I/O（约 672 MiB），且会污染页缓存。~~
+  **（复核修正，见 §4.5）** 构造函数只读 PQ 段（18 MB）和目录（775 KB），
+  **没有**扫整个索引。真正把 672 MiB 读进页缓存的是
+  `configure_cache` → `ensure_node_in_degrees()` 对全部 166,667 页的顺序读，
+  且 `protect_hot_pages` 默认 true 使得 `--cache-policy none` 也会触发。
+  这一项已列为待修项。
 
 ## 3. 1M 数据集暴露出召回故障
 
@@ -274,7 +283,11 @@ alpha 调度后在 1M 上重建（`idx1m_v3`，入口 437651）：
 图本身和搜索都对了，**剩下的唯一瓶颈是从入口出发的搜索起点**：单入口的贪心
 搜索只沿更近的点走，起点落在错误区域就永远出不来。
 
-对照实验（1M，degree 32，io_uring 冷读，100 条查询）：
+对照实验（1M，degree 32，io_uring，100 条查询）：
+
+> **复核注（§4.5）**：以下所有"冷读/冷缓存"标注均不成立——默认配置下
+> `ensure_node_in_degrees()` 已把索引全部读入页缓存，`io_uring` 靠 O_DIRECT
+> 绕过它。物理读字节数与召回仍然真实，但延迟不是纯冷盘延迟。
 
 | 起点覆盖 | recall@10 | 延迟 | 物理读/查询 |
 | --- | --- | --- | --- |
@@ -316,7 +329,11 @@ alpha 调度后在 1M 上重建（`idx1m_v3`，入口 437651）：
 ### 10. 撒点数与页缓存争同一份预算，撒点数全面占优
 
 `spread_start_count` 和页 cache 都要吃内存。把两者交叉跑一遍（1M，io_uring，
-每次 `vmtouch -q -e` 冷缓存，200 条查询）：
+每次 `vmtouch -q -e`，200 条查询）：
+
+> **复核注（§4.5）**：`vmtouch -e` 逐出后，`ensure_node_in_degrees()` 会立刻把
+> 索引全部读回页缓存，所以这些"冷缓存"对照实际上都是在索引全驻留状态下跑的。
+> 物理读与召回数字仍然有效，延迟对比受此影响。
 
 | 撒点数 | 页 cache | Recall@10 | 延迟 (ms) | 物理读 (MB/q) | 峰值 RSS |
 | --- | --- | --- | --- | --- | --- |
@@ -369,12 +386,18 @@ alpha 调度后在 1M 上重建（`idx1m_v3`，入口 437651）：
    实际占用远超 12000 × 4 KiB，`resident_page_bytes` 就是为此引入的。
 3. **访问模式层**：实测 `same_page_node_reuse = 380,637` 而
    `unique_pages_touched = 106,579`，即每个打开页平均被复用 3.6 次，但复用
-   **发生在同一条查询内部**。缓存的价值在跨查询复用，而跨查询复用只有 65%，
+   **发生在同一条查询内部**。缓存的价值在跨查询复用，而跨查询复用有限，
    且省下的是系统调用。维护 LRU/2Q 的链表操作与互斥锁（`cache_mutex_` 在每次
    页查找/插入都加锁）成本超过了省下的那点 I/O。
 
 **注意策略之间没有差异**：lru 与 graph-aware-2q 的命中率是 0.660916 对
 0.660963，几乎完全相同。这说明瓶颈不在淘汰策略，而在"缓存这件事本身"。
+
+**（复核修正，见 §4.5）** 上面引用的 0.661 是 `cache_hits / page_requests`，
+分母含重复请求，口径错误。正确口径下 `cache_hits / page_requests_after_dedup`
+= **3.79**（超过 100%，不可能），真实"未走 I/O 即满足"的比例是
+`(pinned_hits + cache_hits) / page_requests` = **0.819**。数字更高，结论不变：
+命中率高但收益小。
 
 #### B. 拓扑预取
 
@@ -413,7 +436,8 @@ alpha 调度后在 1M 上重建（`idx1m_v3`，入口 437651）：
 2. **延迟**：QPS 从 47.9 涨到 162.5 只有 3.4 倍，而线程数是 8 倍；单查询延迟
    从 20.9 涨到 44.3 ms（**2.1 倍恶化**）。原因是 8 份索引同时从同一块盘冷读，
    I/O 队列深度饱和，每个查询的等待变长。这是"吞吐换延迟"，而且吞吐也没换到
-   线性。
+   线性。（注：这组数据在 `protect_hot_pages = true` 默认配置下测的，见 §4.5；
+   多线程的核心问题是内存放大，该结论不受缓存状态影响。）
 3. **根本矛盾**：赛题约束是内存 ≤ 数据集 10%–20%。在 7.5% 的单线程配置下
    还有空间，但每加一个 worker 就复制一份索引，**2 线程就 18.9%、4 线程出局**。
    所以"用多线程提升 QPS"在这条内存约束下最多只能用到 2 线程，收益 1.7 倍。
@@ -458,7 +482,7 @@ alpha 调度后在 1M 上重建（`idx1m_v3`，入口 437651）：
 
 ### 12. 搜索的主要成本是什么
 
-用 `/usr/bin/time -v` 拆 user/sys CPU 与墙钟（1M，500 条查询，冷缓存）：
+用 `/usr/bin/time -v` 拆 user/sys CPU 与墙钟（1M，500 条查询）：
 
 | 项 | 总量 | 每查询 | 占墙钟 |
 | --- | --- | --- | --- |
@@ -467,7 +491,15 @@ alpha 调度后在 1M 上重建（`idx1m_v3`，入口 437651）：
 | **sys CPU** | 3.85 s | **7.70 ms** | 31% |
 | 等待（I/O + 调度） | — | **13.74 ms** | **55%** |
 
-CPU 占用率 44%，即**一半以上时间在等 I/O**。每查询规模：
+> **（复核修正，见 §4.5）** 这张表是在 `protect_hot_pages = true` 的默认配置下测的，
+> 而该配置会让 `ensure_node_in_degrees()` 顺序读全部 166,667 页（672 MB）。
+> 这部分开销摊在进程总时间里，使 sys CPU 偏高。真冷重测
+> （`--protect-hot-pages 0`，300 条，`io_uring`）：
+> wall 6.03 s、user 0.71 s、**sys 1.64 s**、CPU 39%，即
+> **user 2.37 ms/条、sys 5.47 ms/条、等待 12.12 ms/条**。
+> 比例结构不变（等待 > sys > user），但 sys 的绝对值下降了约 29%。
+
+CPU 占用率 39%–44%，即**一半以上时间在等 I/O**。每查询规模：
 
 | 量 | 值 | 说明 |
 | --- | --- | --- |
@@ -508,8 +540,13 @@ syscall 数**毫无影响**：
 自己的入口会走到，扩展路径不经过它。
 
 所以 `demand_batch_limit()`、`io_depth`、`io_batch` 三个参数在这条热路径上
-全部无效——批大小实际恒为 1。这就是 sys 占 31% 的原因：**213 次
+全部无效——批大小实际恒为 1。这就是 sys 占大头的直接原因：**213 次
 `io_uring_submit` + 213 次 `io_uring_wait_cqe` 系统调用，每次只搬 4 KiB。**
+
+> **复核确认（§4.5）**：该结论在真冷条件下依然成立——`io_submits == page_reads`
+> 在 `io_uring` / `odirect` / `pread` 三种模式下都精确相等。注意 `pread` 模式
+> 的 `io_submit_syscalls` 也是每页 1 次，但那只对应一次 `pread` 系统调用；
+> `io_uring` 每页还要额外付一次 `wait_cqe`。
 
 #### 可动的空间
 
@@ -548,16 +585,178 @@ syscall 数**毫无影响**：
 
 ---
 
+## 4.5 全量复核（2026-10-26 第二遍）
+
+§1–§12 的结论写完后做了一次系统复核，**推翻了其中几条**。复核方法与结论如下。
+
+### 复核方法
+
+1. **字段级**：用脚本枚举 `DiskGraphSearchStats` 的 60 个字段，检查每个字段在
+   生产者代码（`disk_graph_index.cpp` / `query_page_session.cpp` /
+   `async_page_reader.cpp` / `prefetch_adaptive_controller.cpp`）里是否有写点，
+   排除 `merge_aggregate` 的汇总假象。
+2. **恒等式**：对每个配置检查 `io_submits == page_reads == physical_B/page_size`、
+   `hits + misses <= page_requests`、`residency ∈ [0,1]` 等应当成立的关系。
+3. **外部对照**：用 `vmtouch`（独立进程）与程序内的 `mincore` 互相比对驻留率，
+   避免"自己测自己"。
+4. **量级估算**：把实测字节数与索引结构的大小对比，判断某个操作"物理上能否
+   解释这个量"。
+
+### 结论一：冷缓存从未成立（推翻 §1、§2、§11、§12 的冷读前提）
+
+程序内报 `index_cache_residency_before = 1`，而同一时刻 `vmtouch` 报 0%。
+两者都是 `mincore`，不该矛盾。逐段缩小范围后定位到：
+
+| 步骤 | 驻留率 |
+| --- | --- |
+| `vmtouch -e` 之后 | 0/172064 = **0%** |
+| 构造索引对象之后 | 0/172064 = **0%** |
+| **跑完 1 条查询之后** | **172064/172064 = 100%** |
+
+一条查询只读 195 页（0.8 MB），却让 672 MB 全部驻留。唯一的解释是有代码顺序
+读了整个文件——即 `configure_cache` 里的 `ensure_node_in_degrees()`：
+
+```cpp
+if (policy == "graph-aware-2q" || policy == "agent" || protect_hot_pages) {
+  ensure_node_in_degrees();   // 顺序读全部 page_count 页
+}
+```
+
+`protect_hot_pages` **默认为 true**，所以 `--cache-policy none` 也会触发。实测对照：
+
+| `--protect-hot-pages` | residency_before | residency_after |
+| --- | --- | --- |
+| 1（默认） | **1.000** | 1.000 |
+| 0 | **0.044** | 0.044 |
+
+**影响**：§1–§12 里所有标注"冷读 / 冷缓存"的数字，实际测的是
+"索引全驻留 + O_DIRECT 绕过页缓存"的组合。物理读字节数仍然真实（O_DIRECT
+确实走盘），但**延迟不是纯冷盘延迟**，且页缓存的 672 MB 占用完全没被计入
+内存预算。
+
+**修正**：原先 §5 待办 #3 写"构造函数全量读 638 MiB PQ 码区"，是错的——
+PQ 码区只有 18 MB（占索引 2.6%）。真正的元凶是入度统计的全文件顺序读。
+
+### 结论二：三个统计字段恒为 0 却照常输出
+
+| 字段 | 状态 |
+| --- | --- |
+| `pq_filter_reject_count` | **从不赋值**，恒 0，但写进 JSON |
+| `prefetch_saved_wait_us` | **从不赋值**，恒 0，但写进 JSON |
+| `page_cache_evictions` | 正常（经 `stats->` 指针写入，脚本误报） |
+
+前两个字段永远输出 0，读起来像"没有发生"，实际是"没有测量"。
+
+### 结论三：`cache_hit_rate` 分母错误（推翻 §11.A 的 65% 命中率）
+
+```cpp
+cache_hit_rate = cache_hits / page_requests
+```
+
+`page_requests` 含**重复请求**（同一页被多次请求），而 `cache_hits` 只在去重后
+路径累加。实测：`cache_hits = 153243`、`page_requests = 231848`、
+`page_requests_after_dedup = 40405`。
+
+| 口径 | 值 | 说明 |
+| --- | --- | --- |
+| 报告值 | 0.661 | 分母含重复请求 |
+| `hits / after_dedup` | **3.79** | **超过 100%，数学上不可能** |
+| `(pinned + hits) / page_requests` | 0.819 | 真实"未走 I/O 即满足"比例 |
+
+§11.A 用 0.661 论证"命中率高但收益小"，这个论证仍然成立（真实比例 0.819
+更高，结论只会更强），但**引用的数字是错的**。
+
+### 结论四：`demand_read_wait_us` 不是 I/O 等待（已在 §12 修正）
+
+计时区间里夹着 `decode_page` / `store_cached_page` / `materialize_page` 的 CPU
+时间。它报 21.39 ms/查询而实际延迟只有 23.82 ms、CPU 仅 11.2 ms，三个数不可能
+同时成立。
+
+### 结论五：`io_uring` 与 `pread` 不可比（推翻 §12 的 CPU 分解）
+
+真冷（`--protect-hot-pages 0`）条件下的对照：
+
+| 模式 | 延迟 | wall | user | sys | CPU% | 物理读/q | residency after |
+| --- | --- | --- | --- | --- | --- | --- | --- |
+| io_uring | 19.96 ms | 6.03 s | 0.71 s | 1.64 s | 39% | 876 KB | **0.044（保持冷）** |
+| pread | **6.69 ms** | 2.05 s | 0.44 s | 0.90 s | 65% | **2.23 MB** | **0.991（自己读热了）** |
+
+`pread` 快 3 倍，但它**把自己读热了**——`logical_to_physical_read_ratio = 0.39`，
+即 61% 的逻辑读由页缓存满足。而 `io_uring` 走 O_DIRECT，始终保持 0.044 的冷
+状态。**两者的延迟不可直接比较**：一个是"冷盘读 876 KB"，另一个是
+"冷盘读 2.23 MB + 热缓存读 876 KB"。
+
+§12 原先的 CPU 分解（user 3.50 / sys 7.70 / 等待 13.74 ms）是在污染条件下测的，
+`sys 7.70 ms` 里含 `ensure_node_in_degrees` 的 672 MB 顺序读开销。真冷下
+`io_uring` 的 sys 是 1.64 s / 300 条 = **5.47 ms/条**，等待仍是主要成本。
+
+### 结论六：`entry_strategy` 等字段与实际不符
+
+JSON 报 `entry_strategy = "single-medoid"`、`entry_count = 1`，而实际使用的是
+PageRank + BFS 可达性选出的入口（§3.1.5），并撒 4096 个起点。**没有任何字段
+报告撒点数量**，`entry_count` 恒为 1 是硬编码。
+
+### 复核后仍然成立的结论
+
+| 结论 | 为什么不受影响 |
+| --- | --- |
+| Recall 0.988 | 真冷重测 0.985，一致 |
+| alpha 调度修复（§3.1.7） | 图质量指标，与缓存无关 |
+| 入口选择修复（§3.1.5） | 同上 |
+| 页缓存负收益（§11.A） | 真冷下差距只会更大 |
+| 多线程内存线性放大（§11.C） | 内存测量独立于缓存状态 |
+| `search_width` 饱和（§11.E） | 扩展数统计，与缓存无关 |
+| 批处理未生效（§12） | `io_submits == page_reads` 在真冷下依然成立 |
+
+### 复核后的正式结果（以此为准）
+
+真冷（`--protect-hot-pages 0 --require-cold-cache 1`）、1M、2000 条查询：
+
+| 指标 | 复核后 | 原报告（污染条件） | 赛题要求 |
+| --- | --- | --- | --- |
+| Recall@10 | **0.988** | 0.988 | ≥ 0.85 |
+| 平均延迟 / p95 | **19.76 / 27.07 ms** | 20.95 / — | — |
+| 物理读/查询 | 873,742 B | 873,742 B | — |
+| 逻辑→物理比 | **1.000** | 1.000 | — |
+| 峰值 RSS / 数据集 | **6.84%** | 7.62% | 10%–20% |
+| `index_fully_cached_during_run` | **False** ✅ | True ❌ | 冷读实验须为 False |
+| `cache_hit_rate`（新口径） | **0.808** | 0.661 ❌ | — |
+| `cross_query_cache_hit_rate` | **0.000** | — | — |
+| `memory_budget_pass` | True | True | 必须 True |
+
+三点值得注意：
+
+1. **召回与物理读完全不变**。复核没有推翻任何关于图质量或 I/O 量的结论。
+2. **延迟略降**（20.95 → 19.76 ms）。因为 `ensure_node_in_degrees()` 的
+   672 MB 顺序读不再发生，启动阶段省掉了这部分开销。
+3. **`cross_query_cache_hit_rate = 0.000`**。这条彻底证实 §11.A 的论断：
+   在 `cache-policy none` 下**没有任何跨查询页复用**，命中率 0.808 全部来自
+   同一条查询内部的 `pinned_hits`。缓存的价值在跨查询，而这里跨查询复用是 0。
+
+### 复核发现的方法论问题
+
+`index_fully_cached_during_run` 这个字段**本来就是为了标记"本实验无效"**而加的
+（注释写得很清楚），默认配置下它报 `True`，但没有任何地方据此中止或拒绝结论。
+`scripts/bench_cold.sh` 会打印警告，可基准本身照常输出漂亮的数字。
+
+**教训**：一个"用于自我否定"的指标，如果不接硬失败，就等于不存在。
+
+---
+
+
 ## 5. 待办（按优先级）
 
 1. 1M 重建索引后复测入口召回（`index_integrity` 的 `reachable_from_entry` 是首要指标：
    修复前 0.09%，修复后应接近 100%），再决定 20k（0.98）与 1M 的差距来自图结构还是入口点。
 2. 去掉 `adc_enable = true` 的硬编码，恢复"关掉 ADC"作为真实对照组。
-3. 构造函数不再全量读索引，只读元数据与 PQ 段（目前会读 638 MiB 的 PQ 码区，
-   直接把整个索引拉进页缓存，污染冷缓存实验）。
+3. `configure_cache` 里的 `ensure_node_in_degrees()` 会顺序读全部 166,667 页
+   （672 MB），且 `protect_hot_pages` 默认为 true，所以**即使 `--cache-policy none`
+   也会执行**，把整个索引拉进页缓存（见 §13）。这是冷缓存实验失效的真正原因，
+   原先"构造函数全量读 PQ 码"的判断是错的（PQ 码区只有 18 MB，占索引 2.6%）。
 4. 把 `graph_probe` / `index_integrity` / `brute_force_check` 纳入固定流程：
    任何召回结论必须附暴力基线与可达性数字。
-5. 修 `--hot_degree_threshold` 解析但未传递（复盘 §1.5 已列）。
+5. `--hot_degree_threshold` 已确认正确传递（`sift_search_benchmark.cpp:813` →
+   `configure_cache`），此项作废。
 
 ## 5.1 召回问题的诊断顺序（按这个顺序查，不要跳到查询层）
 
@@ -594,18 +793,38 @@ cd build && ctest -R platform_io --output-on-failure
 GRAPH_PROBE_BEAM=16 ./build/graph_probe /data/work/idx1m/sift1m.idx /data/work/ds1m/sift_base.fvecs \
     /data/work/ds1m/sift_query.fvecs /data/work/ds1m/sift_groundtruth.ivecs 148523 60 156
 
-# 冷缓存基准（vmtouch -e，无需 root）
+# 冷缓存基准（必须加 --protect-hot-pages 0，见 §4.5）
+# 不加这一项时 ensure_node_in_degrees() 会把 672 MB 索引全读进页缓存，
+# residency_before 直接变成 1，所谓"冷读"就不存在了。
 vmtouch -q -e /data/work/idx1m_v3.idx
 ./build/agent-aware-search --sift-dir /data/work/ds1m --index-path /data/work/idx1m_v3.idx \
-    --io-mode io_uring --cache-policy none --query-limit 2000 --output-json /data/work/cold.json
+    --io-mode io_uring --cache-policy none --protect-hot-pages 0 \
+    --query-limit 2000 --output-json /data/work/cold.json
+
+# 验证冷缓存是否真的成立：residency_before 必须 < 0.9
+python3 /data/work/readjson.py /data/work/cold.json \
+    index_cache_residency_before,index_cache_residency_after,index_fully_cached_during_run
 
 # 撒点数 × 页缓存对照（§3.1.10）。撒点数现已固定为 4096，
 # 要重跑网格需临时改 DiskGraphSearchConfig::spread_start_count 后重建。
+# 注意 --protect-hot-pages 0 必须带，否则页缓存污染会让 cache 对照失真。
 for pages in 0 2000 12000; do
   vmtouch -q -e /data/work/idx1m_v3.idx
   extra=""; [ "$pages" -gt 0 ] && extra="--cache-policy lru --cache-pages $pages"
   ./build/agent-aware-search --sift-dir /data/work/ds1m \
-      --index-path /data/work/idx1m_v3.idx --io-mode io_uring $extra \
+      --index-path /data/work/idx1m_v3.idx --io-mode io_uring \
+      --protect-hot-pages 0 $extra \
       --query-limit 200 --memory-budget-enforce 0 --output-json /data/work/sc_$pages.json
+done
+
+# CPU 成本分解（真冷）：确认 user/sys/等待三者比例
+for mode in io_uring pread; do
+  vmtouch -q -e /data/work/idx1m_v3.idx
+  /usr/bin/time -v ./build/agent-aware-search --sift-dir /data/work/ds1m \
+      --index-path /data/work/idx1m_v3.idx --io-mode $mode \
+      --cache-policy none --protect-hot-pages 0 --query-limit 300 \
+      --memory-budget-enforce 0 --output-json /data/work/cpu_$mode.json \
+      >/dev/null 2>/data/work/cpu_$mode.time
+  grep -E "User time|System time|Percent of CPU|Elapsed" /data/work/cpu_$mode.time
 done
 ```

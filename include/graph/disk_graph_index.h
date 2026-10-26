@@ -108,7 +108,8 @@ struct DiskGraphSearchStats {
   std::size_t same_page_node_reuse = 0;
   double adc_table_build_us = 0.0;
   std::size_t rerank_reads = 0;
-  std::size_t pq_filter_reject_count = 0;
+  // 用 PQ 码的 ADC 近似值算过距离的次数（起点预筛与候选生成）。
+  // 注意：这条路径没有"过滤/拒绝"，所以不存在对应的 reject 计数。
   std::size_t pq_filter_accept_count = 0;
   double demand_read_wait_us = 0.0;
   double search_mutex_wait_us = 0.0;
@@ -130,7 +131,8 @@ struct DiskGraphSearchStats {
   std::size_t prefetch_adaptive_pause_count = 0;
   std::size_t prefetch_adaptive_final_top_k = 0;
   std::size_t prefetch_adaptive_final_lead = 1;
-  double prefetch_saved_wait_us = 0.0;
+  // 只有 planner 的 CPU 开销是真实测量的；"预取省下的等待时间"从来没有
+  // 被赋过值，删掉而不是留一个恒 0 的字段误导读者。
   double prefetch_planner_cpu_us = 0.0;
 };
 

@@ -90,6 +90,10 @@ struct Args {
   std::size_t hot_degree_threshold = 0;
   std::size_t num_search_threads = 1;
   bool memory_budget_enforce = true;
+  // 冷读实验的硬闸门：索引在计时区间内全程驻留页缓存时，延迟里没有磁盘
+  // 成分，任何 I/O 结论都不成立。默认关闭（热缓存实验是合法的），但冷读
+  // 对照必须打开它，否则"实验无效"只会变成 JSON 里的一个 true。
+  bool require_cold_cache = false;
   bool enable_prefetch = false;
   bool enable_prefetch_explicit = false;
   std::string prefetch_policy = "none";
@@ -232,6 +236,12 @@ void print_help() {
       << "  --memory-budget-ratio R      Resident memory budget ratio, default 0.20\n"
       << "  --memory-budget-enforce 0|1  Truncate --cache-pages to the budget and\n"
       << "                               fail on a measured peak-RSS overrun, default 1\n"
+      << "  --require-cold-cache 0|1     Fail (exit 4) when the index stays resident\n"
+      << "                               in the page cache during the timed region;\n"
+      << "                               set 1 for every cold-read experiment, default 0\n"
+      << "  --protect-hot-pages 0|1      Compute node in-degrees at configure time,\n"
+      << "                               which reads the whole index into the page\n"
+      << "                               cache; set 0 for cold experiments, default 1\n"
       << "  --io-mode NAME               pread, odirect, or io_uring, default io_uring\n"
       << "  --io-batch N                 I/O batch size, default 16\n"
       << "  --io-depth N                 I/O depth for io_uring, default 32\n"
@@ -413,6 +423,10 @@ Args parse_args(int argc, char** argv) {
           parse_bool_value(require_value(i, argc, argv, name), name);
     } else if (name == "--protect-hot-pages") {
       args.protect_hot_pages =
+          parse_bool_value(require_value(i, argc, argv, name), name);
+    } else if (name == "--require-cold-cache" ||
+               name == "--require_cold_cache") {
+      args.require_cold_cache =
           parse_bool_value(require_value(i, argc, argv, name), name);
     } else if (name == "--hot-degree-threshold") {
       args.hot_degree_threshold =
@@ -767,7 +781,6 @@ void add_stats(SearchAggregate& aggregate,
   aggregate.stats.distance_direct_calls += stats.distance_direct_calls;
   aggregate.stats.adc_table_build_us += stats.adc_table_build_us;
   aggregate.stats.rerank_reads += stats.rerank_reads;
-  aggregate.stats.pq_filter_reject_count += stats.pq_filter_reject_count;
   aggregate.stats.pq_filter_accept_count += stats.pq_filter_accept_count;
   aggregate.stats.search_mutex_wait_us += stats.search_mutex_wait_us;
   aggregate.stats.unique_prefetch_pages += stats.unique_prefetch_pages;
@@ -791,7 +804,6 @@ void add_stats(SearchAggregate& aggregate,
       stats.prefetch_adaptive_final_top_k;
   aggregate.stats.prefetch_adaptive_final_lead =
       stats.prefetch_adaptive_final_lead;
-  aggregate.stats.prefetch_saved_wait_us += stats.prefetch_saved_wait_us;
   aggregate.stats.prefetch_planner_cpu_us += stats.prefetch_planner_cpu_us;
 }
 
@@ -1169,7 +1181,20 @@ std::string json_for_run(const Args& args,
   const double duplicate_skipped_per_query =
       static_cast<double>(aggregate.stats.duplicate_skipped) /
       query_count_for_rates;
+  // 命中率的分子与分母必须是同一口径的"一次页需求"。
+  // page_requests 含重复请求（同一页在一次批处理里被多次请求），而
+  // cache_hits / pinned_hits 只在去重后的路径累加；用含重复的分母会得出
+  // 偏低的命中率（实测 0.661，而真实"未走 I/O 即满足"的比例是 0.819）。
+  // 这里统一用 page_requests 作分母，分子同时包含会话内已物化（pinned）
+  // 与跨查询页缓存命中（cache）两种"没走 I/O"的情形。
   const double cache_hit_rate =
+      aggregate.stats.page_requests == 0
+          ? 0.0
+          : static_cast<double>(aggregate.stats.cache_hits +
+                                aggregate.stats.pinned_hits) /
+                static_cast<double>(aggregate.stats.page_requests);
+  // 单独保留"跨查询页缓存命中"的比例，避免把两种来源混成一个数。
+  const double cross_query_cache_hit_rate =
       aggregate.stats.page_requests == 0
           ? 0.0
           : static_cast<double>(aggregate.stats.cache_hits) /
@@ -1324,8 +1349,14 @@ std::string json_for_run(const Args& args,
        << (measured_peak != 0 && measured_peak <= memory_budget.budget_bytes)
        << ",\n";
   json << "  \"top_k\": " << args.top_k << ",\n";
+  // 入口语义：manifest 里的 entry_id 是"图构建时选出的可达性最好节点"
+  // （见 disk_graph_builder.cpp 的 select_entry_node），不是几何 medoid。
+  // 搜索时还会在此基础上均匀撒 spread_start_count 个起点，撒点数量必须
+  // 如实报告，否则读者会以为只有一个入口。
   json << "  \"entry_count\": 1,\n";
-  json << "  \"entry_strategy\": \"single-medoid\",\n";
+  json << "  \"entry_strategy\": \"reachability-maximizing\",\n";
+  json << "  \"spread_start_count\": "
+       << agent_aware::DiskGraphSearchConfig{}.spread_start_count << ",\n";
   json << "  \"entry_seed_count\": " << entry_seed_ids.size() << ",\n";
   json << "  \"entry_seed_ids\": [";
   for (std::size_t i = 0; i < entry_seed_ids.size(); ++i) {
@@ -1459,6 +1490,8 @@ std::string json_for_run(const Args& args,
   json << "  \"duplicate_skipped_per_query\": "
        << duplicate_skipped_per_query << ",\n";
   json << "  \"cache_hit_rate\": " << cache_hit_rate << ",\n";
+  json << "  \"cross_query_cache_hit_rate\": " << cross_query_cache_hit_rate
+       << ",\n";
   json << "  \"query_latency_ms\": [";
   for (std::size_t i = 0; i < aggregate.query_latency_ms.size(); ++i) {
     if (i != 0) {
@@ -1548,8 +1581,6 @@ std::string json_for_run(const Args& args,
   json << "    \"rerank_reads\": " << aggregate.stats.rerank_reads << ",\n";
   json << "    \"pq_filter_accept_count\": "
        << aggregate.stats.pq_filter_accept_count << ",\n";
-  json << "    \"pq_filter_reject_count\": "
-       << aggregate.stats.pq_filter_reject_count << ",\n";
   json << "    \"distance_direct_calls\": "
        << aggregate.stats.distance_direct_calls << ",\n";
   json << "    \"unique_prefetch_pages\": "
@@ -1586,8 +1617,6 @@ std::string json_for_run(const Args& args,
        << aggregate.stats.prefetch_adaptive_final_top_k << ",\n";
   json << "    \"prefetch_adaptive_final_lead\": "
        << aggregate.stats.prefetch_adaptive_final_lead << ",\n";
-  json << "    \"prefetch_saved_wait_us\": "
-       << aggregate.stats.prefetch_saved_wait_us << ",\n";
   json << "    \"prefetch_planner_cpu_us\": "
        << aggregate.stats.prefetch_planner_cpu_us << ",\n";
   json << "    \"prefetch_planner_cpu_ratio\": "
@@ -1754,6 +1783,27 @@ int main(int argc, char** argv) {
                      "--memory-budget-enforce 0 to record a deliberately "
                      "over-budget run\n";
         return 2;
+      }
+    }
+    // 冷读实验的硬闸门。索引在计时区间内全程驻留页缓存时，延迟里没有磁盘
+    // 成分，任何 I/O 结论都不成立。这个判据以前只写进 JSON 的
+    // index_fully_cached_during_run，没有任何调用方据此停下——结果就是
+    // "实验无效"变成了报告里一个没人看的 true。现在让它直接失败。
+    if (args.require_cold_cache) {
+      constexpr double kResidentThreshold = 0.9;
+      const double before = aggregate.cache_residency_before;
+      const double after = aggregate.cache_residency_after;
+      if (before > kResidentThreshold || after > kResidentThreshold) {
+        std::cerr
+            << "error: --require-cold-cache 1 but the index was resident in "
+               "the page cache during the timed region (before="
+            << before << ", after=" << after
+            << ", threshold=" << kResidentThreshold
+            << "); the latency contains no disk component and cannot support "
+               "an I/O conclusion — pass --protect-hot-pages 0 (the in-degree "
+               "pass reads the whole index at configure time) and evict the "
+               "page cache before the run\n";
+        return 4;
       }
     }
     return 0;

@@ -65,7 +65,11 @@ def main():
         manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
         assert payload["status"] == "completed"
         assert payload["index_format_version"] == 3
-        assert payload["entry_strategy"] == "single-medoid"
+        # 入口不是几何 medoid，而是构图时实测可达性最好的节点
+        # （见 disk_graph_builder.cpp 的 select_entry_node）。
+        assert payload["entry_strategy"] == "reachability-maximizing"
+        # 搜索还会在入口之外均匀撒起点，撒点数必须如实报告。
+        assert payload["spread_start_count"] > 0
         assert payload["entry_seed_ids"] == [manifest["entry_id"]]
         assert Path(payload["build_manifest"]) == manifest_path
         expected_stats = {
