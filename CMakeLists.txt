@@ -34,6 +34,7 @@ endif()
 set(AGENT_AWARE_LIBRARY_SOURCES
   src/core/async_page_reader.cpp
   src/core/brute_force.cpp
+  src/core/platform_io.cpp
   src/core/pq_encoder.cpp
   src/core/prefetch_adaptive_controller.cpp
   src/core/query_page_session.cpp
@@ -101,6 +102,9 @@ if(BUILD_TESTING)
   target_link_libraries(async_page_reader_test
                         PRIVATE agent_aware::agent_aware)
   add_test(NAME async_page_reader COMMAND async_page_reader_test)
+  add_executable(platform_io_test tests/platform_io.cpp)
+  target_link_libraries(platform_io_test PRIVATE agent_aware::agent_aware)
+  add_test(NAME platform_io COMMAND platform_io_test)
   add_executable(prefetch_adaptive_controller_test
                  tests/prefetch_adaptive_controller.cpp)
   target_link_libraries(prefetch_adaptive_controller_test
