@@ -741,6 +741,49 @@ PageRank + BFS 可达性选出的入口（§3.1.5），并撒 4096 个起点。*
 
 **教训**：一个"用于自我否定"的指标，如果不接硬失败，就等于不存在。
 
+### 复核遗留项已修复（2026-10-26 收尾）
+
+复核提出的两个"测量能力"层面的缺陷已经修掉，默认配置现在开箱即是真冷。
+
+**① `protect_hot_pages` 默认值 true → false**
+
+它只服务于 hub-aware 缓存策略的 `page_hot_score`，而 `cache_policy` 默认已经是
+`none`，那张入度表根本不会被读。默认 `true` 的代价是每次启动顺序读全部
+166,667 页：1M 上 **+0.48 s 启动**、**672 MB 页缓存污染**、**4 MB 常驻内存**。
+
+验证（默认配置，不带任何参数）：
+
+| 项 | 修复后 |
+| --- | --- |
+| `index_cache_residency_before/after` | 0.0435 / 0.0435（真冷） |
+| `index_fully_cached_during_run` | **False** |
+| `in_degree_bytes` | **0** |
+| 启动耗时 | 2.49 s → 2.01 s |
+| 峰值 RSS | 6.59% |
+| `--require-cold-cache 1` | **exit 0 通过** |
+
+显式 `--protect-hot-pages 1` 仍然可用（`residency=1`、`in_degree_bytes=4 MB`），
+需要对照实验时不受影响。
+
+**② `effective_config.adc_enable = true` 硬编码 → 移除**
+
+那一行会静默覆盖调用方的设置：传 `adc_enable = false` 进去会被改回 `true`，
+于是"关闭 ADC"的对照实验实际仍走 ADC，而报告里的开关看起来是关的。
+现在不再改写，关闭 ADC 时 `initialize_search_state` 明确报错
+（非 PQ 候选生成路径已被移除，所以确实无法关闭）。`--enable-pq 0` 在
+benchmark 层就以 exit 1 拒绝。
+
+顺带删掉 `rank_neighbors_by_distance`：它用 ADC 近似值给邻居排序，但
+`expand_candidate_batch` 早已改成用 `exact_distance` 排序（页刚读过，算距离
+不产生额外 I/O），这个函数已无调用者。留着会让人误以为 ADC 还在承担邻居
+排序的职责。
+
+**②的实质结论**：ADC 目前承担三件事——起点预筛、`topk` 后的 rerank、
+（历史上）邻居排序占位。第三件已消失，前两件与 I/O 优化强耦合，所以
+"完全关闭 ADC"不是一个可用的对照组，而是一个应当明确拒绝的配置。
+文档 §5 待办 #2 的原始设想（"恢复关掉 ADC 作为真实对照组"）在现有架构下
+不成立，已改为"明确拒绝"。
+
 ---
 
 
@@ -748,15 +791,20 @@ PageRank + BFS 可达性选出的入口（§3.1.5），并撒 4096 个起点。*
 
 1. 1M 重建索引后复测入口召回（`index_integrity` 的 `reachable_from_entry` 是首要指标：
    修复前 0.09%，修复后应接近 100%），再决定 20k（0.98）与 1M 的差距来自图结构还是入口点。
-2. 去掉 `adc_enable = true` 的硬编码，恢复"关掉 ADC"作为真实对照组。
-3. `configure_cache` 里的 `ensure_node_in_degrees()` 会顺序读全部 166,667 页
-   （672 MB），且 `protect_hot_pages` 默认为 true，所以**即使 `--cache-policy none`
-   也会执行**，把整个索引拉进页缓存（见 §13）。这是冷缓存实验失效的真正原因，
-   原先"构造函数全量读 PQ 码"的判断是错的（PQ 码区只有 18 MB，占索引 2.6%）。
+2. ~~去掉 `adc_enable = true` 的硬编码，恢复"关掉 ADC"作为真实对照组。~~
+   **已完成（§4.5 收尾）**：硬编码已移除。但结论是"关掉 ADC 不是可用的对照组"
+   —— 非 PQ 候选生成路径已被移除，所以现在明确报错拒绝，而不是静默改回 true。
+3. ~~`ensure_node_in_degrees()` 顺序读全部 166,667 页~~ **已完成（§4.5 收尾）**：
+   `protect_hot_pages` 默认改为 `false`，默认配置不再做入度扫描
+   （`in_degree_bytes = 0`，启动省 0.48 s，不再污染页缓存）。
+   原先"构造函数全量读 PQ 码"的判断也是错的（PQ 码区只有 18 MB，占索引 2.6%）。
 4. 把 `graph_probe` / `index_integrity` / `brute_force_check` 纳入固定流程：
    任何召回结论必须附暴力基线与可达性数字。
 5. `--hot_degree_threshold` 已确认正确传递（`sift_search_benchmark.cpp:813` →
    `configure_cache`），此项作废。
+6. **（新）修 `expand_candidate_batch` 绕过批处理的问题**：它对每个候选逐个
+   `load_node`，导致 `--io-depth` / `--io-batch` 在热路径上无效，每页一次
+   `io_uring_submit` + 一次 `wait_cqe`。这是 §12 定位的最大优化空间，属 Phase 1。
 
 ## 5.1 召回问题的诊断顺序（按这个顺序查，不要跳到查询层）
 
@@ -793,27 +841,31 @@ cd build && ctest -R platform_io --output-on-failure
 GRAPH_PROBE_BEAM=16 ./build/graph_probe /data/work/idx1m/sift1m.idx /data/work/ds1m/sift_base.fvecs \
     /data/work/ds1m/sift_query.fvecs /data/work/ds1m/sift_groundtruth.ivecs 148523 60 156
 
-# 冷缓存基准（必须加 --protect-hot-pages 0，见 §4.5）
-# 不加这一项时 ensure_node_in_degrees() 会把 672 MB 索引全读进页缓存，
-# residency_before 直接变成 1，所谓"冷读"就不存在了。
+# 冷缓存基准。protect_hot_pages 默认已是 false，无需再显式关闭；
+# 但 --require-cold-cache 1 仍应带上，它会在驻留率 >0.9 时以 exit 4 失败。
 vmtouch -q -e /data/work/idx1m_v3.idx
 ./build/agent-aware-search --sift-dir /data/work/ds1m --index-path /data/work/idx1m_v3.idx \
-    --io-mode io_uring --cache-policy none --protect-hot-pages 0 \
+    --io-mode io_uring --cache-policy none --require-cold-cache 1 \
     --query-limit 2000 --output-json /data/work/cold.json
 
 # 验证冷缓存是否真的成立：residency_before 必须 < 0.9
 python3 /data/work/readjson.py /data/work/cold.json \
     index_cache_residency_before,index_cache_residency_after,index_fully_cached_during_run
 
+# 需要 hub-aware 缓存策略时才打开入度统计（它会顺序读整个索引）
+./build/agent-aware-search --sift-dir /data/work/ds1m \
+    --index-path /data/work/idx1m_v3.idx --cache-policy graph-aware-2q \
+    --protect-hot-pages 1 --cache-pages 12000 --query-limit 200 \
+    --memory-budget-enforce 0 --output-json /data/work/hubaware.json
+
 # 撒点数 × 页缓存对照（§3.1.10）。撒点数现已固定为 4096，
 # 要重跑网格需临时改 DiskGraphSearchConfig::spread_start_count 后重建。
-# 注意 --protect-hot-pages 0 必须带，否则页缓存污染会让 cache 对照失真。
+# protect_hot_pages 默认已是 false，这里不用再带。
 for pages in 0 2000 12000; do
   vmtouch -q -e /data/work/idx1m_v3.idx
   extra=""; [ "$pages" -gt 0 ] && extra="--cache-policy lru --cache-pages $pages"
   ./build/agent-aware-search --sift-dir /data/work/ds1m \
-      --index-path /data/work/idx1m_v3.idx --io-mode io_uring \
-      --protect-hot-pages 0 $extra \
+      --index-path /data/work/idx1m_v3.idx --io-mode io_uring $extra \
       --query-limit 200 --memory-budget-enforce 0 --output-json /data/work/sc_$pages.json
 done
 

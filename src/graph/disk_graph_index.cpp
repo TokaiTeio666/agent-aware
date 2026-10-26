@@ -142,25 +142,6 @@ struct PackedDiskGraphIndex::SearchState {
     return session.get_or_load_page(session.page_for_node(id));
   }
 
-  std::vector<SearchResult> rank_neighbors_by_distance(
-      const std::vector<std::uint32_t>& node_ids) {
-    std::vector<SearchResult> ranked;
-    ranked.reserve(node_ids.size());
-    for (const auto node_id : node_ids) {
-      // 邻居的页多半不在手；先用 ADC 近似值占位，弹出时会用全精度距离替换。
-      ranked.push_back(
-          SearchResult{node_id, candidate_distance(node_id), true});
-    }
-    std::sort(ranked.begin(), ranked.end(),
-              [](const SearchResult& lhs, const SearchResult& rhs) {
-                if (lhs.distance == rhs.distance) {
-                  return lhs.id < rhs.id;
-                }
-                return lhs.distance < rhs.distance;
-              });
-    return ranked;
-  }
-
   void add_best(const SearchResult& result) {
     if (best.size() < result_capacity) {
       best.push(result);
@@ -668,11 +649,17 @@ PackedDiskGraphIndex::initialize_search_state(
         "Packed graph index supports one concurrent query session per index; "
         "open one index per worker");
   }
+  // 调用方传进来的 config 已经由 search_one 合并过索引自带的 PQ 模型，
+  // 这里只做前置校验，不再自行改动配置。
   auto state = std::make_unique<SearchState>(*this, query, config, output);
   if (!config.adc_enable || config.pq_model == nullptr ||
       !config.pq_model->enabled()) {
+    // 非 PQ 的候选生成路径已被移除，所以关闭 ADC 目前无法工作。
+    // 这里明确报错而不是静默回落，否则对照实验会得出"关掉 ADC 性能相同"
+    // 的错误结论 —— 实际是开关根本没生效。
     throw std::runtime_error(
-        "Packed graph search requires PQ+ADC; non-PQ candidate generation was removed");
+        "Packed graph search requires PQ+ADC; non-PQ candidate generation was "
+        "removed, so adc_enable cannot be turned off");
   }
 
   const std::vector<std::uint32_t> entries =
@@ -896,9 +883,9 @@ void PackedDiskGraphIndex::expand_candidate_batch(
             std::chrono::steady_clock::now() - planner_start).count();
   }
 
-  // 将 PQ 排序后的邻居推入候选堆（CPU 计算已在 rank_neighbors_by_distance 中完成）。
-  // 注意：这里只进候选堆，不进结果集 —— 邻居的页还没打开，手里只有 ADC 近似值。
-  // 结果集只接收全精度距离（见 expand_candidate_batch 开头）。
+  // 邻居在 expand_candidate_batch 里已经用全精度距离排过序（页刚读过，
+  // 算距离不产生额外 I/O），所以推进候选堆的每个 SearchResult 都带
+  // approximate=false 的真实距离。这里不需要再用 ADC 近似值占位。
   for (const auto& ranked_neighbors : ranked_neighbors_by_candidate) {
     for (const auto& candidate : ranked_neighbors) {
       state.candidates.push(candidate);
@@ -965,6 +952,8 @@ DiskGraphSearchResult PackedDiskGraphIndex::search_one(
     throw std::runtime_error(
         "Packed graph prefetch policy must be none or topology");
   }
+  // 把调用方的配置与索引自带的 PQ 模型合并成一份 effective_config，后续
+  // 校验和 SearchState 都只看这一份，避免"校验用一份、执行用另一份"的分叉。
   DiskGraphSearchConfig effective_config = config;
   if (effective_config.pq_model != nullptr) {
     const auto& external = *effective_config.pq_model;
@@ -978,7 +967,10 @@ DiskGraphSearchResult PackedDiskGraphIndex::search_one(
   } else {
     effective_config.pq_model = &pq_model_;
   }
-  effective_config.adc_enable = true;
+  // 这里**不再**无条件置 adc_enable = true。此前那一行会静默覆盖调用方的
+  // 设置，使"关掉 ADC"的对照实验实际仍走 ADC，而报告里的开关看起来是关的。
+  // 关闭 ADC 现在会在 initialize_search_state 里明确报错（非 PQ 候选生成
+  // 路径已被移除），而不是被悄悄改回 true。
   // 实验开关：记录结果集中每个位置的入批顺序（用来看第 k 名是否早期就被
   // 远离查询的节点占住，从而让 relaxed 收敛条件提前终止搜索）。
   const bool trace_results = std::getenv("AGENT_AWARE_TRACE_RESULTS") != nullptr;

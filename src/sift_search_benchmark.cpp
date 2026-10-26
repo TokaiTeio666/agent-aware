@@ -86,7 +86,11 @@ struct Args {
   std::size_t cache_pages = 0;
   bool cache_pages_requested = false;
   double memory_budget_ratio = 0.20;
-  bool protect_hot_pages = true;
+  // 入度统计会顺序读全部 166,667 页（1M 上 672 MB，实测 +0.48 s 启动），
+  // 且把整个索引拉进页缓存。它只服务于 hub-aware 缓存策略的 page_hot_score，
+  // 而 cache_policy 默认已经是 none —— 那张表根本不会被读。默认关闭：
+  // 只有在显式开启 graph-aware-2q / agent 策略时才需要它。
+  bool protect_hot_pages = false;
   std::size_t hot_degree_threshold = 0;
   std::size_t num_search_threads = 1;
   bool memory_budget_enforce = true;
@@ -241,7 +245,8 @@ void print_help() {
       << "                               set 1 for every cold-read experiment, default 0\n"
       << "  --protect-hot-pages 0|1      Compute node in-degrees at configure time,\n"
       << "                               which reads the whole index into the page\n"
-      << "                               cache; set 0 for cold experiments, default 1\n"
+      << "                               cache (672 MB / +0.5 s on 1M); only needed\n"
+      << "                               by hub-aware cache policies, default 0\n"
       << "  --io-mode NAME               pread, odirect, or io_uring, default io_uring\n"
       << "  --io-batch N                 I/O batch size, default 16\n"
       << "  --io-depth N                 I/O depth for io_uring, default 32\n"
