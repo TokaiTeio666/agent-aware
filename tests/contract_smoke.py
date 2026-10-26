@@ -54,6 +54,10 @@ def main():
             str(search), "--sift-dir", "", "--query", str(query),
             "--query-limit", "8", "--index-path", str(index),
             "--io-mode", "pread", "--cache-pages", "32",
+            # 本测试校验的是输出契约，不是内存预算：512 条 × 32 维的合成数据集
+            # 只有 64 KiB，20% 预算远小于进程自身的固定占用，开启硬失败会以
+            # "预算不可满足"退出。预算是独立指标，由其专项实验负责。
+            "--memory-budget-enforce", "0",
         ]
         run([*common, "--output-json", str(result)])
         payload = json.loads(result.read_text(encoding="utf-8"))

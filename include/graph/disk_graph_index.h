@@ -48,6 +48,14 @@ struct DiskGraphSearchConfig {
   std::size_t beam_width = 0;
   std::size_t entry_count = 1;
   std::vector<std::uint32_t> seed_ids;
+  // 在 seed_ids 之外再均匀撒这么多起始点（spread starts）。图为降低度数做了
+  // 邻居剪枝，从单一入口出发的 beam search 在 1M 规模上极易陷在局部：实测只撒
+  // 1 个入口时，查询会被困在距离 70+ 的区域。0 表示只用 seed_ids。
+  // 撒开的点先按 PQ 码的 ADC 近似值排序，只对最靠前的几个读整页，所以撒点
+  // 数量与读页数解耦。实测（1M，degree 32，io_uring 冷读）：起点越密，贪心
+  // 越早收敛，读的页反而越少 —— 撒 32 个时 recall 0.30 / 48 ms / 2.1 MB；
+  // 撒 4096 个时 recall 0.99 / 20 ms / 0.86 MB。
+  std::size_t spread_start_count = 4096;
   const PqAdcModel* pq_model = nullptr;
   bool adc_enable = false;
   std::size_t rerank_topk = 0;
@@ -59,6 +67,8 @@ struct DiskGraphSearchConfig {
   std::string prefetch_trace_path;
   std::string run_id = "manual";
   std::uint64_t query_id = 0;
+  // 诊断开关：记录每次扩展节点的全精度距离（见 DiskGraphSearchResult）。
+  bool record_expanded_distances = false;
 };
 
 struct DiskGraphSearchStats {
@@ -127,6 +137,10 @@ struct DiskGraphSearchStats {
 struct DiskGraphSearchResult {
   std::vector<SearchResult> topk;
   DiskGraphSearchStats stats;
+  // 每次扩展时节点的全精度距离，按扩展顺序。诊断用：判断贪心是否卡在局部极小、
+  // 是否出现"走远再回来"的跳变。默认不填充，只有调用方显式打开时才有内容。
+  std::vector<float> expanded_distances;
+  bool record_expanded_distances = false;
 };
 
 struct DiskGraphMetadata {

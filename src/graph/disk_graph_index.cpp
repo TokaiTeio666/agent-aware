@@ -4,6 +4,8 @@
 #include <atomic>
 #include <chrono>
 #include <cmath>
+#include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <deque>
 #include <filesystem>
@@ -64,6 +66,11 @@ std::vector<SearchResult> sorted_results(
   return results;
 }
 
+// 候选的全精度距离比当前第 k 名远出这么多时才终止搜索。ADC 近似值可以被
+// 当作"上限"来提前放弃，但 PQ 量化误差会让全精度距离在小范围内抖动；
+// 留一点余量避免把差一点点进前 k 的点提前剪掉。
+constexpr float kSearchStopSlack = 1e-3f;
+
 }  // namespace
 
 std::vector<TopologyPageCandidate> rank_topology_pages(
@@ -120,12 +127,29 @@ struct PackedDiskGraphIndex::SearchState {
     return config.pq_model->adc_distance(id, adc_table);
   }
 
+  // 注意：PQ 的 ADC 距离**不能**当作可靠下界用于剪枝 —— 实测用
+  // "第 k 名 + ADC 距离"判定会把召回率从 0.90 打到 0.28。
+  // ADC 只用于在"还没有页里的全精度距离时"给候选排序。
+
+  // 全精度距离：页已经在会话里（扩展时刚读过），向量就在 decoded.bytes 中，
+  // 只算一次、不产生额外 I/O。ADC 是页不在手的近似值，不能代替它做决策。
+  float exact_distance(std::uint32_t id) {
+    ++output.stats.distance_direct_calls;
+    return index.compute_distance_direct(query, page_holding(id), load_node(id));
+  }
+
+  const PackedDiskGraphIndex::DecodedPage& page_holding(std::uint32_t id) {
+    return session.get_or_load_page(session.page_for_node(id));
+  }
+
   std::vector<SearchResult> rank_neighbors_by_distance(
       const std::vector<std::uint32_t>& node_ids) {
     std::vector<SearchResult> ranked;
     ranked.reserve(node_ids.size());
     for (const auto node_id : node_ids) {
-      ranked.push_back(SearchResult{node_id, candidate_distance(node_id)});
+      // 邻居的页多半不在手；先用 ADC 近似值占位，弹出时会用全精度距离替换。
+      ranked.push_back(
+          SearchResult{node_id, candidate_distance(node_id), true});
     }
     std::sort(ranked.begin(), ranked.end(),
               [](const SearchResult& lhs, const SearchResult& rhs) {
@@ -655,9 +679,21 @@ PackedDiskGraphIndex::initialize_search_state(
       config.seed_ids.empty() ? std::vector<std::uint32_t>{0}
                               : config.seed_ids;
 
+  std::vector<std::uint32_t> all_entries = entries;
+  // 均匀撒开起始点：见 DiskGraphSearchConfig::spread_start_count 的说明。
+  const std::size_t spread_request = config.spread_start_count;
+  const std::size_t spread_cap = std::min<std::size_t>(
+      spread_request, static_cast<std::size_t>(metadata_.vector_count));
+  if (spread_cap > 1) {
+    const std::size_t stride =
+        static_cast<std::size_t>(metadata_.vector_count) / spread_cap;
+    for (std::size_t i = 0; i < spread_cap && stride > 0; ++i) {
+      all_entries.push_back(static_cast<std::uint32_t>(i * stride));
+    }
+  }
   std::vector<std::uint32_t> accepted_entries;
-  accepted_entries.reserve(entries.size());
-  for (const auto entry : entries) {
+  accepted_entries.reserve(all_entries.size());
+  for (const auto entry : all_entries) {
     if (entry >= metadata_.vector_count) {
       continue;
     }
@@ -679,24 +715,48 @@ PackedDiskGraphIndex::initialize_search_state(
       std::min<std::size_t>(std::max(state->effective_k, config.rerank_topk),
                             static_cast<std::size_t>(metadata_.vector_count));
 
-  std::vector<SearchResult> ranked_entries;
-  ranked_entries.reserve(accepted_entries.size());
+  // 起始点的两阶段筛选：先用 PQ 码的 ADC 近似值把撒点排序，再只对最靠前的
+  // 若干个读整页算全精度距离。撒开的起始点本身就是要覆盖整个空间（单入口
+  // 在 1M 上只能召回 0.04），但每个起点都要读一个分散的页：2048 个起点让
+  // 每查询物理读从 2.2 MB 涨到 9.4 MB。ADC 排序不读页，能把"读多少个页面"
+  // 与"筛多少候选"解耦。
+  constexpr std::size_t kMaxSeedAnchors = 4;
+  // 每个保留的锚点，实际读页的候选数（按 ADC 从全部撒点里挑最近的这些）。
+  constexpr std::size_t kExactAnchorsPerSlot = 1;
+  constexpr std::size_t max_seed_anchors = kMaxSeedAnchors;
+  std::vector<std::pair<float, std::uint32_t>> anchor_order;
+  anchor_order.reserve(accepted_entries.size());
   for (const auto entry : accepted_entries) {
-    const float distance = state->candidate_distance(entry);
-    ranked_entries.push_back(SearchResult{entry, distance});
+    anchor_order.emplace_back(state->candidate_distance(entry), entry);
   }
-  std::sort(ranked_entries.begin(), ranked_entries.end(),
-            [](const SearchResult& lhs, const SearchResult& rhs) {
-              if (lhs.distance == rhs.distance) {
-                return lhs.id < rhs.id;
-              }
-              return lhs.distance < rhs.distance;
-            });
+  std::sort(anchor_order.begin(), anchor_order.end());
+  const std::size_t exact_probe_count = std::min<std::size_t>(
+      anchor_order.size(), max_seed_anchors * kExactAnchorsPerSlot);
+  anchor_order.resize(exact_probe_count);
+  for (auto& [anchor_distance, entry] : anchor_order) {
+    anchor_distance = state->exact_distance(entry);
+  }
+  std::sort(anchor_order.begin(), anchor_order.end());
+  if (anchor_order.size() > max_seed_anchors) {
+    anchor_order.resize(max_seed_anchors);
+  }
+  if (anchor_order.empty()) {
+    // 任何情况下候选堆都不能为空：种子列表一旦被过滤光（全部越界或去重），
+    // 搜索会零扩展返回空结果，而调用方只看到一个召回 0 的查询，看不出是
+    // 配置错了。退回到 0 号节点，保证图搜索仍然执行。
+    anchor_order.emplace_back(state->exact_distance(0), 0u);
+  }
+  std::vector<SearchResult> ranked_entries;
+  ranked_entries.reserve(anchor_order.size());
+  for (const auto& [anchor_distance, entry] : anchor_order) {
+    ranked_entries.push_back(SearchResult{entry, anchor_distance, false});
+  }
 
   // entry point 按 PQ 距离顺序入堆，避免第一批扩展被任意 id 顺序主导。
+  // 注意不在这里加入结果集：结果集只接收全精度距离，近似值进去就再也
+  // 改不回来了（best 堆无法原地更新）。
   for (const auto& result : ranked_entries) {
     state->candidates.push(result);
-    state->add_best(result);
   }
   return state;
 }
@@ -762,6 +822,18 @@ void PackedDiskGraphIndex::expand_candidate_batch(
     const DiskNode& node = state.load_node(current.id);
     (void)state.session.pin_page(state.session.page_for_node(current.id));
     ++state.output.stats.expanded;
+    // 节点刚被打开，向量就在手：此时才算全精度距离并入结果集。
+    // 已扩展过的候选（current.approximate == false）用的是精确距离，直接沿用。
+    const float exact =
+        current.approximate
+            ? state.index.compute_distance_direct(state.query,
+                                                   state.page_holding(current.id),
+                                                   node)
+            : current.distance;
+    state.add_best(SearchResult{current.id, exact, false});
+    if (state.output.record_expanded_distances) {
+      state.output.expanded_distances.push_back(exact);
+    }
 
     std::vector<std::uint32_t> new_neighbors;
     new_neighbors.reserve(node.neighbors.size());
@@ -773,8 +845,20 @@ void PackedDiskGraphIndex::expand_candidate_batch(
       new_neighbors.push_back(neighbor_id);
     }
 
-    std::vector<SearchResult> ranked_neighbors =
-        state.rank_neighbors_by_distance(new_neighbors);
+    // 邻居此刻还在页里：顺手算全精度距离（零额外 I/O），不必等到被弹出时再算。
+    // 这样候选堆永远按真实距离排序，也不会为了"改正近似值"而弹出后又塞回去，
+    // 避免在一轮内把同一个点反复计入 batch。
+    std::vector<SearchResult> ranked_neighbors;
+    ranked_neighbors.reserve(new_neighbors.size());
+    for (const auto neighbor_id : new_neighbors) {
+      ranked_neighbors.push_back(
+          SearchResult{neighbor_id, state.exact_distance(neighbor_id), false});
+    }
+    std::sort(ranked_neighbors.begin(), ranked_neighbors.end(),
+              [](const SearchResult& lhs, const SearchResult& rhs) {
+                return lhs.distance == rhs.distance ? lhs.id < rhs.id
+                                                    : lhs.distance < rhs.distance;
+              });
 
     ranked_neighbors_by_candidate.push_back(std::move(ranked_neighbors));
   }
@@ -812,11 +896,12 @@ void PackedDiskGraphIndex::expand_candidate_batch(
             std::chrono::steady_clock::now() - planner_start).count();
   }
 
-  // 将 PQ 排序后的邻居推入候选堆（CPU 计算已在 rank_neighbors_by_distance 中完成）
+  // 将 PQ 排序后的邻居推入候选堆（CPU 计算已在 rank_neighbors_by_distance 中完成）。
+  // 注意：这里只进候选堆，不进结果集 —— 邻居的页还没打开，手里只有 ADC 近似值。
+  // 结果集只接收全精度距离（见 expand_candidate_batch 开头）。
   for (const auto& ranked_neighbors : ranked_neighbors_by_candidate) {
     for (const auto& candidate : ranked_neighbors) {
       state.candidates.push(candidate);
-      state.add_best(candidate);
     }
   }
 }
@@ -894,12 +979,20 @@ DiskGraphSearchResult PackedDiskGraphIndex::search_one(
     effective_config.pq_model = &pq_model_;
   }
   effective_config.adc_enable = true;
+  // 实验开关：记录结果集中每个位置的入批顺序（用来看第 k 名是否早期就被
+  // 远离查询的节点占住，从而让 relaxed 收敛条件提前终止搜索）。
+  const bool trace_results = std::getenv("AGENT_AWARE_TRACE_RESULTS") != nullptr;
+  std::vector<std::pair<std::uint32_t, std::uint32_t>> result_trace;
+  if (trace_results) {
+    result_trace.reserve(512);
+  }
   const std::size_t effective_beam_width =
       std::clamp(config.beam_width == 0 ? config.search_width
                                          : config.beam_width,
                  std::size_t{1}, config.search_width);
 
   DiskGraphSearchResult output;
+  output.record_expanded_distances = config.record_expanded_distances;
   // 只在真正拿到锁之后计时：此前写在该字段里的值恒为 0（锁前从未打点），
   // 无法用于论证锁竞争。
   output.stats.search_mutex_wait_us = search_mutex_wait_us;
@@ -911,10 +1004,79 @@ DiskGraphSearchResult PackedDiskGraphIndex::search_one(
   } release{live_sessions_};
   std::unique_ptr<SearchState> state =
       initialize_search_state(query, effective_config, output);
+  // beam search 的三个不变量（缺一不可，与 Vamana / DiskANN 的实现一致）：
+  //   1. 候选堆按全精度距离排序（入口点在读页之前用 ADC 估，读到页后立即改正）；
+  //   2. 候选比当前最差结果还远就不再扩展 —— 这是"visited"与"beacon"之外的收敛条件；
+  //   3. 结果集（best）只由全精度距离决定，ADC 只用于挑选"下一个要打开的页"。
+  // 旧实现缺少第 1、3 条：结果全程按 ADC 近似值排序且永不重排，于是返回的
+  // distance 与 id 对不上，召回率在 1M 规模上塌到 0.0002。
+  const std::size_t expansion_limit =
+      std::max<std::size_t>(config.search_width, effective_beam_width);
+  const std::size_t beam = std::max<std::size_t>(1, effective_beam_width);
+  // 近似值改正必须计入预算，否则它们可以无限自循环（见下方改正分支）。
+  constexpr std::size_t kApproximateCorrectionLimit = 1000;
+  // 上限取固定的 1000：一次查询里需要改正的点数不该超过搜索宽度的量级，
+  // 超过就说明存在持续抖动，此时宁可放弃本次搜索也不要空转。
+  std::size_t approximate_corrections = 0;
+  std::vector<SearchResult> batch;
   while (!state->candidates.empty() &&
-         output.stats.expanded < config.search_width) {
-    std::vector<SearchResult> batch =
-        select_candidate_batch(*state, effective_beam_width);
+         output.stats.expanded < expansion_limit) {
+    batch.clear();
+    std::size_t emitted = 0;
+    while (!state->candidates.empty() && emitted < beam) {
+      const SearchResult front = state->candidates.top();
+      // 收敛：最前面的候选已经比当前第 k 名更远（Vamana 的 relaxed 条件），
+      //     继续扩展只可能走得更远，整条搜索即可结束。这个判断只看"最前面的
+      //     候选"，与 beam 宽度无关：若对整批都判断，beam 宽时批次还没凑满，
+      //     front 早就不比 worst 近（worst 尚未被替换），搜索会一路扩展到上限。
+      //     批内不再单独丢弃候选：ADC 下界太松，据此剪枝把召回率从 0.90 打到
+      //     0.28（见 docs/problem/phase0-measurements-2026-10-26.md）。
+      if (emitted == 0 && state->best.size() >= state->effective_k &&
+          front.distance > state->best.top().distance) {
+        if (trace_results) {
+          std::fprintf(stderr,
+                       "trace convergence: expanded=%zu best_size=%zu "
+                       "front=%.3f worst_w=%.3f topk=",
+                       output.stats.expanded, state->best.size(),
+                       static_cast<double>(front.distance),
+                       static_cast<double>(state->best.top().distance));
+          for (const auto& result : sorted_results(state->best)) {
+            std::fprintf(stderr, "%u/%.3f ", result.id,
+                         static_cast<double>(result.distance));
+          }
+          std::fprintf(stderr, "\n");
+        }
+        state->candidates = {};
+        break;
+      }
+      // 先在堆顶做判断，确认要扩展才 pop：beam 名额用完时堆顶必须留在堆里，
+      // 它是最近的那个候选 —— 若误弹出就会把它丢掉，下一轮却去扩展更远的点。
+      // （实测 beam=64 时每次弹出的第一个候选被丢弃，召回率从 0.86 掉到 0.05。）
+      if (front.approximate) {
+        state->candidates.pop();
+        // 兜底：候选堆里理论上只有精确距离（入口与邻居都在读页时就算了），
+        // 走到这里说明有路径漏了精确化。就地改正后重新入堆，而不是带着
+        // 近似值参与扩展决策。
+        ++approximate_corrections;
+        state->candidates.push(
+            SearchResult{front.id, state->exact_distance(front.id), false});
+        if (approximate_corrections > kApproximateCorrectionLimit) {
+          // 改正步不计入扩展预算，但必须有上界，否则一个持续的近似/精确
+          // 距离抖动就会让内层循环空转：状态停在 expanded=0、batch=0，
+          // 整个搜索返回空结果。日志留痕，便于把真正的漏精确化找出来。
+          std::fprintf(stderr,
+                       "warning: abandoned packed graph search after %zu "
+                       "approximate-distance corrections\n",
+                       approximate_corrections);
+          state->candidates = {};
+          break;
+        }
+        continue;
+      }
+      state->candidates.pop();
+      batch.push_back(front);
+      ++emitted;
+    }
     if (batch.empty()) {
       break;
     }

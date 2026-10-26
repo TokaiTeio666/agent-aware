@@ -43,6 +43,9 @@ struct VectorSet {
 struct SearchResult {
   std::uint32_t id = 0;
   float distance = 0.0f;
+  // distance 是否为近似值（PQ/ADC 估计）。近似距离只能用于决定"打开哪一页"，
+  // 不能用于排序最终结果或终止搜索。
+  bool approximate = false;
 };
 
 struct SyntheticConfig {
