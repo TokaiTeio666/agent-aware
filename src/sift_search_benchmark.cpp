@@ -79,14 +79,25 @@ struct Args {
   std::string io_mode = "io_uring";
   std::size_t io_batch = 16;
   std::size_t io_depth = 32;
-  std::string cache_policy = "graph-aware-2q";
+  // 默认不开页 cache：1M 实测（io_uring 冷读，2000 条查询）无 cache 21 ms / 0.87 MB
+  // 且 recall 0.986；开 lru 12000 页是 101 ms / 0.83 MB，读量只少 5% 而延迟涨 5 倍，
+  // 还占掉 13% 预算。cache 省下的那点物理读，用撒点数换回来更划算。
+  std::string cache_policy = "none";
   std::size_t cache_pages = 0;
   bool cache_pages_requested = false;
   double memory_budget_ratio = 0.20;
-  bool protect_hot_pages = true;
+  // 入度统计会顺序读全部 166,667 页（1M 上 672 MB，实测 +0.48 s 启动），
+  // 且把整个索引拉进页缓存。它只服务于 hub-aware 缓存策略的 page_hot_score，
+  // 而 cache_policy 默认已经是 none —— 那张表根本不会被读。默认关闭：
+  // 只有在显式开启 graph-aware-2q / agent 策略时才需要它。
+  bool protect_hot_pages = false;
   std::size_t hot_degree_threshold = 0;
   std::size_t num_search_threads = 1;
   bool memory_budget_enforce = true;
+  // 冷读实验的硬闸门：索引在计时区间内全程驻留页缓存时，延迟里没有磁盘
+  // 成分，任何 I/O 结论都不成立。默认关闭（热缓存实验是合法的），但冷读
+  // 对照必须打开它，否则"实验无效"只会变成 JSON 里的一个 true。
+  bool require_cold_cache = false;
   bool enable_prefetch = false;
   bool enable_prefetch_explicit = false;
   std::string prefetch_policy = "none";
@@ -126,6 +137,12 @@ struct SearchAggregate {
   double recall_sum = 0.0;
   std::size_t recall_queries = 0;
   agent_aware::DiskGraphSearchStats stats;
+  // 计时区间内块设备真实的读写量。与 stats.submitted_reads（pread/io_uring
+  // 调用次数）并列报告：两者差距越大，说明越多读被系统页缓存吸收。
+  agent_aware::PhysicalIoSnapshot physical_io;
+  // 计时开始前、结束后索引文件在页缓存中的驻留比例（-1 表示不可测）。
+  double cache_residency_before = -1.0;
+  double cache_residency_after = -1.0;
 };
 
 std::string require_value(int& index, int argc, char** argv,
@@ -218,10 +235,18 @@ void print_help() {
       << "  --pq-iterations N            PQ k-means iterations, default 8\n"
       << "  --rerank-topk N              Exact rerank pool after PQ, default 100\n"
       << "Cache/I/O:\n"
-      << "  --cache-policy NAME          none/lru/2q/graph-aware-2q/agent, default graph-aware-2q\n"
+      << "  --cache-policy NAME          none/lru/2q/graph-aware-2q/agent, default none\n"
       << "  --cache-pages N              Page cache capacity, default auto within memory budget\n"
       << "  --memory-budget-ratio R      Resident memory budget ratio, default 0.20\n"
-      << "  --memory-budget-enforce 0|1  Truncate --cache-pages to the budget, default 1\n"
+      << "  --memory-budget-enforce 0|1  Truncate --cache-pages to the budget and\n"
+      << "                               fail on a measured peak-RSS overrun, default 1\n"
+      << "  --require-cold-cache 0|1     Fail (exit 4) when the index stays resident\n"
+      << "                               in the page cache during the timed region;\n"
+      << "                               set 1 for every cold-read experiment, default 0\n"
+      << "  --protect-hot-pages 0|1      Compute node in-degrees at configure time,\n"
+      << "                               which reads the whole index into the page\n"
+      << "                               cache (672 MB / +0.5 s on 1M); only needed\n"
+      << "                               by hub-aware cache policies, default 0\n"
       << "  --io-mode NAME               pread, odirect, or io_uring, default io_uring\n"
       << "  --io-batch N                 I/O batch size, default 16\n"
       << "  --io-depth N                 I/O depth for io_uring, default 32\n"
@@ -403,6 +428,10 @@ Args parse_args(int argc, char** argv) {
           parse_bool_value(require_value(i, argc, argv, name), name);
     } else if (name == "--protect-hot-pages") {
       args.protect_hot_pages =
+          parse_bool_value(require_value(i, argc, argv, name), name);
+    } else if (name == "--require-cold-cache" ||
+               name == "--require_cold_cache") {
+      args.require_cold_cache =
           parse_bool_value(require_value(i, argc, argv, name), name);
     } else if (name == "--hot-degree-threshold") {
       args.hot_degree_threshold =
@@ -715,6 +744,36 @@ double percentile_latency_ms(std::vector<double> latencies,
   return latencies[rank - 1];
 }
 
+const char* demand_stage_name(std::size_t stage) {
+  switch (static_cast<agent_aware::DemandReadStage>(stage)) {
+    case agent_aware::DemandReadStage::kEntryAnchor:
+      return "entry_anchor";
+    case agent_aware::DemandReadStage::kCandidateExpand:
+      return "candidate_expand";
+    case agent_aware::DemandReadStage::kNeighborRank:
+      return "neighbor_rank";
+    case agent_aware::DemandReadStage::kRerank:
+      return "rerank";
+    default:
+      return "unknown";
+  }
+}
+
+void emit_stage_json(std::ostream& json,
+                     const agent_aware::DiskGraphSearchStats& stats) {
+  for (std::size_t stage = 0; stage < agent_aware::kDemandReadStageCount;
+       ++stage) {
+    const auto& value = stats.demand_by_stage[stage];
+    json << "      \"" << demand_stage_name(stage) << "\": {\"pages\": "
+         << value.pages_read << ", \"batches\": " << value.batches
+         << ", \"syscalls\": " << value.syscalls
+         << ", \"wait_calls\": " << value.wait_calls
+         << ", \"io_wait_us\": " << value.io_wait_us
+         << ", \"post_cpu_us\": " << value.post_cpu_us << "}"
+         << (stage + 1 == agent_aware::kDemandReadStageCount ? "\n" : ",\n");
+  }
+}
+
 void add_stats(SearchAggregate& aggregate,
                const agent_aware::DiskGraphSearchStats& stats) {
   aggregate.stats.node_reads += stats.node_reads;
@@ -743,6 +802,23 @@ void add_stats(SearchAggregate& aggregate,
   aggregate.stats.uring_submit_count += stats.uring_submit_count;
   aggregate.stats.uring_cqe_count += stats.uring_cqe_count;
   aggregate.stats.demand_read_wait_us += stats.demand_read_wait_us;
+  aggregate.stats.demand_io_wait_us += stats.demand_io_wait_us;
+  aggregate.stats.demand_post_cpu_us += stats.demand_post_cpu_us;
+  aggregate.stats.demand_read_batches += stats.demand_read_batches;
+  aggregate.stats.candidate_pushes += stats.candidate_pushes;
+  aggregate.stats.candidate_pops += stats.candidate_pops;
+  aggregate.stats.candidate_corrections += stats.candidate_corrections;
+  for (std::size_t stage = 0; stage < agent_aware::kDemandReadStageCount;
+       ++stage) {
+    auto& into = aggregate.stats.demand_by_stage[stage];
+    const auto& from = stats.demand_by_stage[stage];
+    into.pages_read += from.pages_read;
+    into.batches += from.batches;
+    into.syscalls += from.syscalls;
+    into.wait_calls += from.wait_calls;
+    into.io_wait_us += from.io_wait_us;
+    into.post_cpu_us += from.post_cpu_us;
+  }
   aggregate.stats.page_dedup_requests += stats.page_dedup_requests;
   aggregate.stats.page_dedup_hits += stats.page_dedup_hits;
   aggregate.stats.duplicate_pages_eliminated +=
@@ -751,13 +827,10 @@ void add_stats(SearchAggregate& aggregate,
   aggregate.stats.batch_expanded += stats.batch_expanded;
   aggregate.stats.max_batch_size =
       std::max(aggregate.stats.max_batch_size, stats.max_batch_size);
-  aggregate.stats.beam_unique_pages += stats.beam_unique_pages;
-  aggregate.stats.beam_cached_pages += stats.beam_cached_pages;
   aggregate.stats.same_page_node_reuse += stats.same_page_node_reuse;
   aggregate.stats.distance_direct_calls += stats.distance_direct_calls;
   aggregate.stats.adc_table_build_us += stats.adc_table_build_us;
   aggregate.stats.rerank_reads += stats.rerank_reads;
-  aggregate.stats.pq_filter_reject_count += stats.pq_filter_reject_count;
   aggregate.stats.pq_filter_accept_count += stats.pq_filter_accept_count;
   aggregate.stats.search_mutex_wait_us += stats.search_mutex_wait_us;
   aggregate.stats.unique_prefetch_pages += stats.unique_prefetch_pages;
@@ -781,7 +854,6 @@ void add_stats(SearchAggregate& aggregate,
       stats.prefetch_adaptive_final_top_k;
   aggregate.stats.prefetch_adaptive_final_lead =
       stats.prefetch_adaptive_final_lead;
-  aggregate.stats.prefetch_saved_wait_us += stats.prefetch_saved_wait_us;
   aggregate.stats.prefetch_planner_cpu_us += stats.prefetch_planner_cpu_us;
 }
 
@@ -972,7 +1044,11 @@ SearchAggregate run_search_worker(const Args& args,
                                       entry_seed_ids,
                                   std::size_t first_query,
                                   std::size_t query_stride,
-                                  std::size_t query_count) {
+                                  std::size_t query_count,
+                                  std::vector<std::vector<std::uint32_t>>*
+                                      detail_ids = nullptr,
+                                  std::vector<double>* detail_recall = nullptr,
+                                  std::size_t detail_capacity = 0) {
   SearchAggregate aggregate;
   for (std::size_t i = first_query; i < query_count;
        i += query_stride) {
@@ -982,15 +1058,31 @@ SearchAggregate run_search_worker(const Args& args,
     const auto query_start = Clock::now();
     const auto result = index.search_one(dataset.queries.row(i), search);
     const auto query_end = Clock::now();
+    if (std::getenv("AGENT_AWARE_TRACE_RSS") != nullptr && i % 10 == 0) {
+      std::fprintf(stderr, "query %zu rss=%.1fMB cache_pages=%zu\n", i,
+                   static_cast<double>(agent_aware::process_current_resident_bytes()) / 1e6,
+                   index.metadata().page_count);
+    }
     aggregate.query_latency_ms.push_back(
         std::chrono::duration<double, std::milli>(query_end - query_start)
             .count());
     ++aggregate.queries;
     add_stats(aggregate, result.stats);
     if (dataset.truth_from_file && i < dataset.truth.size()) {
-      aggregate.recall_sum += recall_at_k(result.topk, dataset.truth[i],
-                                          args.top_k);
+      const double query_recall =
+          recall_at_k(result.topk, dataset.truth[i], args.top_k);
+      aggregate.recall_sum += query_recall;
       ++aggregate.recall_queries;
+      // 单查询明细落盘，便于回答"哪类查询召不回"这类问题。多 worker 时各线程
+      // 写不同条目，汇总在 run_searches 里完成。
+      if (detail_ids != nullptr && detail_recall != nullptr &&
+          i < detail_capacity) {
+        (*detail_ids)[i].clear();
+        for (const auto& r : result.topk) {
+          (*detail_ids)[i].push_back(r.id);
+        }
+        (*detail_recall)[i] = query_recall;
+      }
     }
   }
   return aggregate;
@@ -1002,7 +1094,10 @@ SearchAggregate run_searches(const Args& args,
                              const agent_aware::PqAdcModel* pq_model,
                              const std::vector<std::uint32_t>&
                                  entry_seed_ids,
-                             std::size_t query_limit = 0) {
+                             std::size_t query_limit = 0,
+                             std::vector<std::vector<std::uint32_t>>*
+                                 detail_ids = nullptr,
+                             std::vector<double>* detail_recall = nullptr) {
   const std::size_t query_count =
       query_limit == 0
           ? dataset.queries.size()
@@ -1012,13 +1107,36 @@ SearchAggregate run_searches(const Args& args,
 
   SearchAggregate aggregate;
   aggregate.worker_count = worker_count;
+  // 页缓存在计时区间内必须保持稳定：如果中途被逐出或重新填充，读延迟的
+  // 变化会被误读成算法收益。这里记录前后的驻留比例，供事后判断实验有效性。
+  const std::string index_path_str = args.index_path.string();
+  aggregate.cache_residency_before =
+      agent_aware::page_cache_residency_ratio(index_path_str.c_str());
+  const auto physical_before = agent_aware::physical_io_snapshot_for_path(
+      index_path_str.c_str());
+  // 单查询明细最多记录前 256 条：足以定位召回失败的模式，又不会让 JSON 膨胀。
+  constexpr std::size_t kDetailCapacity = 256;
+  std::vector<std::vector<std::uint32_t>> local_ids;
+  std::vector<double> local_recall;
+  if (detail_ids == nullptr) {
+    detail_ids = &local_ids;
+    detail_recall = &local_recall;
+  }
+  detail_ids->clear();
+  detail_recall->clear();
+  if (dataset.truth_from_file) {
+    detail_ids->resize(std::min(query_count, kDetailCapacity));
+    detail_recall->assign(detail_ids->size(), -1.0);
+  }
+  const std::size_t detail_capacity = detail_ids->size();
   const auto start = Clock::now();
 
   if (worker_count == 1) {
     merge_aggregate(
         aggregate,
         run_search_worker(args, dataset, index, pq_model, entry_seed_ids, 0,
-                          worker_count, query_count));
+                          worker_count, query_count, detail_ids, detail_recall,
+                          detail_capacity));
   } else {
     // 每个 worker 打开自己的 PackedDiskGraphIndex，因为本 benchmark 中页 cache 和异步 I/O 状态按 index/thread 隔离。
     std::vector<SearchAggregate> partials(worker_count);
@@ -1033,7 +1151,8 @@ SearchAggregate run_searches(const Args& args,
           configure_index_from_args(args, worker_index);
           partials[worker] = run_search_worker(
               args, dataset, worker_index, pq_model, entry_seed_ids, worker,
-              worker_count, query_count);
+              worker_count, query_count, detail_ids, detail_recall,
+              detail_capacity);
         } catch (...) {
           errors[worker] = std::current_exception();
         }
@@ -1056,12 +1175,21 @@ SearchAggregate run_searches(const Args& args,
   const auto end = Clock::now();
   aggregate.elapsed_ms =
       std::chrono::duration<double, std::milli>(end - start).count();
+  const auto physical_after = agent_aware::physical_io_snapshot_for_path(
+      index_path_str.c_str());
+  aggregate.physical_io =
+      agent_aware::physical_io_delta(physical_before, physical_after);
+  aggregate.cache_residency_after =
+      agent_aware::page_cache_residency_ratio(index_path_str.c_str());
   return aggregate;
 }
 
 std::string json_for_run(const Args& args,
                          const agent_aware::LoadedQueryDataset& dataset,
                          const agent_aware::DiskGraphMetadata& index_metadata,
+                         const std::vector<std::vector<std::uint32_t>>&
+                             detail_ids,
+                         const std::vector<double>& detail_recall,
                          const agent_aware::DiskGraphIoStatus& io_status,
                          const SearchAggregate& aggregate,
                          const fs::path& binary_path,
@@ -1069,6 +1197,7 @@ std::string json_for_run(const Args& args,
                              pq_stats,
                          const MemoryBudgetReport& memory_budget,
                          std::uint64_t baseline_rss,
+                         double startup_cache_residency,
                          const std::vector<std::uint32_t>& entry_seed_ids,
                          const std::vector<std::string>& warnings) {
   const double elapsed_s = std::max(1e-9, aggregate.elapsed_ms / 1000.0);
@@ -1091,6 +1220,21 @@ std::string json_for_run(const Args& args,
           ? 0.0
           : static_cast<double>(aggregate.stats.batch_expanded) /
                 static_cast<double>(aggregate.stats.batch_count);
+  std::size_t stage_pages_total = 0;
+  for (std::size_t stage = 0; stage < agent_aware::kDemandReadStageCount;
+       ++stage) {
+    stage_pages_total += aggregate.stats.demand_by_stage[stage].pages_read;
+  }
+  const double pages_per_read_batch =
+      aggregate.stats.demand_read_batches == 0
+          ? 0.0
+          : static_cast<double>(stage_pages_total) /
+                static_cast<double>(aggregate.stats.demand_read_batches);
+  const double candidate_pushes_per_pop =
+      aggregate.stats.candidate_pops == 0
+          ? 0.0
+          : static_cast<double>(aggregate.stats.candidate_pushes) /
+                static_cast<double>(aggregate.stats.candidate_pops);
   const double query_count_for_rates =
       static_cast<double>(std::max<std::size_t>(1, aggregate.queries));
   const double reads_per_query =
@@ -1102,7 +1246,20 @@ std::string json_for_run(const Args& args,
   const double duplicate_skipped_per_query =
       static_cast<double>(aggregate.stats.duplicate_skipped) /
       query_count_for_rates;
+  // 命中率的分子与分母必须是同一口径的"一次页需求"。
+  // page_requests 含重复请求（同一页在一次批处理里被多次请求），而
+  // cache_hits / pinned_hits 只在去重后的路径累加；用含重复的分母会得出
+  // 偏低的命中率（实测 0.661，而真实"未走 I/O 即满足"的比例是 0.819）。
+  // 这里统一用 page_requests 作分母，分子同时包含会话内已物化（pinned）
+  // 与跨查询页缓存命中（cache）两种"没走 I/O"的情形。
   const double cache_hit_rate =
+      aggregate.stats.page_requests == 0
+          ? 0.0
+          : static_cast<double>(aggregate.stats.cache_hits +
+                                aggregate.stats.pinned_hits) /
+                static_cast<double>(aggregate.stats.page_requests);
+  // 单独保留"跨查询页缓存命中"的比例，避免把两种来源混成一个数。
+  const double cross_query_cache_hit_rate =
       aggregate.stats.page_requests == 0
           ? 0.0
           : static_cast<double>(aggregate.stats.cache_hits) /
@@ -1138,6 +1295,10 @@ std::string json_for_run(const Args& args,
   json << std::boolalpha;
   json << "{\n";
   json << "  \"status\": \"completed\",\n";
+  // stats 段的结构版本：2 起删除了恒 0 的 beam_unique_pages/beam_cached_pages，
+  // 新增按阶段的 demand 读归因与 demand_io_wait/post_cpu 拆分。
+  // 与旧 JSON 逐字段对比的脚本必须按版本分支。
+  json << "  \"stats_schema_version\": 2,\n";
   json << "  \"dataset_mode\": \"" << json_escape(dataset.mode) << "\",\n";
   json << "  \"base_count\": " << index_metadata.vector_count << ",\n";
   json << "  \"query_count\": " << dataset.queries.size() << ",\n";
@@ -1257,8 +1418,14 @@ std::string json_for_run(const Args& args,
        << (measured_peak != 0 && measured_peak <= memory_budget.budget_bytes)
        << ",\n";
   json << "  \"top_k\": " << args.top_k << ",\n";
+  // 入口语义：manifest 里的 entry_id 是"图构建时选出的可达性最好节点"
+  // （见 disk_graph_builder.cpp 的 select_entry_node），不是几何 medoid。
+  // 搜索时还会在此基础上均匀撒 spread_start_count 个起点，撒点数量必须
+  // 如实报告，否则读者会以为只有一个入口。
   json << "  \"entry_count\": 1,\n";
-  json << "  \"entry_strategy\": \"single-medoid\",\n";
+  json << "  \"entry_strategy\": \"reachability-maximizing\",\n";
+  json << "  \"spread_start_count\": "
+       << agent_aware::DiskGraphSearchConfig{}.spread_start_count << ",\n";
   json << "  \"entry_seed_count\": " << entry_seed_ids.size() << ",\n";
   json << "  \"entry_seed_ids\": [";
   for (std::size_t i = 0; i < entry_seed_ids.size(); ++i) {
@@ -1338,10 +1505,62 @@ std::string json_for_run(const Args& args,
               query_count_for_rates
        << ",\n";
   json << "  \"reads_per_query\": " << reads_per_query << ",\n";
+  // 物理 I/O：submitted_reads 只是调用次数；这一组才是块设备真实搬运的字节。
+  // physical_io_available=false 表示平台不支持（如 Windows），此时任何
+  // "I/O 优化" 结论都不成立，必须显式标注而不是留空。
+  json << "  \"physical_io_available\": "
+       << aggregate.physical_io.valid << ",\n";
+  json << "  \"physical_io_device\": \""
+       << json_escape(aggregate.physical_io.device) << "\",\n";
+  json << "  \"physical_read_bytes\": "
+       << aggregate.physical_io.read_sectors * 512ULL << ",\n";
+  json << "  \"physical_write_bytes\": "
+       << aggregate.physical_io.write_sectors * 512ULL << ",\n";
+  json << "  \"physical_read_ops\": " << aggregate.physical_io.read_ops
+       << ",\n";
+  json << "  \"physical_write_ops\": " << aggregate.physical_io.write_ops
+       << ",\n";
+  json << "  \"physical_read_bytes_per_query\": "
+       << static_cast<double>(aggregate.physical_io.read_sectors * 512ULL) /
+              query_count_for_rates
+       << ",\n";
+  // 逻辑读字节 / 物理读字节。接近 1 表示每次页读都真的落到了设备；
+  // 远小于 1 表示大部分读被系统页缓存吸收——此时的延迟不能当作磁盘延迟。
+  json << "  \"logical_to_physical_read_ratio\": ";
+  {
+    const std::uint64_t physical_bytes =
+        aggregate.physical_io.read_sectors * 512ULL;
+    const double logical_bytes =
+        static_cast<double>(aggregate.stats.completed_reads) *
+        static_cast<double>(index_metadata.page_size);
+    if (!aggregate.physical_io.valid || physical_bytes == 0) {
+      json << "null";
+    } else {
+      json << logical_bytes / static_cast<double>(physical_bytes);
+    }
+  }
+  json << ",\n";
+  // 三个采样点共同界定一次实验的缓存状态：
+  //   startup    索引对象构造之前（drop_caches 之后应立即接近 0）
+  //   before/after  计时区间前后（应保持稳定，否则延迟变化来自缓存而非算法）
+  json << "  \"index_cache_residency_startup\": " << startup_cache_residency
+       << ",\n";
+  json << "  \"index_cache_residency_before\": "
+       << aggregate.cache_residency_before << ",\n";
+  json << "  \"index_cache_residency_after\": "
+       << aggregate.cache_residency_after << ",\n";
+  // 计时区间内索引是否全程驻留页缓存。true 时延迟里没有磁盘成分，
+  // 不能用于论证磁盘 I/O 优化。
+  json << "  \"index_fully_cached_during_run\": "
+       << (aggregate.cache_residency_before > 0.9 &&
+           aggregate.cache_residency_after > 0.9)
+       << ",\n";
   json << "  \"demand_reads_per_query\": " << demand_reads_per_query << ",\n";
   json << "  \"duplicate_skipped_per_query\": "
        << duplicate_skipped_per_query << ",\n";
   json << "  \"cache_hit_rate\": " << cache_hit_rate << ",\n";
+  json << "  \"cross_query_cache_hit_rate\": " << cross_query_cache_hit_rate
+       << ",\n";
   json << "  \"query_latency_ms\": [";
   for (std::size_t i = 0; i < aggregate.query_latency_ms.size(); ++i) {
     if (i != 0) {
@@ -1352,6 +1571,17 @@ std::string json_for_run(const Args& args,
   json << "],\n";
   json << "  \"recall_at_k\": " << recall << ",\n";
   json << "  \"recall_queries\": " << aggregate.recall_queries << ",\n";
+  json << "  \"query_details\": [";
+  for (std::size_t i = 0; i < detail_ids.size(); ++i) {
+    json << (i == 0 ? "\n" : ",\n");
+    json << "    {\"query\": " << args.query_offset + i << ", \"recall\": "
+         << detail_recall[i] << ", \"topk\": [";
+    for (std::size_t j = 0; j < detail_ids[i].size(); ++j) {
+      json << (j == 0 ? "" : ", ") << detail_ids[i][j];
+    }
+    json << "]}";
+  }
+  json << (detail_ids.empty() ? "],\n" : "\n  ],\n");
   json << "  \"stats\": {\n";
   json << "    \"expanded\": " << aggregate.stats.expanded << ",\n";
   json << "    \"visited\": " << aggregate.stats.visited << ",\n";
@@ -1390,6 +1620,26 @@ std::string json_for_run(const Args& args,
        << aggregate.stats.search_mutex_wait_us << ",\n";
   json << "    \"demand_read_wait_us\": "
        << aggregate.stats.demand_read_wait_us << ",\n";
+  json << "    \"demand_io_wait_us\": " << aggregate.stats.demand_io_wait_us
+       << ",\n";
+  json << "    \"demand_post_cpu_us\": " << aggregate.stats.demand_post_cpu_us
+       << ",\n";
+  json << "    \"demand_read_batches\": "
+       << aggregate.stats.demand_read_batches << ",\n";
+  // 一次 demand 批量读平均带回多少页。io_uring 下它 >1 才说明批量提交真的
+  // 生效；等于 1 就是"每页一次往返"。
+  json << "    \"pages_per_read_batch\": "
+       << pages_per_read_batch << ",\n";
+  json << "    \"demand_read_by_stage\": {\n";
+  emit_stage_json(json, aggregate.stats);
+  json << "    },\n";
+  json << "    \"candidate_pushes\": " << aggregate.stats.candidate_pushes
+       << ",\n";
+  json << "    \"candidate_pops\": " << aggregate.stats.candidate_pops << ",\n";
+  json << "    \"candidate_pushes_per_pop\": " << candidate_pushes_per_pop
+       << ",\n";
+  json << "    \"candidate_corrections\": "
+       << aggregate.stats.candidate_corrections << ",\n";
   json << "    \"io_submits\": " << aggregate.stats.io_submits << ",\n";
   json << "    \"io_completions\": " << aggregate.stats.io_completions
        << ",\n";
@@ -1403,10 +1653,12 @@ std::string json_for_run(const Args& args,
   json << "    \"avg_batch_size\": " << avg_batch_size << ",\n";
   json << "    \"max_batch_size\": " << aggregate.stats.max_batch_size
        << ",\n";
-  json << "    \"beam_unique_pages\": "
-       << aggregate.stats.beam_unique_pages << ",\n";
-  json << "    \"beam_cached_pages\": "
-       << aggregate.stats.beam_cached_pages << ",\n";
+  json << "    \"page_cache_evictions\": "
+       << aggregate.stats.page_cache_evictions << ",\n";
+  json << "    \"page_cache_promotions\": "
+       << aggregate.stats.page_cache_promotions << ",\n";
+  json << "    \"prefetch_submit_failures\": "
+       << aggregate.stats.prefetch_submit_failures << ",\n";
   json << "    \"page_dedup_requests\": "
        << aggregate.stats.page_dedup_requests << ",\n";
   json << "    \"page_dedup_hits\": " << aggregate.stats.page_dedup_hits
@@ -1420,8 +1672,6 @@ std::string json_for_run(const Args& args,
   json << "    \"rerank_reads\": " << aggregate.stats.rerank_reads << ",\n";
   json << "    \"pq_filter_accept_count\": "
        << aggregate.stats.pq_filter_accept_count << ",\n";
-  json << "    \"pq_filter_reject_count\": "
-       << aggregate.stats.pq_filter_reject_count << ",\n";
   json << "    \"distance_direct_calls\": "
        << aggregate.stats.distance_direct_calls << ",\n";
   json << "    \"unique_prefetch_pages\": "
@@ -1458,8 +1708,6 @@ std::string json_for_run(const Args& args,
        << aggregate.stats.prefetch_adaptive_final_top_k << ",\n";
   json << "    \"prefetch_adaptive_final_lead\": "
        << aggregate.stats.prefetch_adaptive_final_lead << ",\n";
-  json << "    \"prefetch_saved_wait_us\": "
-       << aggregate.stats.prefetch_saved_wait_us << ",\n";
   json << "    \"prefetch_planner_cpu_us\": "
        << aggregate.stats.prefetch_planner_cpu_us << ",\n";
   json << "    \"prefetch_planner_cpu_ratio\": "
@@ -1528,6 +1776,10 @@ int main(int argc, char** argv) {
       throw std::runtime_error("Packed graph index does not exist; run agent-aware-build first: " +
                                args.index_path.string());
     }
+    // 索引对象构造会把 metadata、PQ 码本与目录读进来。必须在构造之前采样，
+    // 否则测到的是"加载完成后"的 100%，看不到 drop_caches 的实际效果。
+    const double startup_cache_residency =
+        agent_aware::page_cache_residency_ratio(args.index_path.string().c_str());
     agent_aware::PackedDiskGraphIndex index(args.index_path.string());
     if (args.manifest_path.empty()) {
       args.manifest_path = fs::path(args.index_path.string() + ".manifest.json");
@@ -1579,14 +1831,72 @@ int main(int argc, char** argv) {
       (void)run_searches(args, dataset, index, pq_model_ptr,
                          entry_seed_ids, args.warmup_query_limit);
     }
-    const auto aggregate =
-        run_searches(args, dataset, index, pq_model_ptr, entry_seed_ids);
+    std::vector<std::vector<std::uint32_t>> detail_ids;
+    std::vector<double> detail_recall;
+    const auto aggregate = run_searches(args, dataset, index, pq_model_ptr,
+                                        entry_seed_ids, 0, &detail_ids,
+                                        &detail_recall);
     const std::string json =
-        json_for_run(args, dataset, index.metadata(), io_status, aggregate, binary_path,
+        json_for_run(args, dataset, index.metadata(), detail_ids, detail_recall,
+                     io_status, aggregate, binary_path,
                      pq_stats,
-                     memory_budget, baseline_rss, entry_seed_ids, warnings);
+                     memory_budget, baseline_rss, startup_cache_residency,
+                     entry_seed_ids, warnings);
     write_json_output(args.output_json, json);
     std::cout << json;
+
+    // 内存约束是赛题硬指标。估算值只能说明"配置上没超"，真实进程峰值 RSS
+    // 才算数；一旦超出就必须以非零码退出，让脚本和 CI 直接失败，而不是
+    // 留一行警告让结论继续流通。
+    if (args.memory_budget_enforce) {
+      const std::uint64_t peak = agent_aware::process_peak_resident_bytes();
+      // 进程尚未分配任何索引相关工作集之前的 RSS，是"任何配置都省不掉"的
+      // 固定开销。预算低于它时，再省也过不了 —— 这属于预算设定错误
+      // （数据集太小 / 比例太小），不是被实现的某一个选择超出来的。
+      const std::uint64_t floor_rss =
+          std::max(baseline_rss, agent_aware::process_current_resident_bytes());
+      if (peak != 0 && memory_budget.budget_bytes != 0 &&
+          memory_budget.budget_bytes < floor_rss) {
+        std::cerr << "error: dataset memory budget "
+                  << memory_budget.budget_bytes << " B (ratio "
+                  << args.memory_budget_ratio
+                  << ") is below the process's own fixed footprint " << floor_rss
+                  << " B; no cache configuration can satisfy it — use a larger "
+                     "dataset or a higher --memory-budget-ratio\n";
+        return 3;
+      }
+      if (peak != 0 && memory_budget.budget_bytes != 0 &&
+          peak > memory_budget.budget_bytes) {
+        std::cerr << "error: measured peak RSS " << peak
+                  << " B exceeds the dataset memory budget "
+                  << memory_budget.budget_bytes << " B (ratio "
+                  << args.memory_budget_ratio << "); pass "
+                     "--memory-budget-enforce 0 to record a deliberately "
+                     "over-budget run\n";
+        return 2;
+      }
+    }
+    // 冷读实验的硬闸门。索引在计时区间内全程驻留页缓存时，延迟里没有磁盘
+    // 成分，任何 I/O 结论都不成立。这个判据以前只写进 JSON 的
+    // index_fully_cached_during_run，没有任何调用方据此停下——结果就是
+    // "实验无效"变成了报告里一个没人看的 true。现在让它直接失败。
+    if (args.require_cold_cache) {
+      constexpr double kResidentThreshold = 0.9;
+      const double before = aggregate.cache_residency_before;
+      const double after = aggregate.cache_residency_after;
+      if (before > kResidentThreshold || after > kResidentThreshold) {
+        std::cerr
+            << "error: --require-cold-cache 1 but the index was resident in "
+               "the page cache during the timed region (before="
+            << before << ", after=" << after
+            << ", threshold=" << kResidentThreshold
+            << "); the latency contains no disk component and cannot support "
+               "an I/O conclusion — pass --protect-hot-pages 0 (the in-degree "
+               "pass reads the whole index at configure time) and evict the "
+               "page cache before the run\n";
+        return 4;
+      }
+    }
     return 0;
   } catch (const std::exception& error) {
     std::cerr << "error: " << error.what() << "\n";

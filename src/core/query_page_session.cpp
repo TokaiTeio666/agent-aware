@@ -73,7 +73,12 @@ const QueryPageSession::Page& QueryPageSession::get_or_load_page(
   ++stats_.node_reads;
   ++stats_.page_requests_after_dedup;
   demand_pages_.insert(page_id);
-  Page page = read_demand_page(page_id);
+  // 走单页路径的只剩两种调用方：锚点探测，以及扩展时对尚未在手邻居的按需
+  // 读取。两者由邻居预批（expand_candidate_batch）区分。
+  const DemandReadStage stage = reading_neighbor_pages_
+                                     ? DemandReadStage::kNeighborRank
+                                     : DemandReadStage::kEntryAnchor;
+  Page page = read_demand_page(page_id, stage);
 
   if (index_.cache_enabled()) {
     const Page& cached_page = index_.store_cached_page(std::move(page), stats_);
@@ -129,17 +134,24 @@ std::vector<std::uint32_t> QueryPageSession::collect_missing_pages(
 }
 
 void QueryPageSession::ensure_pages_loaded_batch(
-    const std::vector<std::uint32_t>& page_ids) {
+    const std::vector<std::uint32_t>& page_ids, DemandReadStage stage) {
   if (page_ids.empty()) {
     return;
   }
   if (finished_) {
+    // rerank 在 finish_query 之后执行，这一支同样要算进 rerank 阶段的读。
+    const std::size_t reads_before = stats_.node_reads;
     for (const auto page_id : page_ids) {
       (void)get_or_load_page(page_id);
+    }
+    if (stage == DemandReadStage::kRerank) {
+      stats_.rerank_reads += stats_.node_reads - reads_before;
     }
     return;
   }
 
+  DemandReadStageStats& stage_stats =
+      stats_.demand_by_stage[static_cast<std::size_t>(stage)];
   drain_ready_prefetches();
 
   stats_.page_requests += page_ids.size();
@@ -192,6 +204,9 @@ void QueryPageSession::ensure_pages_loaded_batch(
       const double wait_us = std::chrono::duration<double, std::micro>(
           std::chrono::steady_clock::now() - wait_start).count();
       stats_.demand_read_wait_us += wait_us;
+      stage_stats.pages_read += 1;
+      stage_stats.wait_calls += 1;
+      stage_stats.io_wait_us += wait_us;
       index_.prefetch_controller_.record_feedback(
           "post_expand", prefetch_adaptive_, "pending_hit", wait_us, stats_);
     } else {
@@ -230,18 +245,33 @@ void QueryPageSession::ensure_pages_loaded_batch(
     }
 
     const auto wait_start = std::chrono::steady_clock::now();
+    const std::size_t syscalls_before = stats_.io_submit_syscalls;
+    const auto submit_start = std::chrono::steady_clock::now();
     const auto submitted = index_.page_reader_->batch_submit(requests, stats_);
+    ++stats_.demand_read_batches;
+    stats_.demand_io_wait_us +=
+        std::chrono::duration<double, std::micro>(
+            std::chrono::steady_clock::now() - submit_start)
+            .count();
     std::unordered_map<std::uint64_t, std::uint32_t> submitted_pages;
     submitted_pages.reserve(submitted.size());
     for (const auto& read : submitted) {
       submitted_pages.emplace(read.token, read.page_id);
     }
+    // 回收循环里等盘的部分算 io_wait，解码/物化算 post_cpu。
+    ++stage_stats.wait_calls;
+    double io_wait_us = 0.0;
+    double post_cpu_us = 0.0;
 
     while (!submitted_pages.empty()) {
       AsyncPageReader::CompletedRead completed;
+      const auto reap_start = std::chrono::steady_clock::now();
       if (!index_.page_reader_->reap_async_read(true, completed, stats_)) {
         throw std::runtime_error("Failed to wait for packed graph page batch");
       }
+      io_wait_us += std::chrono::duration<double, std::micro>(
+                        std::chrono::steady_clock::now() - reap_start)
+                        .count();
       const auto token = submitted_pages.find(completed.token);
       if (token == submitted_pages.end()) {
         const auto prefetch = prefetch_tokens_.find(completed.token);
@@ -258,6 +288,7 @@ void QueryPageSession::ensure_pages_loaded_batch(
       }
       const std::uint32_t page_id = token->second;
       submitted_pages.erase(token);
+      const auto decode_start = std::chrono::steady_clock::now();
       Page decoded = index_.decode_page(page_id, std::move(completed.data));
       if (index_.cache_enabled()) {
         const Page& cached_page =
@@ -268,11 +299,22 @@ void QueryPageSession::ensure_pages_loaded_batch(
             owned_pages_.insert_or_assign(page_id, std::move(decoded));
         materialize_page(inserted.first->second);
       }
+      post_cpu_us += std::chrono::duration<double, std::micro>(
+                         std::chrono::steady_clock::now() - decode_start)
+                         .count();
     }
     stats_.demand_read_wait_us +=
         std::chrono::duration<double, std::micro>(
             std::chrono::steady_clock::now() - wait_start)
             .count();
+    stats_.demand_io_wait_us += io_wait_us;
+    stats_.demand_post_cpu_us += post_cpu_us;
+
+    stage_stats.pages_read += requests.size();
+    stage_stats.batches += 1;
+    stage_stats.syscalls += stats_.io_submit_syscalls - syscalls_before;
+    stage_stats.io_wait_us += io_wait_us;
+    stage_stats.post_cpu_us += post_cpu_us;
   }
 }
 
@@ -444,6 +486,17 @@ void QueryPageSession::finish_query() {
     }
   }
   unpin_all();
+  // 一个会话只服务一条查询，但它们都在同一个 benchmark 进程里顺序创建。
+  // 这些容器如果不释放，内存会随查询条数一路涨：实测 1M 上 50 条查询峰值
+  // RSS 91 MB（占数据集 17.8%），100 条就到 120 MB（23.5%），越过 20% 预算。
+  // 释放之后峰值稳定在 7.6%。注意这里只放掉"本查询的解码结果"，索引级的
+  // 页缓存不归会话管。
+  std::unordered_set<std::uint32_t>().swap(visited_pages_);
+  std::unordered_set<std::uint32_t>().swap(accessed_nodes_);
+  std::unordered_set<std::uint32_t>().swap(demand_pages_);
+  std::unordered_map<std::uint32_t, Page>().swap(owned_pages_);
+  std::unordered_set<std::uint32_t>().swap(materialized_pages_);
+  std::unordered_map<std::uint32_t, Node>().swap(local_nodes_);
   finished_ = true;
 }
 
@@ -525,16 +578,22 @@ void QueryPageSession::materialize_page(const Page& page) {
 }
 
 QueryPageSession::Page QueryPageSession::read_demand_page(
-    std::uint32_t page_id) {
+    std::uint32_t page_id, DemandReadStage stage) {
+  DemandReadStageStats& stage_stats =
+      stats_.demand_by_stage[static_cast<std::size_t>(stage)];
+  stage_stats.pages_read += 1;
+  stage_stats.batches += 1;
   const auto wait_start = std::chrono::steady_clock::now();
   if (!index_.page_reader_->async_enabled()) {
     Page page = index_.read_page(page_id, stats_);
-    stats_.demand_read_wait_us +=
-        std::chrono::duration<double, std::micro>(
-            std::chrono::steady_clock::now() - wait_start)
-            .count();
+    const double wait_us = std::chrono::duration<double, std::micro>(
+                               std::chrono::steady_clock::now() - wait_start)
+                               .count();
+    stats_.demand_read_wait_us += wait_us;
+    stage_stats.io_wait_us += wait_us;
     return page;
   }
+  const std::size_t syscalls_before = stats_.io_submit_syscalls;
   const auto submitted = index_.page_reader_->batch_submit(
       {AsyncPageReader::ReadRequest{page_id, page_offset(page_id),
                                     index_.metadata_.page_size}},
@@ -542,6 +601,8 @@ QueryPageSession::Page QueryPageSession::read_demand_page(
   if (submitted.size() != 1) {
     throw std::runtime_error("Failed to submit packed graph demand page");
   }
+  stage_stats.syscalls += stats_.io_submit_syscalls - syscalls_before;
+  ++stage_stats.wait_calls;
   AsyncPageReader::CompletedRead completed;
   while (true) {
     if (!index_.page_reader_->reap_async_read(true, completed, stats_)) {
@@ -559,11 +620,17 @@ QueryPageSession::Page QueryPageSession::read_demand_page(
         prefetch_page,
         index_.decode_page(prefetch_page, std::move(completed.data)));
   }
-  stats_.demand_read_wait_us +=
-      std::chrono::duration<double, std::micro>(
-          std::chrono::steady_clock::now() - wait_start)
-          .count();
-  return index_.decode_page(page_id, std::move(completed.data));
+  const double wait_us = std::chrono::duration<double, std::micro>(
+                             std::chrono::steady_clock::now() - wait_start)
+                             .count();
+  stats_.demand_read_wait_us += wait_us;
+  stage_stats.io_wait_us += wait_us;
+  const auto decode_start = std::chrono::steady_clock::now();
+  Page page = index_.decode_page(page_id, std::move(completed.data));
+  stage_stats.post_cpu_us += std::chrono::duration<double, std::micro>(
+                                 std::chrono::steady_clock::now() - decode_start)
+                                 .count();
+  return page;
 }
 
 bool QueryPageSession::consume_prefetch_completion(bool wait) {

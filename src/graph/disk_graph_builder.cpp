@@ -4,6 +4,7 @@
 #include <deque>
 #include <fstream>
 #include <limits>
+#include <numeric>
 #include <sstream>
 #include <stdexcept>
 #include <vector>
@@ -25,8 +26,154 @@ VamanaGraph build_vamana_graph(
   options.alpha = 1.2;
   options.seed = config.random_seed;
   options.add_reverse_edges = true;
+  // 远点锚点（beacon）与撒点起点都关掉。它们当初是为了治"图断裂"加的，
+  // 但实测 1M 的断裂并不来自连通性（从节点 0 可达 99.71%），而它们注入的
+  // 均匀切片点（0, 31250, 62500, …）会被 robust_prune 当作有效近邻保留下来，
+  // 把真实近邻挤出每个节点的出边名额（实测有个节点 0/32 条出边是近邻）。
+  options.beacon_count = 0;
+  options.start_count = 0;
   options.deleted_ids = config.deleted_ids;
   return VamanaBuilder(options).build(base);
+}
+
+// 入口点选中心性最高的节点，而不是几何 medoid。Vamana 的贪心搜索只能沿
+// 出边前进，入口若是某个局部区域的点，搜索一开始就被锁在那里。medoid 在
+// 大规模上尤其糟糕：它到全库都"不近不远"，出边改局部化以后就退化成普通
+// 小簇的成员（实测 12 万点上从 medoid 出发只能到达 0.1%，从 PageRank 前
+// 几名的点出发能到达 97%）。
+//
+// 这里用无向化、固定迭代次数的 PageRank（1M×32×20 轮在构建时间面前可忽略）。
+std::uint32_t select_entry_node(
+    const std::vector<std::vector<std::uint32_t>>& graph) {
+  const std::size_t count = graph.size();
+  if (count == 0) {
+    return 0;
+  }
+  constexpr int kIterations = 20;
+  constexpr double kDamping = 0.85;
+  const double teleport = (1.0 - kDamping) / static_cast<double>(count);
+  std::vector<double> rank(count, 1.0 / static_cast<double>(count));
+  std::vector<double> next(count, 0.0);
+  for (int iteration = 0; iteration < kIterations; ++iteration) {
+    std::fill(next.begin(), next.end(), teleport);
+    for (std::size_t from = 0; from < count; ++from) {
+      const auto& neighbors = graph[from];
+      if (neighbors.empty()) {
+        continue;
+      }
+      const double share =
+          kDamping * rank[from] / static_cast<double>(neighbors.size());
+      for (const auto to : neighbors) {
+        if (to < count) {
+          next[to] += share;
+        }
+      }
+    }
+    rank.swap(next);
+  }
+  // PageRank 不直接决定入口：在成规模的图上，一个抱团的小簇（成员彼此互指、
+  // 出边全在簇内）也能拿到很高的评分，而它的成员只能到达本簇一百来个点。
+  // 构建图里这类孤岛实测有上千个。因此先标记最大连通分量，再只在其中挑
+  // PageRank 最高的节点 —— 入口必须在主分量的骨架里，而不是在任何孤岛上。
+  std::vector<char> in_main_component(count, 0);
+  {
+    std::vector<std::size_t> component(count, 0);
+    std::vector<std::size_t> component_sizes;
+    std::vector<std::uint32_t> stack;
+    for (std::size_t seed = 0; seed < count; ++seed) {
+      if (component[seed] != 0) {
+        continue;
+      }
+      const std::size_t label = component_sizes.size() + 1;
+      component_sizes.push_back(0);
+      stack.push_back(static_cast<std::uint32_t>(seed));
+      component[seed] = label;
+      while (!stack.empty()) {
+        const auto current = stack.back();
+        stack.pop_back();
+        ++component_sizes.back();
+        for (const auto neighbor : graph[current]) {
+          if (neighbor < count && component[neighbor] == 0) {
+            component[neighbor] = label;
+            stack.push_back(neighbor);
+          }
+        }
+      }
+    }
+    const std::size_t main_label =
+        static_cast<std::size_t>(
+            std::max_element(component_sizes.begin(), component_sizes.end()) -
+            component_sizes.begin()) +
+        1;
+    for (std::size_t i = 0; i < count; ++i) {
+      in_main_component[i] = component[i] == main_label ? 1 : 0;
+    }
+  }
+
+  // 在主分量里按 PageRank 取前 k 名作为候选，逐个实测"从它出发能到达多少
+  // 节点"（有向可达，才是贪心搜索真正的活动范围），取覆盖最大的那个。
+  // PageRank 本身与有向可达规模并不一致：实测主分量内评分最高的点只能到达
+  // 122 个节点，而分布中位数以上位置的点能到达 116,442 个。
+  std::size_t candidate_count = 0;
+  for (std::size_t i = 0; i < count; ++i) {
+    candidate_count += in_main_component[i] ? 1 : 0;
+  }
+  std::vector<std::uint32_t> candidates(count);
+  std::iota(candidates.begin(), candidates.end(), 0u);
+  const std::size_t probe_count =
+      std::min<std::size_t>({std::size_t{32}, candidate_count, count});
+  if (probe_count == 0) {
+    return 0;
+  }
+  std::partial_sort(
+      candidates.begin(), candidates.begin() + probe_count, candidates.end(),
+      [&](std::uint32_t lhs, std::uint32_t rhs) {
+        if (in_main_component[lhs] != in_main_component[rhs]) {
+          return in_main_component[lhs] != 0;
+        }
+        return rank[lhs] == rank[rhs] ? lhs < rhs : rank[lhs] > rank[rhs];
+      });
+  // PageRank 前 k 名可能全部落在同一个局部稠密簇里（实测 12 万点上前 32 名
+  // 都只能到达 122 个节点，而主分量有 11.9 万个节点）。补一批均匀采样的候选，
+  // 给"实测可达规模"一个不受 PageRank 影响的兜底。
+  constexpr std::size_t kUniformProbes = 64;
+  candidates.resize(probe_count);
+  const std::size_t stride = std::max<std::size_t>(1, count / kUniformProbes);
+  for (std::size_t i = 0; i < count && candidates.size() < probe_count + kUniformProbes;
+       i += stride) {
+    if (in_main_component[i] != 0) {
+      candidates.push_back(static_cast<std::uint32_t>(i));
+    }
+  }
+
+  std::uint32_t best = 0;
+  std::size_t best_reachable = 0;
+  std::vector<char> seen(count, 0);
+  std::vector<std::uint32_t> queue;
+  for (const auto start : candidates) {
+    if (!in_main_component[start]) {
+      continue;
+    }
+    std::fill(seen.begin(), seen.end(), 0);
+    queue.clear();
+    seen[start] = 1;
+    queue.push_back(start);
+    std::size_t reachable = 0;
+    for (std::size_t head = 0; head < queue.size(); ++head) {
+      ++reachable;
+      for (const auto neighbor : graph[queue[head]]) {
+        if (neighbor < count && !seen[neighbor]) {
+          seen[neighbor] = 1;
+          queue.push_back(neighbor);
+        }
+      }
+    }
+    if (reachable > best_reachable) {
+      best_reachable = reachable;
+      best = start;
+    }
+  }
+  return best;
 }
 
 std::vector<std::uint32_t> bfs_order(
@@ -201,7 +348,7 @@ DiskGraphBuildResult PackedDiskGraphBuilder::build(
   if (!output) {
     throw std::runtime_error("Failed while finalizing packed graph index");
   }
-  return DiskGraphBuildResult{built_graph.medoid};
+  return DiskGraphBuildResult{select_entry_node(graph)};
 }
 
 }  // namespace agent_aware

@@ -37,7 +37,7 @@ Recall 随宽度单调上升、延迟随宽度线性增加，`156` 是"Recall �
 原始 JSON 在 [`results/2026-10-25-windows-msvc-v2/`](results/2026-10-25-windows-msvc-v2/)。
 
 > SIFT1M 的旧口径（`156` Recall@10 0.9748、avg 48.10 ms、io_uring）已移入
-> [`docs/archive/2026-10-legacy/`](docs/archive/2026-10-legacy/README.md)：产出它的代码与工作树已不可追溯，
+> [`docs/legacy/archive/2026-10-legacy/`](docs/legacy/archive/2026-10-legacy/README.md)：产出它的代码与工作树已不可追溯，
 > 不能在评审材料中继续引用。
 
 ## 技术架构
@@ -96,6 +96,7 @@ agent-aware/
 ├── CMakeLists.txt                         # 顶层构建入口，生成库和 benchmark 可执行文件
 ├── README.md                              # 项目入口、构建运行、实验结果和参数说明
 ├── PROJECT_PLAN.md                        # 总体计划、技术路线和验收标准
+├── 赛题.md                                # 赛题原文（与 docs/legacy/problem.md 相同）
 ├── include/                               # 对外头文件根目录
 │   ├── agent_aware.h                      # 聚合入口头
 │   ├── core/                              # 基础类型、距离计算、PQ、预取和异步 page reader
@@ -121,10 +122,15 @@ agent-aware/
 ├── scripts/
 │   ├── agent_aware.py                      # once/ab benchmark 统一入口
 └── docs/
-    ├── design/                            # SSD 存储、缓存、异步预取、动态写入设计
-    ├── experiments/                       # SIFT1M、混合读写、参数调优实验报告
-    ├── problem/                           # 赛题背景与问题定义
-    └── roadmap in future/                 # 后续优化计划与答辩补强路线
+    ├── README.md                          # 文档索引：按"重构前 / 重构后"两代分类
+    ├── experiments/                       # 重构后：可复现实验报告（原始 JSON 在 results/）
+    ├── problem/                           # 重构后：问题审计、修复状态、Phase 0/1 测量与复盘
+    └── legacy/                            # 重构前（2026-10 之前）：只读归档，不代表当前代码
+        ├── design/                        # 01-06 模块设计稿
+        ├── roadmap/                       # 原 roadmap in future/ 下的后续计划
+        ├── problem.md                     # 赛题背景与问题定义
+        ├── AI_USAGE_DISCLOSURE.md
+        └── archive/2026-10-legacy/        # 旧 SIFT1M 实验报告与旧源码快照
 ```
 
 ## 核心特性
@@ -312,7 +318,7 @@ SSD mixed-RW 不会重新训练 PQ：它从 `--index_path` 读出 V3 索引中�
 需要先解除写路径的 `fdatasync` 上限并做固定 delta 规模的压测。干净关闭 → 重开时，1,859 条
 可见记录由 5 个 SSTable 完整恢复。完整三轮数据、并发调度器缺陷的修复过程与结论边界见
 [动态混合读写对照实验](docs/experiments/mixed-read-write.md)。旧 SIFT1M 数字已移入
-[`docs/archive/2026-10-legacy/`](docs/archive/2026-10-legacy/README.md)，不再引用。
+[`docs/legacy/archive/2026-10-legacy/`](docs/legacy/archive/2026-10-legacy/README.md)，不再引用。
 
 下面是 95/5 + 后台 compaction 的快速复现命令；纯读、compaction 开关和 80/20 的完整对照方法见专项报告。
 
@@ -720,4 +726,4 @@ manager.close();
 
 本项目开发过程中使用了 ChatGPT、OpenAI Codex / Codex CLI 等 AI 工具进行辅助。AI 主要用于赛题理解、方案讨论、代码结构分析、错误定位、重构建议、实验结果整理，以及 README 和设计文档草稿生成。
 
-AI 生成内容均经过参赛队成员人工审核、修改、编译测试和实验验证。项目的最终方案、代码合并、实验运行、结果判断和答辩内容由参赛队成员负责。详细说明见 [docs/AI_USAGE_DISCLOSURE.md](docs/AI_USAGE_DISCLOSURE.md)。
+AI 生成内容均经过参赛队成员人工审核、修改、编译测试和实验验证。项目的最终方案、代码合并、实验运行、结果判断和答辩内容由参赛队成员负责。详细说明见 [docs/legacy/AI_USAGE_DISCLOSURE.md](docs/legacy/AI_USAGE_DISCLOSURE.md)。

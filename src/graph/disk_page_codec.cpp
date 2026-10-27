@@ -2,6 +2,8 @@
 
 #include <algorithm>
 #include <limits>
+#include <stdexcept>
+#include <string>
 #include <utility>
 
 namespace agent_aware {
@@ -78,6 +80,15 @@ std::vector<char> DiskPageCodec::encode_packed_page(
     const std::uint32_t node_id =
         slot < node_count ? order[begin + slot]
                           : std::numeric_limits<std::uint32_t>::max();
+    // 度数超过页格式的 degree 时必须报错，不能截断：多出来的边会在
+    // 序列化时被静默丢弃，而在内存图里它们仍然参与可达性，结果是
+    // "构建时连通、落盘后断裂"的坏索引，且没有任何日志。
+    if (slot < node_count && graph[node_id].size() > degree) {
+      throw std::runtime_error(
+          "Packed page cannot encode node " + std::to_string(node_id) +
+          ": degree " + std::to_string(graph[node_id].size()) +
+          " exceeds page degree " + std::to_string(degree));
+    }
     for (std::size_t n = 0; n < degree; ++n) {
       std::uint32_t neighbor = std::numeric_limits<std::uint32_t>::max();
       if (slot < node_count && n < graph[node_id].size()) {

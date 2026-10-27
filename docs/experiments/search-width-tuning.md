@@ -58,7 +58,7 @@ Recall 只取决于宽度（与缓存策略无关）。逐段折算：
 ## 3. 与旧 SIFT1M 结果的关系
 
 旧记录（SIFT1M，`156` → Recall@10 0.9748、avg 48.10 ms、io_uring）已移入
-[`docs/archive/2026-10-legacy/`](../archive/2026-10-legacy/README.md)，原因见该目录 README。
+[`docs/legacy/archive/2026-10-legacy/`](../legacy/archive/2026-10-legacy/README.md)，原因见该目录 README。
 这里的两组数字**不可横向比较**：
 
 | 差异 | 旧 | 新 |

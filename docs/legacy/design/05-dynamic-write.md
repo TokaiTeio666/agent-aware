@@ -2,7 +2,7 @@
 
 ## 当前实现状态（2026-07-11）
 
-动态写入已经完成可复现实验闭环：WAL、MemTable、SSTable、manifest、manual/background compaction、recovery、base/delta Top-K merge、动态 Recall 抽样和真实并发 mixed RW benchmark 均已落地。`DynamicWriteManager` 读侧通过 immutable read view 发布，避免 reader 查询 base 覆盖记录时和 writer/flush/compaction 抢同一把全局 mutex。2026-07-11 的 SIFT1M 配对实验及三轮明细见 [动态混合读写对照实验](../experiments/mixed-read-write.md)。
+动态写入已经完成可复现实验闭环：WAL、MemTable、SSTable、manifest、manual/background compaction、recovery、base/delta Top-K merge、动态 Recall 抽样和真实并发 mixed RW benchmark 均已落地。`DynamicWriteManager` 读侧通过 immutable read view 发布，避免 reader 查询 base 覆盖记录时和 writer/flush/compaction 抢同一把全局 mutex。2026-07-11 的 SIFT1M 配对实验及三轮明细见 [动态混合读写对照实验](../../experiments/mixed-read-write.md)。
 
 | 项目 | 状态 | 当前对应实现 |
 | --- | --- | --- |
@@ -382,7 +382,7 @@ Manifest 作用：
 
 ## 九、Benchmark 与验证场景
 
-2026-07-11 已使用 SIFT1M、4 reader、1 writer、30 秒 workload 完成纯读、95/5 compaction 开/关和 80/20 compaction 开四组配对实验。每组预热一次、正式运行三次；写事件为 70/25/5 CRUD，吞吐轮次关闭 exact Recall。关键中位数如下，完整范围和逐轮数据见 [专项实验报告](../experiments/mixed-read-write.md)。
+2026-07-11 已使用 SIFT1M、4 reader、1 writer、30 秒 workload 完成纯读、95/5 compaction 开/关和 80/20 compaction 开四组配对实验。每组预热一次、正式运行三次；写事件为 70/25/5 CRUD，吞吐轮次关闭 exact Recall。关键中位数如下，完整范围和逐轮数据见 [专项实验报告](../../experiments/mixed-read-write.md)。
 
 | 场景 | Read QPS | Write QPS | Read P95 | Delta search | Compaction |
 | --- | ---: | ---: | ---: | ---: | ---: |

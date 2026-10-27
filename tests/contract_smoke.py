@@ -54,6 +54,10 @@ def main():
             str(search), "--sift-dir", "", "--query", str(query),
             "--query-limit", "8", "--index-path", str(index),
             "--io-mode", "pread", "--cache-pages", "32",
+            # 本测试校验的是输出契约，不是内存预算：512 条 × 32 维的合成数据集
+            # 只有 64 KiB，20% 预算远小于进程自身的固定占用，开启硬失败会以
+            # "预算不可满足"退出。预算是独立指标，由其专项实验负责。
+            "--memory-budget-enforce", "0",
         ]
         run([*common, "--output-json", str(result)])
         payload = json.loads(result.read_text(encoding="utf-8"))
@@ -61,16 +65,39 @@ def main():
         manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
         assert payload["status"] == "completed"
         assert payload["index_format_version"] == 3
-        assert payload["entry_strategy"] == "single-medoid"
+        # 入口不是几何 medoid，而是构图时实测可达性最好的节点
+        # （见 disk_graph_builder.cpp 的 select_entry_node）。
+        assert payload["entry_strategy"] == "reachability-maximizing"
+        # 搜索还会在入口之外均匀撒起点，撒点数必须如实报告。
+        assert payload["spread_start_count"] > 0
         assert payload["entry_seed_ids"] == [manifest["entry_id"]]
         assert Path(payload["build_manifest"]) == manifest_path
         expected_stats = {
             "expanded", "submitted_reads", "completed_reads", "demand_reads",
-            "cache_hits", "io_submit_syscalls", "beam_cached_pages",
+            "cache_hits", "io_submit_syscalls",
             "nodes_used_per_loaded_page", "page_fill_utilization",
-            "demand_read_wait_us", "same_page_node_reuse",
+            "demand_read_wait_us", "demand_io_wait_us", "demand_post_cpu_us",
+            "demand_read_batches", "pages_per_read_batch",
+            "candidate_pushes", "candidate_pops",
+            "same_page_node_reuse",
         }
         assert expected_stats <= payload["stats"].keys()
+        # 恒 0 的死字段（唯一的写入者 select_candidate_batch 从未被调用）已删除，
+        # 留着会让读者以为"同页复用为 0"是实测结果。JSON 结构版本随之升到 2。
+        assert payload["stats_schema_version"] == 2
+        assert "beam_unique_pages" not in payload["stats"]
+        assert "beam_cached_pages" not in payload["stats"]
+        stages = payload["stats"]["demand_read_by_stage"]
+        assert set(stages) == {
+            "entry_anchor", "candidate_expand", "neighbor_rank", "rerank"}
+        for stage in stages.values():
+            assert set(stage) == {
+                "pages", "batches", "syscalls", "wait_calls", "io_wait_us",
+                "post_cpu_us"}
+        # 各阶段页数之和必须等于本查询实际提交的 demand 读页数：这条恒等式
+        # 一旦不成立，说明有 demand 读没被归因。
+        stage_pages = sum(stage["pages"] for stage in stages.values())
+        assert stage_pages == payload["stats"]["page_reads"]
         def collect_keys(value):
             if isinstance(value, dict):
                 return [str(key).lower() for key in value] + [

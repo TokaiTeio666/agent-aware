@@ -4,9 +4,9 @@
 > 英文说明：I/O Optimization of Vector Retrieval Systems for Agent Memory  
 > 适用赛题：2026 年全国大学生计算机系统能力大赛操作系统设计赛 OS 功能挑战赛道  
 > 编写日期：2026-05-21  
-> 最后更新：2026-07-11
+> 最后更新：2026-10-27（文档按"重构前 / 重构后"两代归类，见 `docs/README.md`）
 
-## 当前实现状态（2026-07-11）
+## 当前实现状态（2026-10-27）
 
 
 | 能力 | 当前状态 | 说明 |
@@ -58,10 +58,10 @@ Agent-aware 面向大模型 Agent 的长期记忆场景，设计一套在内存�
 | 指标 | 目标值 | 说明 |
 | --- | --- | --- |
 | 内存占用 | 数据集大小的 10%-20% | 赛题核心约束，默认以不超过 20% 为验收标准 |
-| Recall@10 | 不低于 85% | 当前主展示护栏为 `>=0.95`；`search_width=156` 单轮达到 `0.9748` |
-| 查询吞吐 | SSD 单线程平衡点 QPS `>=20` | 当前 `search_width=156` 单轮为 `20.79`，后续以三轮中位数验收 |
-| 查询延迟 | 平衡点 avg `<60 ms`、P99 `<75 ms` | 当前单轮 avg `48.10 ms`、P99 `66.29 ms`；仍需真实 NVMe 复测 |
-| 缓存命中率 | Graph-Aware 2Q 显著优于 LRU | 以 hub 节点保护和 I/O 次数下降作为证据 |
+| Recall@10 | 不低于 85% | SIFT1M 冷缓存实测 `0.988`（Phase 1，2000 条查询 × 3 轮）；合成 100k×128 下 `search_width=156` 为 `0.8767` |
+| 查询吞吐 | SSD 单线程平衡点 QPS `>=20` | SIFT1M 冷缓存单线程约 `74 QPS`（均值 `13.5 ms`，Phase 1 修复后）；合成 100k×128 `search_width=156` 为 `878.5 QPS` |
+| 查询延迟 | 平衡点 avg `<60 ms`、P99 `<75 ms` | SIFT1M 冷缓存 avg `13.5 ms`、P95 `18.05 ms`、P99 `24.2 ms`（Phase 1 修复后，3 轮交替对照）；p99 单轮有磁盘长尾噪声，以 p95 为准 |
+| 缓存命中率 | Graph-Aware 2Q 显著优于 LRU | 合成 100k×128 上无显著优势（`docs/experiments/cache-policy.md`）；仍以 hub 节点保护和 I/O 次数下降作为证据，未采纳 |
 | 写入开销 | 随机写转顺序追加写 | 用 WAL、SSTable、Compaction 统计写放大和后台延迟 |
 
 ### 3.3 工程目标
@@ -167,9 +167,14 @@ agent-aware/
 ├── scripts/
 │   ├── agent_aware.py                     # once/ab benchmark 统一入口
 └── docs/
-    ├── design/                            # 01-06 编号设计文档，覆盖 SSD、缓存、预取、动态写入
-    ├── problem/                           # 赛题要求、问题背景和约束说明
-    └── roadmap in future/                 # 后续优化计划、答辩补强和冲刺路线
+    ├── README.md                          # 文档索引：按"重构前 / 重构后"两代分类
+    ├── experiments/                       # 重构后：可复现实验报告
+    ├── problem/                           # 重构后：问题审计、修复状态、Phase 0/1 测量与复盘
+    └── legacy/                            # 重构前（2026-10 之前）：只读归档
+        ├── design/                        # 01-06 编号设计文档
+        ├── roadmap/                       # 后续优化计划与答辩补强路线
+        ├── problem.md                     # 赛题要求与问题背景
+        └── archive/2026-10-legacy/        # 旧 SIFT1M 报告与旧源码快照
 ```
 
 ## 5. 系统架构设计
@@ -347,8 +352,8 @@ PQEncoder 将 128 维向量划分为 8 个子空间，每个子空间训练 256 
 | P4 异步预取 | 第 4-5 周 | 接入 io_uring，完成 batch submit 和拓扑预取 | SSD 主路径 QPS、延迟统计 | ✅ 已完成 |
 | P5 动态写入 | 第 5-6 周 | 完成 MemTable、WAL、SSTable、Compaction 和增量插入 | 混合读写 benchmark 与三轮 SIFT1M 配对报告 | ✅ 已完成并验证 |
 | P6 调优与文档 | 第 6-7 周 | 参数调优、SIFT 大规模测试、报告和答辩材料 | README、架构文档、实验报告、演示脚本 | 🔄 进行中 |
-| P8 I/O 尾延迟优化 | 后续 | 量化各阶段 I/O 放大、候选裁剪、布局与缓存治理、自适应预算 | reads/query、bytes/query、P99 降低（详见 `docs/roadmap in future/recall-to-io-tail-latency-plan.md`） | 🔜 待推进 |
-| P9 答辩补强 | 答辩前 | 参数矩阵曲线、真实 NVMe 复测、delta 退化治理 | 矩阵实验、环境报告、delta 优化（详见 `docs/roadmap in future/defense-gap-closure-plan.md`） | 🔜 待推进 |
+| P8 I/O 尾延迟优化 | 后续 | 量化各阶段 I/O 放大、候选裁剪、布局与缓存治理、自适应预算 | reads/query、bytes/query、P99 降低（详见 `docs/legacy/roadmap/recall-to-io-tail-latency-plan.md`） | 🔜 待推进 |
+| P9 答辩补强 | 答辩前 | 参数矩阵曲线、真实 NVMe 复测、delta 退化治理 | 矩阵实验、环境报告、delta 优化（详见 `docs/legacy/roadmap/defense-gap-closure-plan.md`） | 🔜 待推进 |
 
 ### 8.2 任务分解
 
@@ -502,38 +507,47 @@ python3 scripts/agent_aware.py once
 
 ## 15. 结论
 
-Agent-aware 的计划重点是围绕赛题的真实约束构建系统，而不是绕开内存限制追求纯内存性能。当前 `search_width=156` 在 WSL2 单轮实验中形成 Recall@10 `0.9748`、avg `48.10 ms`、P99 `66.29 ms` 的平衡点，为后续预取和混合读写实验提供统一 baseline。内存侧当前输出的是 PQ、目录和 cache 的 estimated resident ratio；正式验收还需补进程 RSS 与完整对象生命周期口径。
+Agent-aware 的重点是围绕赛题的真实约束构建系统，而不是绕开内存限制追求纯内存性能。当前可信口径分两套，不可横向比较：
 
-后续工作应集中在三点：一是对 `search_width=156` 完成三轮复验、预取配对 A/B 和真实 NVMe 测试，二是完善 Compaction 与图连通性的一致性验证，三是将实验结果整理为图表化报告和答辩演示材料。
+- **SIFT1M、VMware VM、ext4 原生盘、真冷缓存**（`docs/problem/phase1-demand-io-batching-2026-10-27.md`）：Recall@10 `0.988`、avg `13.50 ms`、P95 `18.05 ms`、P99 `24.2 ms`（2000 条查询、3 轮交替对照），峰值 RSS 为数据集的 `6.85%`。这是 Phase 1 完成 demand 读批处理后的数字，同一二进制读页数与字节数相对修复前**逐位不变**，只是 syscall 从 426,632 降到 37,581。
+- **合成 100k×128、Windows MSVC、`pread`**（`docs/experiments/`）：`search_width=156` 时 Recall@10 `0.8767`、avg `1.136 ms`、reads/query `61.62`；该规模下 20% 内存预算**不满足**（基线 RSS 13.7 MB > 9.77 MB 预算），如实报告。
+
+早期 SIFT1M 数字（`156` → Recall@10 `0.9748`、avg `48.10 ms`、P99 `66.29 ms`）出自已不可追溯的代码与工作树，已归档到 `docs/legacy/archive/2026-10-legacy/`，不应再作为当前结论引用。
+
+后续工作集中在三点：一是把 Phase 1 的批处理口径推广到混合读写与多线程路径并给出同机对照，二是补齐崩溃注入与 compaction 一致性验证，三是把两套口径整理为图表化报告和答辩演示材料。
 
 ## 16. 文档指引与专项计划索引
 
-本文档是项目总览，`docs/design/` 下的 01-06 编号文档是各模块的详细设计归档，`docs/roadmap in future/` 下的文档是后续优化和答辩补强路线。阅读时优先按照当前目录中的编号文件名引用，避免继续使用未编号的旧路径。
+本文档是项目总览。文档分两代存放，索引见 [`docs/README.md`](docs/README.md)：
+
+- **重构后（2026-10 之后）**：`docs/experiments/` 是可复现实验报告，`docs/problem/` 是问题审计、修复状态与 Phase 0/1 测量/复盘，两者代表当前代码口径；
+- **重构前（2026-10 之前）**：`docs/legacy/` 下的设计稿与路线图只作历史归档，其中的接口名、参数默认值和数字**不代表当前实现**，引用时以 `docs/problem/current-issues.md` 的审计结论为准。
 
 ### 16.1 推荐阅读路径
 
 | 阅读目标 | 建议顺序 |
 | --- | --- |
-| 快速理解静态检索 | `README.md` -> `01-ssd-storage-path.md` -> `03-async-prefetch.md` -> `04-beam-width-io-uring.md` |
-| 预取验收 | `03-async-prefetch.md` -> `docs/roadmap in future/recall-to-io-tail-latency-plan.md` |
-| 动态写入与流式更新 | `05-dynamic-write.md` -> `docs/experiments/mixed-read-write.md` -> `06-fresh-streaming-ann.md` -> `docs/roadmap in future/next-sift1m-mixed-rw-optimization.md` |
-| 答辩前补强 | `docs/roadmap in future/defense-gap-closure-plan.md` -> 参数矩阵结果 -> 真实 NVMe/比赛环境复测记录 |
+| 当前测量口径与结论 | `docs/problem/retrospective-2026-10-25.md` -> `docs/problem/phase0-measurements-2026-10-26.md` -> `docs/problem/phase1-demand-io-batching-2026-10-27.md` |
+| 快速理解静态检索 | `README.md` -> `docs/legacy/design/01-ssd-storage-path.md` -> `docs/legacy/design/03-async-prefetch.md` -> `docs/legacy/design/04-beam-width-io-uring.md` |
+| 预取验收 | `docs/legacy/design/03-async-prefetch.md` -> `docs/legacy/roadmap/recall-to-io-tail-latency-plan.md` |
+| 动态写入与流式更新 | `docs/legacy/design/05-dynamic-write.md` -> `docs/experiments/mixed-read-write.md` -> `docs/legacy/design/06-fresh-streaming-ann.md` -> `docs/legacy/roadmap/next-sift1m-mixed-rw-optimization.md` |
+| 答辩前补强 | `docs/legacy/roadmap/defense-gap-closure-plan.md` -> 参数矩阵结果 -> 真实 NVMe/比赛环境复测记录 |
 
-### 16.2 设计文档索引
-
-| 文档 | 主题 | 状态 |
-| --- | --- | --- |
-| `docs/design/01-ssd-storage-path.md` | SSD 4KB record 布局、DiskIndexReader/Writer、O_DIRECT、packed graph 文件格式 | 已落地 |
-| `docs/design/02-cache-zero-copy.md` | Graph-Aware 2Q BufferPool、同页复用、pin/unpin、compute_distance_direct | 已落地 |
-| `docs/design/03-async-prefetch.md` | post-expand topology 排序、自适应限流、io_uring-only 预取与 A/B 验收 | 已落地，正式五轮验收待运行 |
-| `docs/design/04-beam-width-io-uring.md` | beam_width 语义、beam batch 收集、io_uring 批量读取、page 去重 | 已落地 |
-| `docs/design/05-dynamic-write.md` | LSM 写入路径：WAL/MemTable/SSTable/manifest/compaction/recovery | 已落地 |
-| `docs/design/06-fresh-streaming-ann.md` | Streaming ANN 创新路线：LSM delta + immutable read view、Delta memory graph、周期性 rebuild | 部分已完成 |
-
-### 16.3 后续路线图索引
+### 16.2 设计文档索引（重构前归档）
 
 | 文档 | 主题 | 状态 |
 | --- | --- | --- |
-| `docs/roadmap in future/recall-to-io-tail-latency-plan.md` | I/O 放大与尾延迟优化：候选裁剪、数据布局、缓存治理、自适应预算、P99/P999 治理、分阶段排期 | 待推进 |
-| `docs/roadmap in future/defense-gap-closure-plan.md` | 答辩前补强：参数矩阵曲线、真实 NVMe/比赛环境复测、delta 增长压力测试、delta 查询优化路线 | 待推进 |
-| `docs/roadmap in future/next-sift1m-mixed-rw-optimization.md` | SIFT1M mixed RW 后续优化：动态层查询、读写隔离、flush/compaction 延迟治理 | 待推进 |
+| `docs/legacy/design/01-ssd-storage-path.md` | SSD 4KB record 布局、DiskIndexReader/Writer、O_DIRECT、packed graph 文件格式 | 已落地 |
+| `docs/legacy/design/02-cache-zero-copy.md` | Graph-Aware 2Q BufferPool、同页复用、pin/unpin、compute_distance_direct | 已落地 |
+| `docs/legacy/design/03-async-prefetch.md` | post-expand topology 排序、自适应限流、io_uring-only 预取与 A/B 验收 | 已落地，正式五轮验收待运行 |
+| `docs/legacy/design/04-beam-width-io-uring.md` | beam_width 语义、beam batch 收集、io_uring 批量读取、page 去重 | 已落地 |
+| `docs/legacy/design/05-dynamic-write.md` | LSM 写入路径：WAL/MemTable/SSTable/manifest/compaction/recovery | 已落地 |
+| `docs/legacy/design/06-fresh-streaming-ann.md` | Streaming ANN 创新路线：LSM delta + immutable read view、Delta memory graph、周期性 rebuild | 部分已完成 |
+
+### 16.3 后续路线图索引（重构前归档）
+
+| 文档 | 主题 | 状态 |
+| --- | --- | --- |
+| `docs/legacy/roadmap/recall-to-io-tail-latency-plan.md` | I/O 放大与尾延迟优化：候选裁剪、数据布局、缓存治理、自适应预算、P99/P999 治理、分阶段排期 | 待推进 |
+| `docs/legacy/roadmap/defense-gap-closure-plan.md` | 答辩前补强：参数矩阵曲线、真实 NVMe/比赛环境复测、delta 增长压力测试、delta 查询优化路线 | 待推进 |
+| `docs/legacy/roadmap/next-sift1m-mixed-rw-optimization.md` | SIFT1M mixed RW 后续优化：动态层查询、读写隔离、flush/compaction 延迟治理 | 待推进 |

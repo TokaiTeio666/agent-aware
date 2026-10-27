@@ -17,7 +17,7 @@ SIFT1M 的官方下载站（`corpus-texmex.irisa.fr`）不可达，本机也没�
 | 生成方式 | 1,000 个高斯簇中心 U(-1,1)^128，base 噪声 σ=0.15，query 噪声 σ=0.10（splitmix64 + mt19937_64） |
 | 确定性 | 同一配方在任意机器上生成字节级相同的 fvecs |
 
-合成数据的结论**不能**与 `docs/archive/2026-10-legacy/` 中的 SIFT1M 数字横向比较。
+合成数据的结论**不能**与 `docs/legacy/archive/2026-10-legacy/` 中的 SIFT1M 数字横向比较。
 
 ## 目录
 

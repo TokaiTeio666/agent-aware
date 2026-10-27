@@ -26,7 +26,11 @@ class QueryPageSession {
   const Node& get_node(std::uint32_t node_id, bool count_same_page_reuse);
   std::vector<std::uint32_t> collect_missing_pages(
       const std::vector<std::uint32_t>& page_ids) const;
-  void ensure_pages_loaded_batch(const std::vector<std::uint32_t>& page_ids);
+  // 批量载入页。stage 只用于把 demand 读归因到搜索阶段（见
+  // DemandReadStage）。未列出的调用方一律使用 kCandidateExpand。
+  void ensure_pages_loaded_batch(const std::vector<std::uint32_t>& page_ids,
+                                 DemandReadStage stage =
+                                     DemandReadStage::kCandidateExpand);
   std::size_t submit_topology_prefetch(
       const std::vector<std::uint32_t>& page_ids);
   void drain_ready_prefetches();
@@ -38,6 +42,11 @@ class QueryPageSession {
   bool page_available(std::uint32_t page_id) const;
   bool pin_page(std::uint32_t page_id);
   void unpin_all();
+  // 扩展时为邻居页打分期间置位：这期间发生的单页 demand 读归因到
+  // kNeighborRank，而不是锚点探测。
+  void set_reading_neighbor_pages(bool value) {
+    reading_neighbor_pages_ = value;
+  }
   void finish_query();
 
  private:
@@ -49,7 +58,7 @@ class QueryPageSession {
   bool page_ready_in_session(std::uint32_t page_id) const;
   bool materialize_available_page(std::uint32_t page_id);
   void materialize_page(const Page& page);
-  Page read_demand_page(std::uint32_t page_id);
+  Page read_demand_page(std::uint32_t page_id, DemandReadStage stage);
   bool consume_prefetch_completion(bool wait);
   bool wait_for_prefetch_page(std::uint32_t page_id);
   void store_prefetched_page(std::uint32_t page_id, Page page);
@@ -57,6 +66,7 @@ class QueryPageSession {
   PackedDiskGraphIndex& index_;
   DiskGraphSearchStats& stats_;
   bool finished_ = false;
+  bool reading_neighbor_pages_ = false;
   bool async_prefetch_ = false;
   bool prefetch_adaptive_ = true;
   std::size_t prefetch_top_k_ = 2;

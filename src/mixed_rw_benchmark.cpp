@@ -208,6 +208,10 @@ struct ScenarioResult {
   double graph_reads_per_read = 0.0;
   double cache_hit_rate = 0.0;
   double page_read_wait_ms_per_read = 0.0;
+  double page_io_wait_ms_per_read = 0.0;
+  double page_post_cpu_ms_per_read = 0.0;
+  double demand_pages_per_read = 0.0;
+  double read_batches_per_read = 0.0;
   double search_mutex_wait_ms_per_read = 0.0;
   ReadBreakdownSummary read_breakdown;
   CompactionAggregate compaction;
@@ -677,6 +681,24 @@ void append_read_timing(ThreadMetrics& metrics,
   metrics.graph_stats.page_cache_hits += stats.graph.page_cache_hits;
   metrics.graph_stats.page_cache_misses += stats.graph.page_cache_misses;
   metrics.graph_stats.demand_read_wait_us += stats.graph.demand_read_wait_us;
+  metrics.graph_stats.demand_io_wait_us += stats.graph.demand_io_wait_us;
+  metrics.graph_stats.demand_post_cpu_us += stats.graph.demand_post_cpu_us;
+  metrics.graph_stats.demand_read_batches += stats.graph.demand_read_batches;
+  metrics.graph_stats.io_submit_syscalls += stats.graph.io_submit_syscalls;
+  metrics.graph_stats.io_submits += stats.graph.io_submits;
+  metrics.graph_stats.candidate_pushes += stats.graph.candidate_pushes;
+  metrics.graph_stats.candidate_pops += stats.graph.candidate_pops;
+  for (std::size_t stage = 0; stage < agent_aware::kDemandReadStageCount;
+       ++stage) {
+    auto& into = metrics.graph_stats.demand_by_stage[stage];
+    const auto& from = stats.graph.demand_by_stage[stage];
+    into.pages_read += from.pages_read;
+    into.batches += from.batches;
+    into.syscalls += from.syscalls;
+    into.wait_calls += from.wait_calls;
+    into.io_wait_us += from.io_wait_us;
+    into.post_cpu_us += from.post_cpu_us;
+  }
   metrics.graph_stats.search_mutex_wait_us += stats.graph.search_mutex_wait_us;
   metrics.read_breakdown.dynamic_snapshot_ms.push_back(
       stats.timing.dynamic_snapshot_ms);
@@ -895,6 +917,24 @@ void merge_thread_metrics(ThreadMetrics& into, ThreadMetrics&& from) {
   into.graph_stats.page_cache_hits += from.graph_stats.page_cache_hits;
   into.graph_stats.page_cache_misses += from.graph_stats.page_cache_misses;
   into.graph_stats.demand_read_wait_us += from.graph_stats.demand_read_wait_us;
+  into.graph_stats.demand_io_wait_us += from.graph_stats.demand_io_wait_us;
+  into.graph_stats.demand_post_cpu_us += from.graph_stats.demand_post_cpu_us;
+  into.graph_stats.demand_read_batches += from.graph_stats.demand_read_batches;
+  into.graph_stats.io_submit_syscalls += from.graph_stats.io_submit_syscalls;
+  into.graph_stats.io_submits += from.graph_stats.io_submits;
+  into.graph_stats.candidate_pushes += from.graph_stats.candidate_pushes;
+  into.graph_stats.candidate_pops += from.graph_stats.candidate_pops;
+  for (std::size_t stage = 0; stage < agent_aware::kDemandReadStageCount;
+       ++stage) {
+    auto& into_stage = into.graph_stats.demand_by_stage[stage];
+    const auto& from_stage = from.graph_stats.demand_by_stage[stage];
+    into_stage.pages_read += from_stage.pages_read;
+    into_stage.batches += from_stage.batches;
+    into_stage.syscalls += from_stage.syscalls;
+    into_stage.wait_calls += from_stage.wait_calls;
+    into_stage.io_wait_us += from_stage.io_wait_us;
+    into_stage.post_cpu_us += from_stage.post_cpu_us;
+  }
   into.graph_stats.search_mutex_wait_us +=
       from.graph_stats.search_mutex_wait_us;
   merge_read_breakdown(into.read_breakdown, std::move(from.read_breakdown));
@@ -1018,6 +1058,33 @@ ScenarioResult finalize_result(
       metrics.read_ops == 0
           ? 0.0
           : (metrics.graph_stats.demand_read_wait_us / 1000.0) /
+                static_cast<double>(metrics.read_ops);
+  // demand_read_wait_us 里含读回后的解码/物化 CPU；下面两个字段把它拆开，
+  // 口径与 agent-aware-search 的 demand_io_wait_us / demand_post_cpu_us 相同。
+  result.page_io_wait_ms_per_read =
+      metrics.read_ops == 0
+          ? 0.0
+          : (metrics.graph_stats.demand_io_wait_us / 1000.0) /
+                static_cast<double>(metrics.read_ops);
+  result.page_post_cpu_ms_per_read =
+      metrics.read_ops == 0
+          ? 0.0
+          : (metrics.graph_stats.demand_post_cpu_us / 1000.0) /
+                static_cast<double>(metrics.read_ops);
+  std::size_t stage_pages_total = 0;
+  for (std::size_t stage = 0; stage < agent_aware::kDemandReadStageCount;
+       ++stage) {
+    stage_pages_total += metrics.graph_stats.demand_by_stage[stage].pages_read;
+  }
+  result.demand_pages_per_read =
+      metrics.read_ops == 0
+          ? 0.0
+          : static_cast<double>(stage_pages_total) /
+                static_cast<double>(metrics.read_ops);
+  result.read_batches_per_read =
+      metrics.read_ops == 0
+          ? 0.0
+          : static_cast<double>(metrics.graph_stats.demand_read_batches) /
                 static_cast<double>(metrics.read_ops);
   result.search_mutex_wait_ms_per_read =
       metrics.read_ops == 0
@@ -1420,6 +1487,8 @@ void write_csv(const std::filesystem::path& output_path,
             "memtable_insert_avg_us,flush_duration_ms,sstable_count,"
             "delta_record_count,memory_usage_mb,disk_usage_mb,recovery_time_ms,"
             "search_mode,graph_reads_per_read,cache_hit_rate,"
+            "page_io_wait_ms_per_read,page_post_cpu_ms_per_read,"
+            "demand_pages_per_read,read_batches_per_read,"
             "compaction_attempted,compaction_count,compaction_duration_ms,"
             "compaction_input_records,compaction_output_records\n";
   output << std::fixed << std::setprecision(6);
@@ -1464,6 +1533,10 @@ void write_csv(const std::filesystem::path& output_path,
            << result.search_mode << ','
            << result.graph_reads_per_read << ','
            << result.cache_hit_rate << ','
+           << result.page_io_wait_ms_per_read << ','
+           << result.page_post_cpu_ms_per_read << ','
+           << result.demand_pages_per_read << ','
+           << result.read_batches_per_read << ','
            << result.compaction.attempted << ','
            << result.compaction.success << ','
            << result.compaction.duration_ms << ','
@@ -1621,6 +1694,14 @@ void write_json(const std::filesystem::path& output_path,
            << "      \"cache_hit_rate\": " << result.cache_hit_rate << ",\n"
            << "      \"page_read_wait_ms_per_read\": "
            << result.page_read_wait_ms_per_read << ",\n"
+           << "      \"page_io_wait_ms_per_read\": "
+           << result.page_io_wait_ms_per_read << ",\n"
+           << "      \"page_post_cpu_ms_per_read\": "
+           << result.page_post_cpu_ms_per_read << ",\n"
+           << "      \"demand_pages_per_read\": "
+           << result.demand_pages_per_read << ",\n"
+           << "      \"read_batches_per_read\": "
+           << result.read_batches_per_read << ",\n"
            << "      \"search_mutex_wait_ms_per_read\": "
            << result.search_mutex_wait_ms_per_read << ",\n"
            << "      \"write_pipeline\": {\n"
