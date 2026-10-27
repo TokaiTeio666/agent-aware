@@ -142,6 +142,18 @@ struct PackedDiskGraphIndex::SearchState {
     return session.get_or_load_page(session.page_for_node(id));
   }
 
+  // 锚点探测：几个起点分散在整个空间，页几乎不可能彼此同页，所以整体一次
+  // 批量载入，把 N 次单页提交压成一趟往返；之后逐个算精确距离（零 I/O）。
+  // anchor 阶段的计时与计数只覆盖这次载入。
+  void prefetch_pages_batch(const std::vector<std::uint32_t>& ids) {
+    std::vector<std::uint32_t> page_ids;
+    page_ids.reserve(ids.size());
+    for (const auto id : ids) {
+      page_ids.push_back(session.page_for_node(id));
+    }
+    session.ensure_pages_loaded_batch(page_ids, DemandReadStage::kEntryAnchor);
+  }
+
   void add_best(const SearchResult& result) {
     if (best.size() < result_capacity) {
       best.push(result);
@@ -720,6 +732,12 @@ PackedDiskGraphIndex::initialize_search_state(
   const std::size_t exact_probe_count = std::min<std::size_t>(
       anchor_order.size(), max_seed_anchors * kExactAnchorsPerSlot);
   anchor_order.resize(exact_probe_count);
+  {
+    std::vector<std::uint32_t> probe_ids;
+    probe_ids.reserve(anchor_order.size());
+    for (const auto& probe : anchor_order) probe_ids.push_back(probe.second);
+    state->prefetch_pages_batch(probe_ids);
+  }
   for (auto& [anchor_distance, entry] : anchor_order) {
     anchor_distance = state->exact_distance(entry);
   }
@@ -731,6 +749,7 @@ PackedDiskGraphIndex::initialize_search_state(
     // 任何情况下候选堆都不能为空：种子列表一旦被过滤光（全部越界或去重），
     // 搜索会零扩展返回空结果，而调用方只看到一个召回 0 的查询，看不出是
     // 配置错了。退回到 0 号节点，保证图搜索仍然执行。
+    state->prefetch_pages_batch({0u});
     anchor_order.emplace_back(state->exact_distance(0), 0u);
   }
   std::vector<SearchResult> ranked_entries;
@@ -744,6 +763,7 @@ PackedDiskGraphIndex::initialize_search_state(
   // 改不回来了（best 堆无法原地更新）。
   for (const auto& result : ranked_entries) {
     state->candidates.push(result);
+    ++output.stats.candidate_pushes;
   }
   return state;
 }
@@ -764,40 +784,6 @@ std::vector<std::uint32_t> PackedDiskGraphIndex::collect_rerank_pages(
   }
   return page_ids;
 }
-std::vector<SearchResult> PackedDiskGraphIndex::select_candidate_batch(
-    SearchState& state, std::size_t effective_beam_width) const {
-  std::vector<SearchResult> window;
-  const std::size_t remaining =
-      state.config.search_width > state.output.stats.expanded
-          ? state.config.search_width - state.output.stats.expanded
-          : 0;
-  const std::size_t batch_limit =
-      std::min(effective_beam_width, remaining);
-  if (batch_limit == 0) {
-    return window;
-  }
-
-  window.reserve(batch_limit);
-  while (!state.candidates.empty() && window.size() < batch_limit) {
-    window.push_back(state.candidates.top());
-    state.candidates.pop();
-  }
-
-  std::unordered_set<std::uint32_t> batch_pages;
-  std::unordered_set<std::uint32_t> available_pages;
-  batch_pages.reserve(window.size());
-  available_pages.reserve(window.size());
-  for (const auto& candidate : window) {
-    const std::uint32_t page_id = state.session.page_for_node(candidate.id);
-    batch_pages.insert(page_id);
-    if (state.session.page_available(page_id)) {
-      available_pages.insert(page_id);
-    }
-  }
-  state.output.stats.beam_unique_pages += batch_pages.size();
-  state.output.stats.beam_cached_pages += available_pages.size();
-  return window;
-}
 
 void PackedDiskGraphIndex::expand_candidate_batch(
     SearchState& state, const std::vector<SearchResult>& batch,
@@ -805,9 +791,19 @@ void PackedDiskGraphIndex::expand_candidate_batch(
   std::vector<std::vector<SearchResult>> ranked_neighbors_by_candidate;
   ranked_neighbors_by_candidate.reserve(batch.size());
 
+  // 第一步：逐个候选打开节点、计入结果集、按原顺序收集新邻居 id，同时
+  // 记录"这个邻居是否和候选同页"。这一步只碰已装在会话里的页（search_one
+  // 已把本批候选所在页批量载入），不发起 I/O；visited 的插入顺序与逐候选
+  // 扩展时完全一致。
+  std::vector<std::vector<std::uint32_t>> new_neighbors_by_candidate;
+  std::vector<std::vector<bool>> neighbor_crosses_page;
+  new_neighbors_by_candidate.reserve(batch.size());
+  neighbor_crosses_page.reserve(batch.size());
   for (const auto& current : batch) {
     const DiskNode& node = state.load_node(current.id);
-    (void)state.session.pin_page(state.session.page_for_node(current.id));
+    const std::uint32_t candidate_page =
+        state.session.page_for_node(current.id);
+    (void)state.session.pin_page(candidate_page);
     ++state.output.stats.expanded;
     // 节点刚被打开，向量就在手：此时才算全精度距离并入结果集。
     // 已扩展过的候选（current.approximate == false）用的是精确距离，直接沿用。
@@ -823,18 +819,44 @@ void PackedDiskGraphIndex::expand_candidate_batch(
     }
 
     std::vector<std::uint32_t> new_neighbors;
+    std::vector<bool> crosses_page;
     new_neighbors.reserve(node.neighbors.size());
+    crosses_page.reserve(node.neighbors.size());
     for (const auto neighbor_id : node.neighbors) {
       if (neighbor_id >= metadata_.vector_count ||
           !state.visited.insert(neighbor_id).second) {
         continue;
       }
       new_neighbors.push_back(neighbor_id);
+      crosses_page.push_back(state.session.page_for_node(neighbor_id) !=
+                             candidate_page);
     }
+    new_neighbors_by_candidate.push_back(std::move(new_neighbors));
+    neighbor_crosses_page.push_back(std::move(crosses_page));
+  }
 
-    // 邻居此刻还在页里：顺手算全精度距离（零额外 I/O），不必等到被弹出时再算。
-    // 这样候选堆永远按真实距离排序，也不会为了"改正近似值"而弹出后又塞回去，
-    // 避免在一轮内把同一个点反复计入 batch。
+  // 第二步：把跨页邻居所在页一次性批量载入。此前每个邻居单独算全精度距离，
+  // 页不在会话里就落进 read_demand_page 的单页提交——每页一次
+  // io_uring_submit + 一次 wait_cqe 的串行往返，这是 Phase 0 §12 定位的
+  // I/O 粒度问题。同页邻居本来就在手，不参与预读。
+  std::vector<std::uint32_t> neighbor_page_ids;
+  for (std::size_t i = 0; i < new_neighbors_by_candidate.size(); ++i) {
+    for (std::size_t j = 0; j < new_neighbors_by_candidate[i].size(); ++j) {
+      if (neighbor_crosses_page[i][j]) {
+        neighbor_page_ids.push_back(
+            state.session.page_for_node(new_neighbors_by_candidate[i][j]));
+      }
+    }
+  }
+  state.session.ensure_pages_loaded_batch(neighbor_page_ids,
+                                          DemandReadStage::kNeighborRank);
+
+  // 第三步：邻居页此时都在会话里，算全精度距离不产生 I/O。候选堆永远按
+  // 真实距离排序，也不会为了"改正近似值"而弹出后又塞回去。
+  // 置位只是为了让预读之后仍漏网的按需读（页在预读与打分之间被移走、
+  // 或预取竞争时缓冲池不足）归因到邻居阶段而不是锚点探测。
+  state.session.set_reading_neighbor_pages(true);
+  for (const auto& new_neighbors : new_neighbors_by_candidate) {
     std::vector<SearchResult> ranked_neighbors;
     ranked_neighbors.reserve(new_neighbors.size());
     for (const auto neighbor_id : new_neighbors) {
@@ -849,6 +871,7 @@ void PackedDiskGraphIndex::expand_candidate_batch(
 
     ranked_neighbors_by_candidate.push_back(std::move(ranked_neighbors));
   }
+  state.session.set_reading_neighbor_pages(false);
 
   if (state.config.prefetch_policy == "topology") {
     const auto planner_start = std::chrono::steady_clock::now();
@@ -889,6 +912,7 @@ void PackedDiskGraphIndex::expand_candidate_batch(
   for (const auto& ranked_neighbors : ranked_neighbors_by_candidate) {
     for (const auto& candidate : ranked_neighbors) {
       state.candidates.push(candidate);
+      ++state.output.stats.candidate_pushes;
     }
   }
 }
@@ -898,7 +922,9 @@ void PackedDiskGraphIndex::finalize_topk(SearchState& state) {
   state.output.topk = sorted_results(state.best);
   if (!state.adc_table.empty() && state.config.rerank_topk > 0) {
     const auto rerank_pages = collect_rerank_pages(state);
-    constexpr std::size_t kRerankChunkPages = 2;
+    // rerank 的候选数就是 topk（默认 10），一次批量提交即可。原先按固定
+    // 2 页一块切分，等于把一趟往返拆成 5 趟，且与新加的邻居预批口径不一致。
+    constexpr std::size_t kRerankChunkPages = 32;
     const std::size_t reads_before_rerank = state.output.stats.node_reads;
     for (std::size_t begin = 0; begin < rerank_pages.size();
          begin += kRerankChunkPages) {
@@ -906,7 +932,8 @@ void PackedDiskGraphIndex::finalize_topk(SearchState& state) {
           std::min(begin + kRerankChunkPages, rerank_pages.size());
       const std::vector<std::uint32_t> current_pages(
           rerank_pages.begin() + begin, rerank_pages.begin() + end);
-      state.session.ensure_pages_loaded_batch(current_pages);
+      state.session.ensure_pages_loaded_batch(current_pages,
+                                              DemandReadStage::kRerank);
 
       const std::unordered_set<std::uint32_t> current_page_set(
           current_pages.begin(), current_pages.end());
@@ -1050,8 +1077,10 @@ DiskGraphSearchResult PackedDiskGraphIndex::search_one(
         // 走到这里说明有路径漏了精确化。就地改正后重新入堆，而不是带着
         // 近似值参与扩展决策。
         ++approximate_corrections;
+        ++output.stats.candidate_corrections;
         state->candidates.push(
             SearchResult{front.id, state->exact_distance(front.id), false});
+        ++output.stats.candidate_pushes;
         if (approximate_corrections > kApproximateCorrectionLimit) {
           // 改正步不计入扩展预算，但必须有上界，否则一个持续的近似/精确
           // 距离抖动就会让内层循环空转：状态停在 expanded=0、batch=0，
@@ -1066,6 +1095,7 @@ DiskGraphSearchResult PackedDiskGraphIndex::search_one(
         continue;
       }
       state->candidates.pop();
+      ++output.stats.candidate_pops;
       batch.push_back(front);
       ++emitted;
     }
@@ -1078,7 +1108,8 @@ DiskGraphSearchResult PackedDiskGraphIndex::search_one(
     for (const auto& candidate : batch) {
       page_ids.push_back(state->session.page_for_node(candidate.id));
     }
-    state->session.ensure_pages_loaded_batch(page_ids);
+    state->session.ensure_pages_loaded_batch(
+        page_ids, DemandReadStage::kCandidateExpand);
 
     ++output.stats.batch_count;
     output.stats.batch_expanded += batch.size();

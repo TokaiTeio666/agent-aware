@@ -805,6 +805,13 @@ benchmark 层就以 exit 1 拒绝。
 6. **（新）修 `expand_candidate_batch` 绕过批处理的问题**：它对每个候选逐个
    `load_node`，导致 `--io-depth` / `--io-batch` 在热路径上无效，每页一次
    `io_uring_submit` + 一次 `wait_cqe`。这是 §12 定位的最大优化空间，属 Phase 1。
+   **已完成（Phase 1，2026-10-27）**：见
+   [`phase1-demand-io-batching-2026-10-27.md`](phase1-demand-io-batching-2026-10-27.md)。
+   复核修正了本条的归因：单页读不在"逐个候选 `load_node`"，而全部在
+   `neighbor_rank`（逐个邻居算精确距离），扩展阶段读 0 页。
+   修复后 syscall 426,632 → 37,581、每批 11.35 页、延迟 30.1 → 13.5 ms，
+   召回 0.988 与读页数 873,742 B/查询**不变**。§12"213 次往返压成 14 次"中，
+   批次上限 16 页使实际为 18.8 次/查询。
 
 ## 5.1 召回问题的诊断顺序（按这个顺序查，不要跳到查询层）
 

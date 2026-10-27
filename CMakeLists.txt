@@ -102,6 +102,11 @@ if(BUILD_TESTING)
   target_link_libraries(async_page_reader_test
                         PRIVATE agent_aware::agent_aware)
   add_test(NAME async_page_reader COMMAND async_page_reader_test)
+  # 扩展路径的 demand 读必须成批提交，且批量不得改变 top-k 与页数。
+  add_executable(demand_io_batching_test tests/demand_io_batching.cpp)
+  target_link_libraries(demand_io_batching_test
+                        PRIVATE agent_aware::agent_aware)
+  add_test(NAME demand_io_batching COMMAND demand_io_batching_test)
   # 召回结论的诊断工具，需要数据集/索引路径，手动运行，不进 ctest：
   #   brute_force_check  精确暴力基线（真值文件是否可信）
   #   index_integrity    索引向量逐位比对 + 入口可达率 + 邻居局部性

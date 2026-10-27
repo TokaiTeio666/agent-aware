@@ -5,6 +5,8 @@
 > 前序文档：[`current-issues.md`](current-issues.md)（问题清单）、[`fix-status-2026-10-25.md`](fix-status-2026-10-25.md)（修复状态）
 > 后续：[`phase0-measurements-2026-10-26.md`](phase0-measurements-2026-10-26.md)（在 Linux VM 上建立物理 I/O
 > 计量后的首次可信测量；§1.3 的"页缓存吸收全部 I/O"得到证实，并发现 1M 规模下图索引不可达的缺陷）
+> 再后续：[`phase1-demand-io-batching-2026-10-27.md`](phase1-demand-io-batching-2026-10-27.md)
+> （demand 读批处理：每页一次往返 → 每 11.35 页一次，延迟 −55%，召回与读页数不变）
 >
 > 本文不是问题清单的重复。`current-issues.md` 回答"哪里有问题"；本文回答**"这些问题是哪一类错误、为什么会犯、对答辩和对外表述意味着什么、下次怎么做"**。
 > 文中标注 **[新]** 的条目是本轮独立审计新发现、`current-issues.md` 未覆盖的；其余条目引用其章节号。

@@ -71,6 +71,34 @@ struct DiskGraphSearchConfig {
   bool record_expanded_distances = false;
 };
 
+// 一次 demand 读发生在搜索的哪个阶段。归因在真正发起 I/O 的调用点完成
+// （见 QueryPageSession::ensure_pages_loaded_batch），而不是事后按字段反推：
+// 同一个 get_or_load_page 会被入口锚点、被弹出的候选、邻居打分、rerank
+// 四类调用方共用。
+enum class DemandReadStage {
+  kEntryAnchor = 0,   // 入口 / 锚点的精确距离探测
+  kCandidateExpand = 1,  // 被弹出并扩展的候选所在页
+  kNeighborRank = 2,  // 扩展时对尚未在手邻居的按需读取
+  kRerank = 3,        // topk 之后的 rerank
+  kStageCount = 4,
+};
+
+constexpr std::size_t kDemandReadStageCount =
+    static_cast<std::size_t>(DemandReadStage::kStageCount);
+
+// 按阶段的 demand 读归因。所有字段都只由 ensure_pages_loaded_batch（以及
+// 它按需回退到的 read_demand_page）写入；各阶段 io_wait_us 之和等于
+// demand_io_wait_us，pages_read 之和等于本查询实际提交的 demand 读页数
+// （rerank 若发生在 finish_query 之后，按 node_reads 增量计，见 finalize）。
+struct DemandReadStageStats {
+  std::size_t pages_read = 0;
+  std::size_t batches = 0;
+  std::size_t syscalls = 0;
+  std::size_t wait_calls = 0;
+  double io_wait_us = 0.0;
+  double post_cpu_us = 0.0;
+};
+
 struct DiskGraphSearchStats {
   std::size_t node_reads = 0;
   std::size_t expanded = 0;
@@ -103,15 +131,28 @@ struct DiskGraphSearchStats {
   std::size_t batch_count = 0;
   std::size_t batch_expanded = 0;
   std::size_t max_batch_size = 0;
-  std::size_t beam_unique_pages = 0;
-  std::size_t beam_cached_pages = 0;
   std::size_t same_page_node_reuse = 0;
   double adc_table_build_us = 0.0;
   std::size_t rerank_reads = 0;
   // 用 PQ 码的 ADC 近似值算过距离的次数（起点预筛与候选生成）。
   // 注意：这条路径没有"过滤/拒绝"，所以不存在对应的 reject 计数。
   std::size_t pq_filter_accept_count = 0;
+  // demand 读从提交到完成的整段时间（含 decode / store / materialize 的 CPU）。
+  // 它不是纯 I/O 等待，引用前请用下面的分阶段字段。
   double demand_read_wait_us = 0.0;
+  // 其中真正花在 I/O 上的时间：batch_submit 之后到最后一个 CQE 被 reap 之前，
+  // 扣除等待期间顺带解码 prefetch 完成页的 CPU。
+  double demand_io_wait_us = 0.0;
+  // 其中读回之后的 CPU：decode_page / store_cached_page / materialize_page。
+  double demand_post_cpu_us = 0.0;
+  // demand 批量 I/O 的提交次数（pages_read / demand_read_batches = 每批页数）。
+  std::size_t demand_read_batches = 0;
+  DemandReadStageStats demand_by_stage[kDemandReadStageCount];
+  // 候选堆：压入次数（含邻居与入口）、弹出并扩展的次数、弹出后转回精确距离
+  // 的改正次数（正常路径应为 0）。
+  std::size_t candidate_pushes = 0;
+  std::size_t candidate_pops = 0;
+  std::size_t candidate_corrections = 0;
   double search_mutex_wait_us = 0.0;
   std::size_t unique_prefetch_pages = 0;
   std::size_t prefetch_candidate_nodes = 0;
@@ -265,8 +306,6 @@ class PackedDiskGraphIndex {
       DiskGraphSearchResult& output);
   std::vector<std::uint32_t> collect_rerank_pages(
       const SearchState& state) const;
-  std::vector<SearchResult> select_candidate_batch(
-      SearchState& state, std::size_t effective_beam_width) const;
   void expand_candidate_batch(SearchState& state,
                               const std::vector<SearchResult>& batch,
                               std::size_t effective_beam_width);

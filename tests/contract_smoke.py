@@ -74,11 +74,30 @@ def main():
         assert Path(payload["build_manifest"]) == manifest_path
         expected_stats = {
             "expanded", "submitted_reads", "completed_reads", "demand_reads",
-            "cache_hits", "io_submit_syscalls", "beam_cached_pages",
+            "cache_hits", "io_submit_syscalls",
             "nodes_used_per_loaded_page", "page_fill_utilization",
-            "demand_read_wait_us", "same_page_node_reuse",
+            "demand_read_wait_us", "demand_io_wait_us", "demand_post_cpu_us",
+            "demand_read_batches", "pages_per_read_batch",
+            "candidate_pushes", "candidate_pops",
+            "same_page_node_reuse",
         }
         assert expected_stats <= payload["stats"].keys()
+        # 恒 0 的死字段（唯一的写入者 select_candidate_batch 从未被调用）已删除，
+        # 留着会让读者以为"同页复用为 0"是实测结果。JSON 结构版本随之升到 2。
+        assert payload["stats_schema_version"] == 2
+        assert "beam_unique_pages" not in payload["stats"]
+        assert "beam_cached_pages" not in payload["stats"]
+        stages = payload["stats"]["demand_read_by_stage"]
+        assert set(stages) == {
+            "entry_anchor", "candidate_expand", "neighbor_rank", "rerank"}
+        for stage in stages.values():
+            assert set(stage) == {
+                "pages", "batches", "syscalls", "wait_calls", "io_wait_us",
+                "post_cpu_us"}
+        # 各阶段页数之和必须等于本查询实际提交的 demand 读页数：这条恒等式
+        # 一旦不成立，说明有 demand 读没被归因。
+        stage_pages = sum(stage["pages"] for stage in stages.values())
+        assert stage_pages == payload["stats"]["page_reads"]
         def collect_keys(value):
             if isinstance(value, dict):
                 return [str(key).lower() for key in value] + [

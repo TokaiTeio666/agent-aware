@@ -744,6 +744,36 @@ double percentile_latency_ms(std::vector<double> latencies,
   return latencies[rank - 1];
 }
 
+const char* demand_stage_name(std::size_t stage) {
+  switch (static_cast<agent_aware::DemandReadStage>(stage)) {
+    case agent_aware::DemandReadStage::kEntryAnchor:
+      return "entry_anchor";
+    case agent_aware::DemandReadStage::kCandidateExpand:
+      return "candidate_expand";
+    case agent_aware::DemandReadStage::kNeighborRank:
+      return "neighbor_rank";
+    case agent_aware::DemandReadStage::kRerank:
+      return "rerank";
+    default:
+      return "unknown";
+  }
+}
+
+void emit_stage_json(std::ostream& json,
+                     const agent_aware::DiskGraphSearchStats& stats) {
+  for (std::size_t stage = 0; stage < agent_aware::kDemandReadStageCount;
+       ++stage) {
+    const auto& value = stats.demand_by_stage[stage];
+    json << "      \"" << demand_stage_name(stage) << "\": {\"pages\": "
+         << value.pages_read << ", \"batches\": " << value.batches
+         << ", \"syscalls\": " << value.syscalls
+         << ", \"wait_calls\": " << value.wait_calls
+         << ", \"io_wait_us\": " << value.io_wait_us
+         << ", \"post_cpu_us\": " << value.post_cpu_us << "}"
+         << (stage + 1 == agent_aware::kDemandReadStageCount ? "\n" : ",\n");
+  }
+}
+
 void add_stats(SearchAggregate& aggregate,
                const agent_aware::DiskGraphSearchStats& stats) {
   aggregate.stats.node_reads += stats.node_reads;
@@ -772,6 +802,23 @@ void add_stats(SearchAggregate& aggregate,
   aggregate.stats.uring_submit_count += stats.uring_submit_count;
   aggregate.stats.uring_cqe_count += stats.uring_cqe_count;
   aggregate.stats.demand_read_wait_us += stats.demand_read_wait_us;
+  aggregate.stats.demand_io_wait_us += stats.demand_io_wait_us;
+  aggregate.stats.demand_post_cpu_us += stats.demand_post_cpu_us;
+  aggregate.stats.demand_read_batches += stats.demand_read_batches;
+  aggregate.stats.candidate_pushes += stats.candidate_pushes;
+  aggregate.stats.candidate_pops += stats.candidate_pops;
+  aggregate.stats.candidate_corrections += stats.candidate_corrections;
+  for (std::size_t stage = 0; stage < agent_aware::kDemandReadStageCount;
+       ++stage) {
+    auto& into = aggregate.stats.demand_by_stage[stage];
+    const auto& from = stats.demand_by_stage[stage];
+    into.pages_read += from.pages_read;
+    into.batches += from.batches;
+    into.syscalls += from.syscalls;
+    into.wait_calls += from.wait_calls;
+    into.io_wait_us += from.io_wait_us;
+    into.post_cpu_us += from.post_cpu_us;
+  }
   aggregate.stats.page_dedup_requests += stats.page_dedup_requests;
   aggregate.stats.page_dedup_hits += stats.page_dedup_hits;
   aggregate.stats.duplicate_pages_eliminated +=
@@ -780,8 +827,6 @@ void add_stats(SearchAggregate& aggregate,
   aggregate.stats.batch_expanded += stats.batch_expanded;
   aggregate.stats.max_batch_size =
       std::max(aggregate.stats.max_batch_size, stats.max_batch_size);
-  aggregate.stats.beam_unique_pages += stats.beam_unique_pages;
-  aggregate.stats.beam_cached_pages += stats.beam_cached_pages;
   aggregate.stats.same_page_node_reuse += stats.same_page_node_reuse;
   aggregate.stats.distance_direct_calls += stats.distance_direct_calls;
   aggregate.stats.adc_table_build_us += stats.adc_table_build_us;
@@ -1175,6 +1220,21 @@ std::string json_for_run(const Args& args,
           ? 0.0
           : static_cast<double>(aggregate.stats.batch_expanded) /
                 static_cast<double>(aggregate.stats.batch_count);
+  std::size_t stage_pages_total = 0;
+  for (std::size_t stage = 0; stage < agent_aware::kDemandReadStageCount;
+       ++stage) {
+    stage_pages_total += aggregate.stats.demand_by_stage[stage].pages_read;
+  }
+  const double pages_per_read_batch =
+      aggregate.stats.demand_read_batches == 0
+          ? 0.0
+          : static_cast<double>(stage_pages_total) /
+                static_cast<double>(aggregate.stats.demand_read_batches);
+  const double candidate_pushes_per_pop =
+      aggregate.stats.candidate_pops == 0
+          ? 0.0
+          : static_cast<double>(aggregate.stats.candidate_pushes) /
+                static_cast<double>(aggregate.stats.candidate_pops);
   const double query_count_for_rates =
       static_cast<double>(std::max<std::size_t>(1, aggregate.queries));
   const double reads_per_query =
@@ -1235,6 +1295,10 @@ std::string json_for_run(const Args& args,
   json << std::boolalpha;
   json << "{\n";
   json << "  \"status\": \"completed\",\n";
+  // stats 段的结构版本：2 起删除了恒 0 的 beam_unique_pages/beam_cached_pages，
+  // 新增按阶段的 demand 读归因与 demand_io_wait/post_cpu 拆分。
+  // 与旧 JSON 逐字段对比的脚本必须按版本分支。
+  json << "  \"stats_schema_version\": 2,\n";
   json << "  \"dataset_mode\": \"" << json_escape(dataset.mode) << "\",\n";
   json << "  \"base_count\": " << index_metadata.vector_count << ",\n";
   json << "  \"query_count\": " << dataset.queries.size() << ",\n";
@@ -1556,6 +1620,26 @@ std::string json_for_run(const Args& args,
        << aggregate.stats.search_mutex_wait_us << ",\n";
   json << "    \"demand_read_wait_us\": "
        << aggregate.stats.demand_read_wait_us << ",\n";
+  json << "    \"demand_io_wait_us\": " << aggregate.stats.demand_io_wait_us
+       << ",\n";
+  json << "    \"demand_post_cpu_us\": " << aggregate.stats.demand_post_cpu_us
+       << ",\n";
+  json << "    \"demand_read_batches\": "
+       << aggregate.stats.demand_read_batches << ",\n";
+  // 一次 demand 批量读平均带回多少页。io_uring 下它 >1 才说明批量提交真的
+  // 生效；等于 1 就是"每页一次往返"。
+  json << "    \"pages_per_read_batch\": "
+       << pages_per_read_batch << ",\n";
+  json << "    \"demand_read_by_stage\": {\n";
+  emit_stage_json(json, aggregate.stats);
+  json << "    },\n";
+  json << "    \"candidate_pushes\": " << aggregate.stats.candidate_pushes
+       << ",\n";
+  json << "    \"candidate_pops\": " << aggregate.stats.candidate_pops << ",\n";
+  json << "    \"candidate_pushes_per_pop\": " << candidate_pushes_per_pop
+       << ",\n";
+  json << "    \"candidate_corrections\": "
+       << aggregate.stats.candidate_corrections << ",\n";
   json << "    \"io_submits\": " << aggregate.stats.io_submits << ",\n";
   json << "    \"io_completions\": " << aggregate.stats.io_completions
        << ",\n";
@@ -1569,10 +1653,12 @@ std::string json_for_run(const Args& args,
   json << "    \"avg_batch_size\": " << avg_batch_size << ",\n";
   json << "    \"max_batch_size\": " << aggregate.stats.max_batch_size
        << ",\n";
-  json << "    \"beam_unique_pages\": "
-       << aggregate.stats.beam_unique_pages << ",\n";
-  json << "    \"beam_cached_pages\": "
-       << aggregate.stats.beam_cached_pages << ",\n";
+  json << "    \"page_cache_evictions\": "
+       << aggregate.stats.page_cache_evictions << ",\n";
+  json << "    \"page_cache_promotions\": "
+       << aggregate.stats.page_cache_promotions << ",\n";
+  json << "    \"prefetch_submit_failures\": "
+       << aggregate.stats.prefetch_submit_failures << ",\n";
   json << "    \"page_dedup_requests\": "
        << aggregate.stats.page_dedup_requests << ",\n";
   json << "    \"page_dedup_hits\": " << aggregate.stats.page_dedup_hits
