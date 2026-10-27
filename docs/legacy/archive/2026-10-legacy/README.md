@@ -2,7 +2,7 @@
 
 本目录保存 2026-10-25 之前 `docs/experiments/` 下的两份实验报告，以及生成这些数字时的
 源码快照（`legacy-source/`）。它们**不代表当前代码的可复现结果**，新的实验记录见
-[`docs/experiments/`](../../experiments/)。
+[`docs/experiments/`](../../../experiments/)。
 
 ## 为什么废弃
 
@@ -12,7 +12,7 @@
 | 原始 JSON 没有入库 | README 引用的 `build/search_width_*_baseline.json` 与混合读写 JSON 只在作者本地 `build/`，`build/` 被 `.gitignore` 忽略 |
 | 单轮样本支撑"结论" | `128` 首跑 Avg 79.72 ms、复跑 49.86 ms；`156`/`192` 各只有一轮，README 却据此得出"`156` 平均延迟低 3.5%" |
 | 预算数字是模型值 | `estimated_resident_ratio=0.198505` 是公式估算，不是进程 RSS；全仓库当时没有读取 `/proc` 或 `GetProcessMemoryInfo` |
-| 缓存策略结论未验证 | `docs/design/02-cache-zero-copy.md` 的 LRU / 2Q / Graph-Aware 2Q 对照表为空；历史上唯一一组对照（`archive/results/p3-cache-*`，synthetic 3000 点）显示 graph-aware 命中率与 QPS 都低于 LRU |
+| 缓存策略结论未验证 | `docs/legacy/design/02-cache-zero-copy.md` 的 LRU / 2Q / Graph-Aware 2Q 对照表为空；历史上唯一一组对照（`archive/results/p3-cache-*`，synthetic 3000 点）显示 graph-aware 命中率与 QPS 都低于 LRU |
 | 环境不可复现 | WSL2 开发环境、`dirty` 工作树，且查询窗口/缓存页数与新口径不同 |
 
 ## 旧数字（仅留档，勿引用）
@@ -26,9 +26,9 @@
 
 | 旧报告 | 新报告 | 数据来源 |
 | --- | --- | --- |
-| `experiments-search-width-tuning.md` | [`docs/experiments/search-width-tuning.md`](../../experiments/search-width-tuning.md) | `results/2026-10-25-windows-msvc-v2/` |
-| `experiments-mixed-read-write.md` | [`docs/experiments/mixed-read-write.md`](../../experiments/mixed-read-write.md) | `results/2026-10-25-windows-msvc-v2/`（并发调度器修复后） |
-| —（旧报告没有缓存策略对照） | [`docs/experiments/cache-policy.md`](../../experiments/cache-policy.md) | `results/2026-10-25-windows-msvc-v2/` |
+| `experiments-search-width-tuning.md` | [`docs/experiments/search-width-tuning.md`](../../../experiments/search-width-tuning.md) | `results/2026-10-25-windows-msvc-v2/` |
+| `experiments-mixed-read-write.md` | [`docs/experiments/mixed-read-write.md`](../../../experiments/mixed-read-write.md) | `results/2026-10-25-windows-msvc-v2/`（并发调度器修复后） |
+| —（旧报告没有缓存策略对照） | [`docs/experiments/cache-policy.md`](../../../experiments/cache-policy.md) | `results/2026-10-25-windows-msvc-v2/` |
 
 旧报告中的数据与结论在评审材料中不应再出现数值，只能作为"历史待验证点"引用。
 

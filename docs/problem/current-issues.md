@@ -162,13 +162,13 @@ insert 对已存在的 id 不报错，直接追加一条新版本。对**已删�
 
 - `search_one` 里 `effective_config.adc_enable = true` 是无条件的（`disk_graph_index.cpp:868`），且没有 PQ 会直接抛错（`:619-622`）。
 - `add_best` 对每个未访问邻居都无条件入堆（`:791`）；`pq_filter_reject_count` 从不自增；`pq_filter_accept_count` 在每次 ADC 查表时自增（`:119`），并不是"被接受的候选数"。
-- 文档（README `--enable-pq`、`docs/roadmap in future/recall-to-io-tail-latency-plan.md` §5.2）仍把 PQ 当作"过滤/拒绝"机制描述。
+- 文档（README `--enable-pq`、`docs/legacy/roadmap/recall-to-io-tail-latency-plan.md` §5.2）仍把 PQ 当作"过滤/拒绝"机制描述。
 
 **建议**：统计改为"ADC 查表次数 / 入堆候选数"，或实现真正的拒绝阈值。
 
 ### 2.2 没有提前终止，`search_width` 是唯一预算旋钮
 
-`while (!candidates.empty() && expanded < config.search_width)`（`disk_graph_index.cpp:877-878`）。`docs/design/04-beam-width-io-uring.md` 明确要求保留 early stop / adaptive early stop，实现中不存在。`--search-width` 从 128→156→192 时延迟翻倍（README 表），本质是"扩展越多、延迟越高"的线性关系，没有"简单查询早停"的自适应能力。
+`while (!candidates.empty() && expanded < config.search_width)`（`disk_graph_index.cpp:877-878`）。`docs/legacy/design/04-beam-width-io-uring.md` 明确要求保留 early stop / adaptive early stop，实现中不存在。`--search-width` 从 128→156→192 时延迟翻倍（README 表），本质是"扩展越多、延迟越高"的线性关系，没有"简单查询早停"的自适应能力。
 
 ### 2.3 多线程路径的隔离方式回避了真正难点
 
@@ -178,7 +178,7 @@ insert 对已存在的 id 不报错，直接追加一条新版本。对**已删�
 
 ### 2.4 Graph-Aware 2Q、"优于 LRU"没有实验支撑
 
-- `docs/design/02-cache-zero-copy.md` 第 244 行列出了 LRU / 2Q / Graph-Aware 2Q 的对照，结果表全部为空；PROJECT_PLAN §10.3 同样只有表头。
+- `docs/legacy/design/02-cache-zero-copy.md` 第 244 行列出了 LRU / 2Q / Graph-Aware 2Q 的对照，结果表全部为空；PROJECT_PLAN §10.3 同样只有表头。
 - 仓库历史中唯一一组直接对照是 `archive/results/p3-cache-{lru,graph-aware-2q}.txt`（`bc2b942` 已删除，可从 git 历史取出）：synthetic 3000 点、cache 64 页下 `hit_rate` LRU **0.9149** vs graph-aware **0.8718**，QPS LRU **4405** vs **3939**，即 **graph-aware 更差**。
 - 当前 `sift_search_benchmark` 支持 `--cache-policy`，但没有任何脚本或报告输出过 LRU/2Q/graph-aware 的 SIFT1M 对照。
 
@@ -202,13 +202,13 @@ insert 对已存在的 id 不报错，直接追加一条新版本。对**已删�
 ### 2.6 delta 层只有线性扫描，没有分层/图结构
 
 - `search_delta_l2_at` 是"全量复制 → 过滤 → 全量 L2 → nth_element"（`dynamic_write_manager.cpp:753-782`）。
-- `docs/roadmap in future/defense-gap-closure-plan.md` Phase 3/4 的 delta 压测（1k/10k/50k/100k）和 `docs/design/06-fresh-streaming-ann.md` 的 Delta memory graph **都没有做**；README 也没有给出 delta 规模与 `delta_search_ms` 的关系曲线。
+- `docs/legacy/roadmap/defense-gap-closure-plan.md` Phase 3/4 的 delta 压测（1k/10k/50k/100k）和 `docs/legacy/design/06-fresh-streaming-ann.md` 的 Delta memory graph **都没有做**；README 也没有给出 delta 规模与 `delta_search_ms` 的关系曲线。
 - 由于 §1.3 的版本无界增长，实际扫描量等于"写过的不同 id 数"，而不只是"当前 delta 记录数"。
 
 ### 2.7 "写入磁盘图"与"Streaming ANN"名不副实
 
 - 写入记录里会算出 `neighbors`（`dynamic_write_manager.cpp:596`、`:708-750`），写入 WAL/SSTable，但读路径**从不使用**：`latest_records_for` 和 `search_delta_l2_at` 只看 `vector` 与 `deleted`；`grep "\.neighbors" src/engine src/core` 无结果。这个字段只是增加了写放大。
-- 新写入的节点不会进入 SSD packed graph，query 只能通过 delta 的暴力扫描看到它们；没有周期性 rebuild（`docs/design/05-dynamic-write.md` 自述"未完成"）。
+- 新写入的节点不会进入 SSD packed graph，query 只能通过 delta 的暴力扫描看到它们；没有周期性 rebuild（`docs/legacy/design/05-dynamic-write.md` 自述"未完成"）。
 - PROJECT_PLAN 第 4 节说"新节点通过 search_for_construction 和 robust_prune 增量接入 Vamana 图"，与实现不符。
 - `--dynamic_graph_degree`、`--neighbor_candidate_limit` 实际只影响写入时被算出来、随后被丢弃的字段。另外 `select_incremental_neighbors` 的候选截断用 `std::hash(node_id ^ node_id)`，对所有记录都是同一个值，等价于随机抽样（`:721-730`），并不是"邻域候选"。
 
@@ -235,13 +235,13 @@ insert 对已存在的 id 不报错，直接追加一条新版本。对**已删�
 
 ### 2.10 预取实现与其设计文档不一致
 
-- **没有事前预测**：`docs/roadmap in future/CRTP_两阶段页级预取实施计划.md`（1765 行）描述的两层"区域预测 + 拓扑修正"结构不存在；当前实现是每个 batch 之后的 post-expand 排序（`disk_graph_index.cpp:755-790`），以及 `docs/design/03-async-prefetch.md` 描述的"1→2 页自适应限流"。
+- **没有事前预测**：`docs/legacy/roadmap/CRTP_两阶段页级预取实施计划.md`（1765 行）描述的两层"区域预测 + 拓扑修正"结构不存在；当前实现是每个 batch 之后的 post-expand 排序（`disk_graph_index.cpp:755-790`），以及 `docs/legacy/design/03-async-prefetch.md` 描述的"1→2 页自适应限流"。
 - **候选窗口被预取器自己截断**：`rank_topology_pages` 只保留前 `scan_limit = 2×beam` 个候选页（`disk_graph_index.cpp:69-72`、`:761-775`），再由 `submit_topology_prefetch` 取前 1–2 个提交，其余页被标为 `prefetch_skip_seen` 后不再参与排序。
 - **自适应参数不生效**：前 32 个样本强制 `top_k = 1`（`prefetch_adaptive_controller.cpp:22-23`），`--prefetch-top-k` 未生效；`Decision.required_lead` 返回了但 `submit_topology_prefetch` 从不读取（`query_page_session.cpp:283-299`）；`io_latency_us` 入参被丢弃（`prefetch_adaptive_controller.cpp:37`）；`--prefetch-max-pages-per-query` 在预算耗尽后只走 `limit == 0` 返回，并在 `:299-301` 计入 `demand_priority_blocks_prefetch`，也就是说"预取额度用完"和"demand 优先级保护"在统计里混在一起。
 - **控制器无锁共享**：`prefetch_controller_` 是 index 成员，多个 `QueryPageSession` 在无锁情况下读写 `buckets_`（`prefetch_adaptive_controller.cpp:18, 38`）。
 - **trace 的 oracle 标签只标已提交页**：`useful` 只对真正提交且后来被使用的页计为 1（`query_page_session.cpp:310, 391, 418`），`scripts/replay_prefetch_policy.py` 据此算 oracle（`:24-26`），因此任何 replay 都会低估其它策略。
 - **已预取但未作为 demand 出现的页在非缓存路径下被丢弃**（`query_page_session.cpp:170-199, 531-540`），这些 I/O 只计入提交量。
-- A/B 正式验收（`summarize_prefetch_ab.py` 的 11 个门槛）从未运行过：README 自己写"默认关闭、正式 A/B 通过前不开启"，`docs/design/03-async-prefetch.md` 也只写了使用方法。
+- A/B 正式验收（`summarize_prefetch_ab.py` 的 11 个门槛）从未运行过：README 自己写"默认关闭、正式 A/B 通过前不开启"，`docs/legacy/design/03-async-prefetch.md` 也只写了使用方法。
 - **按 README 命令单独开启预取，预取不会发生**：`query_page_session.cpp:31` 把 `config.prefetch_max_pages_per_query`（默认 0）存入 `prefetch_query_limit_`，README 对 0 的解释是"不额外限制"，但 `:293-296` 对 0 的处理是 `query_room = decision.top_k`——每批最多 1–2 页，而且 `decision` 来自控制器。这个行为本质上没有错（0 表示按每批决策），问题在于**README 的参数语义与代码不一致**，并且没有任何文档说明"单独开预取需要先确认 `prefetch_runtime_enabled=true`"。按 README 的参数直接开，很可能看到 `prefetch_submitted = 0` 却找不到原因（io_uring 回退、每批预算、warmup 期 top_k=1 都可能）。§2.12 的脚本可以跑，但它传入的也是同一套默认值。另外，"预取默认关闭、未通过 A/B"这一口径本身是对的，但正因为如此，预取目前不应作为已实现创新点出现在答辩材料里。
 
 （登记待确认）`prefetch_query_limit_` 在 `:31` 直接取 `config.prefetch_max_pages_per_query`，而 `query_room` 只有 `prefetch_query_limit_ == 0` 时才取 `decision.top_k`（`:293-296`），所以非 0 时这一项才生效；请作者确认原意是"每批上限"还是"每次查询总量"，并在 README 与代码里统一。
@@ -280,23 +280,23 @@ insert 对已存在的 id 不报错，直接追加一条新版本。对**已删�
 
 | 文档 | 问题 |
 | --- | --- |
-| `docs/design/01-ssd-storage-path.md` | 第 3 行自述"历史设计"，正文仍引用已删除的 `include/storage/*`、`DiskIndexReader/Writer` |
-| `docs/design/04-beam-width-io-uring.md` | 引用已删除的 `naive_disk_graph_index.cpp`；"early stop 不能被破坏"但代码无 early stop |
-| `docs/design/02-cache-zero-copy.md` | 原始设计稿与"当前实现状态"混排，`pin/unpin` 独立接口、`PagePinGuard` 实际未实现（自述"未完全拆出"） |
+| `docs/legacy/design/01-ssd-storage-path.md` | 第 3 行自述"历史设计"，正文仍引用已删除的 `include/storage/*`、`DiskIndexReader/Writer` |
+| `docs/legacy/design/04-beam-width-io-uring.md` | 引用已删除的 `naive_disk_graph_index.cpp`；"early stop 不能被破坏"但代码无 early stop |
+| `docs/legacy/design/02-cache-zero-copy.md` | 原始设计稿与"当前实现状态"混排，`pin/unpin` 独立接口、`PagePinGuard` 实际未实现（自述"未完全拆出"） |
 | `PROJECT_PLAN.md` §5.1 / §7 | 描述 `QueryProcessor`、`search_memory_fast`、`LsmWriteManager`、`DiskIndexReader` 等已不存在的名字 |
-| `docs/roadmap in future/next-sift1m-mixed-rw-optimization.md` | 第 5 行写"P0/P1 核心任务已经完成"，但同文档后面又列出大量"待做"；`bench_dynamic_correctness`、`--preload_delta_count`、`build/...json` 均不存在 |
-| `docs/roadmap in future/defense-gap-closure-plan.md` | 交付物指向 `docs/experiments/param-tuning-and-sift-scale-test.md`、`docs/design/fresh-streaming-ann.md`、`docs/competition/scoring-and-defense.md`，均已被删除 |
-| `docs/roadmap in future/CRTP_两阶段页级预取实施计划.md` | 1765 行完整实施计划，没有任何状态标记，未开始也未废弃 |
+| `docs/legacy/roadmap/next-sift1m-mixed-rw-optimization.md` | 第 5 行写"P0/P1 核心任务已经完成"，但同文档后面又列出大量"待做"；`bench_dynamic_correctness`、`--preload_delta_count`、`build/...json` 均不存在 |
+| `docs/legacy/roadmap/defense-gap-closure-plan.md` | 交付物指向 `docs/experiments/param-tuning-and-sift-scale-test.md`、`docs/legacy/design/06-fresh-streaming-ann.md`、`docs/competition/scoring-and-defense.md`，均已被删除 |
+| `docs/legacy/roadmap/CRTP_两阶段页级预取实施计划.md` | 1765 行完整实施计划，没有任何状态标记，未开始也未废弃 |
 
 **建议**：docs 目录重建索引；每篇开头统一给出"状态：已实现 / 部分实现 / 设计稿 / 已废弃 / 规划中 + 对应 commit/PR"。
 
 ### 3.2 路线图堆积，缺少单一"当前焦点"
 
-`docs/roadmap in future/` 下四份计划累计约 3600 行，互相引用、优先级不一致（例如 delta memory graph 同时出现在三份计划里，且给出的"几天完成"估计彼此冲突）。没有一份把"提交前剩余窗口 + 必做 / 可选 / 放弃"列清楚。
+`docs/legacy/roadmap/` 下四份计划累计约 3600 行，互相引用、优先级不一致（例如 delta memory graph 同时出现在三份计划里，且给出的"几天完成"估计彼此冲突）。没有一份把"提交前剩余窗口 + 必做 / 可选 / 放弃"列清楚。
 
 ### 3.3 文档间口径互相矛盾
 
-- README 只给了 `search_width=156` 的单点，PROJECT_PLAN §9 仍写 `ef_search/search_width` 默认 350，`docs/design/04` 又写 `beam_width=0 表示跟随 search_width`。
+- README 只给了 `search_width=156` 的单点，PROJECT_PLAN §9 仍写 `ef_search/search_width` 默认 350，`docs/legacy/design/04` 又写 `beam_width=0 表示跟随 search_width`。
 - 搜索宽度结果表在 README、`docs/experiments/search-width-tuning.md`、PROJECT_PLAN 三处各一份，`128` 的值在 README 是"复跑值"，历史 JSON 是另一套（`docs/experiments/search-width-tuning.md` 第 75 行）。
 - `PROJECT_PLAN.md` 第 15 行"高并发纯读：8 reader 下 56.55 read_qps"来自被删除的旧代码，当前 `sift_search` 的并发是每线程独立索引，不能直接对照。
 

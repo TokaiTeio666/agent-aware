@@ -2,7 +2,7 @@
 
 所有数字均来自 [`results/2026-10-25-windows-msvc-v2/`](../../results/2026-10-25-windows-msvc-v2/)
 中的原始 JSON，用 `scripts/summarize_repro_results.cpp` 汇总（每个单元格为 3 轮中位数，
-括号内为最小-最大）。旧实验记录已移入 [`docs/archive/2026-10-legacy/`](../archive/2026-10-legacy/)。
+括号内为最小-最大）。旧实验记录已移入 [`docs/legacy/archive/2026-10-legacy/`](../legacy/archive/2026-10-legacy/)。
 
 | 文档 | 内容 | 一句话结论 |
 | --- | --- | --- |

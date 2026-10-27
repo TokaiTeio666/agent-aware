@@ -1,7 +1,7 @@
 # 修复状态：`current-issues.md` 逐条对照（2026-10-25）
 
 > 对照对象：[`current-issues.md`](current-issues.md)（审计时 HEAD `6d7b69d`，当前基线 `b9f3e46`）
-> 修复代码：当前工作树（未提交）；旧文档与旧结果：[`docs/archive/2026-10-legacy/`](../archive/2026-10-legacy/)
+> 修复代码：当前工作树（未提交）；旧文档与旧结果：[`docs/legacy/archive/2026-10-legacy/`](../legacy/archive/2026-10-legacy/)
 > 新实验：[`docs/experiments/`](../experiments/)、[`results/`](../../results/)
 > 同类问题归类与教训：[`retrospective-2026-10-25.md`](retrospective-2026-10-25.md)
 

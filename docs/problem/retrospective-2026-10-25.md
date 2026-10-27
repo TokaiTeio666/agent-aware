@@ -35,7 +35,7 @@
 ### 1.1 把"设计文档"当成"已实现"
 
 写设计稿时把完整愿景写成完成时，代码只做了一部分，最后文档没回头删。
-评审只要打开 `docs/design/*` 对照代码就能发现：
+评审只要打开 `docs/legacy/design/*` 对照代码就能发现：
 
 - "写入磁盘图 / Streaming ANN"：`neighbors` 字段写了但**没有任何读路径**（`current-issues.md` §2.7）；
 - "Immutable Read View 无锁快照"：实际是 `sequence_id` 过滤，且版本历史无界增长（§1.3）；

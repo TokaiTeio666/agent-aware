@@ -34,7 +34,7 @@
 2026-10-25 的可复现扫描（合成 100k×128、Windows `pread`、3 轮中位数）表明，`search_width=156`、`beam_width=16`
 仍是 Recall 与 I/O 的合理折中：Recall@10 `0.8767`、avg `1.136 ms`、P99 `2.002 ms`、reads/query `61.62`；
 `128` 的 Recall 为 `0.7968`，`192` 为 `0.9160` 但多读 18% 的页。完整数据、旧 SIFT1M 记录的去向与限制见
-[`docs/experiments/search-width-tuning.md`](../experiments/search-width-tuning.md)。
+[`docs/experiments/search-width-tuning.md`](../../experiments/search-width-tuning.md)。
 
 ---
 
